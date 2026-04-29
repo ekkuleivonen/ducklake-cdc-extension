@@ -1,0 +1,205 @@
+# name: test/sql/sugar.test
+# description: Acknowledged sugar wrappers (cdc_events, cdc_changes) shipped in
+#              v0.0.3. Both compose cdc_window with DuckLake builtins; both
+#              acquire the consumer's owner-token lease the same way the
+#              underlying primitive does and never auto-commit.
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/sugar.ducklake' AS lake (DATA_PATH '__TEST_DIR__/sugar_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid');
+
+statement ok
+UPDATE lake.orders SET status = 'shipped' WHERE id = 2;
+
+# Discover the snapshot of the CREATE TABLE (the schema-version-changing
+# snapshot the consumer should commit past before seeing DML for the same
+# table). Snapshot id 1 is the CREATE TABLE in this fixture (snapshot 0 is
+# the ATTACH).
+query I
+SELECT min(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot WHERE schema_version = 1;
+----
+1
+
+# Start the consumer past the CREATE TABLE so the first window covers the
+# INSERT and the UPDATE without being bounded at the schema-version edge.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'demo', start_at = '1');
+
+# cdc_events: composes cdc_window + ducklake_snapshot_changes. Returns one
+# row per snapshot in the window, with the window's `end_snapshot` projected
+# as next_snapshot_id so callers know exactly which snapshot to commit at.
+# Internal __ducklake_cdc_* writes (consumer state bootstrap / audit /
+# lease columns) are filtered out so they never appear here.
+query I
+SELECT count(*) FROM cdc_events('lake', 'demo');
+----
+2
+
+# Idempotent: a second call from the same connection returns the same rows
+# because the lease is held and no commit landed in between.
+query I
+SELECT count(*) FROM cdc_events('lake', 'demo');
+----
+2
+
+# cdc_events surfaces commit metadata so consumers can dispatch on
+# commit_extra_info. Default DuckLake commits leave the field NULL.
+query I
+SELECT count(*) FROM cdc_events('lake', 'demo')
+WHERE commit_extra_info IS NULL;
+----
+2
+
+# next_snapshot_id matches end_snapshot from cdc_window: the cursor stays
+# put until cdc_commit, so callers know exactly where to commit. Materialize
+# the two stateful calls separately so DuckLake does not try to commit two
+# catalog updates inside one SELECT.
+statement ok
+CREATE TEMP TABLE demo_event_snapshot AS
+SELECT max(next_snapshot_id) AS next_snapshot_id FROM cdc_events('lake', 'demo');
+
+statement ok
+CREATE TEMP TABLE demo_window_snapshot AS
+SELECT end_snapshot FROM cdc_window('lake', 'demo');
+
+query I
+SELECT next_snapshot_id = end_snapshot
+FROM demo_event_snapshot, demo_window_snapshot;
+----
+true
+
+# A consumer with a tables filter that does NOT include 'orders' sees
+# zero events even though the underlying snapshots exist - the composer
+# applies the filter when set.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'other_only', start_at = '1');
+
+statement ok
+UPDATE lake.main.__ducklake_cdc_consumers SET tables = ['main.something_else']
+WHERE consumer_name = 'other_only';
+
+query I
+SELECT count(*) FROM cdc_events('lake', 'other_only');
+----
+0
+
+# Same consumer with 'orders' in its tables filter sees the events.
+statement ok
+UPDATE lake.main.__ducklake_cdc_consumers SET tables = ['main.orders']
+WHERE consumer_name = 'other_only';
+
+query I
+SELECT count(*) FROM cdc_events('lake', 'other_only');
+----
+2
+
+# cdc_changes: dynamic schema discovered from <lake>.table_changes(...).
+# Returns one row per row-level change (insert / update_preimage /
+# update_postimage / delete) with the consumer's change_types filter
+# applied as a WHERE clause.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'orders_consumer', start_at = '1');
+
+# All four change types pass through unfiltered by default. Two inserts
+# plus an update gives us insert, insert, update_preimage, update_postimage.
+query I
+SELECT count(*) FROM cdc_changes('lake', 'orders_consumer', 'orders');
+----
+4
+
+# The schema includes the table's user columns plus our extra columns
+# (snapshot_time, author, commit_message, commit_extra_info, next_snapshot_id).
+query III
+SELECT change_type, id, status FROM cdc_changes('lake', 'orders_consumer', 'orders')
+ORDER BY snapshot_id ASC, rowid ASC, change_type ASC;
+----
+insert	1	new
+insert	2	paid
+update_postimage	2	shipped
+update_preimage	2	paid
+
+# next_snapshot_id surfaces the window's end snapshot for batch-commit ergonomics.
+query I
+SELECT count(DISTINCT next_snapshot_id) FROM cdc_changes('lake', 'orders_consumer', 'orders');
+----
+1
+
+# Setting change_types narrows the stream. No implicit update_preimage
+# filtering - if the consumer asked for it, it gets it; otherwise it
+# doesn't.
+statement ok
+UPDATE lake.main.__ducklake_cdc_consumers
+SET change_types = ['insert']
+WHERE consumer_name = 'orders_consumer';
+
+query II
+SELECT change_type, id FROM cdc_changes('lake', 'orders_consumer', 'orders')
+ORDER BY id;
+----
+insert	1
+insert	2
+
+statement ok
+UPDATE lake.main.__ducklake_cdc_consumers
+SET change_types = ['update_postimage', 'update_preimage']
+WHERE consumer_name = 'orders_consumer';
+
+query II
+SELECT change_type, id FROM cdc_changes('lake', 'orders_consumer', 'orders')
+ORDER BY change_type;
+----
+update_postimage	2
+update_preimage	2
+
+# A consumer with a tables filter that excludes the requested table is
+# rejected loudly rather than returning silently empty results.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'wrong_table', start_at = '1');
+
+statement ok
+UPDATE lake.main.__ducklake_cdc_consumers
+SET tables = ['main.something_else']
+WHERE consumer_name = 'wrong_table';
+
+statement error
+SELECT * FROM cdc_changes('lake', 'wrong_table', 'orders');
+----
+not in consumer 'wrong_table' tables filter
+
+# cdc_events and cdc_changes both refuse to run against an incompatible
+# catalog (same guard the underlying primitives apply).
+statement ok
+ATTACH ':memory:' AS fake;
+
+statement ok
+CREATE SCHEMA fake.__ducklake_metadata_fake;
+
+statement ok
+CREATE TABLE fake.__ducklake_metadata_fake.ducklake_metadata (key VARCHAR, value VARCHAR);
+
+statement ok
+INSERT INTO fake.__ducklake_metadata_fake.ducklake_metadata VALUES ('version', '99.99');
+
+statement error
+SELECT * FROM cdc_events('fake', 'shouldfail');
+----
+CDC_INCOMPATIBLE_CATALOG
+
+statement error
+SELECT * FROM cdc_changes('fake', 'shouldfail', 'orders');
+----
+CDC_INCOMPATIBLE_CATALOG

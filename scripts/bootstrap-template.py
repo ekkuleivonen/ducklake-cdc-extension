@@ -103,7 +103,9 @@ def replace_everywhere(to_find: str, to_replace: str) -> None:
     replace("./Makefile", to_find.upper(), to_replace.upper())
     replace("./README.md", to_find, to_replace)
     replace("./extension_config.cmake", to_find, to_replace)
-    replace(".github/workflows/MainDistributionPipeline.yml", to_find, to_replace)
+    replace(".github/workflows/full-ci.yml", to_find, to_replace)
+    replace(".github/workflows/light-ci.yml", to_find, to_replace)
+    replace(".github/workflows/release.yml", to_find, to_replace)
 
 
 def remove_placeholder() -> None:

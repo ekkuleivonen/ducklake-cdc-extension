@@ -1,0 +1,211 @@
+# name: test/sql/observability.test
+# description: Observability sugar shipped in v0.0.6 — cdc_consumer_stats and
+#              cdc_audit_recent. Both are read-only stateless wrappers, never
+#              acquire the consumer's owner-token lease, and never write to
+#              the catalog beyond the implicit consumer-state bootstrap.
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/observability.ducklake' AS lake (DATA_PATH '__TEST_DIR__/observability_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+CREATE TABLE lake.shipments(id INTEGER, orders_id INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid');
+
+statement ok
+INSERT INTO lake.shipments VALUES (10, 1);
+
+# Two consumers — one filtered to a single table (filter is applied
+# directly to consumer state until cdc_consumer_create grows a named
+# param in PR 4), one wide-open. Used to exercise both the per-consumer
+# scope of the named `consumer` parameter and the multi-row case in
+# cdc_consumer_stats.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'orders_only', start_at = '0');
+
+statement ok
+UPDATE lake.__ducklake_cdc_consumers
+SET tables = ['main.orders']
+WHERE consumer_name = 'orders_only';
+
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'wide_open', start_at = '0');
+
+# Bare cdc_consumer_stats returns one row per registered consumer. We don't
+# assert on lag_seconds (clock-dependent) but every other column is
+# deterministic from the fixture.
+query II
+SELECT consumer_name, current_snapshot >= last_committed_snapshot
+FROM cdc_consumer_stats('lake')
+ORDER BY consumer_name;
+----
+orders_only	1
+wide_open	1
+
+# Both consumers are pinned at snapshot 0 (start_at='0') and the catalog
+# has advanced through CREATE TABLE x2 + INSERT x2, so lag_snapshots
+# should be > 0 and gap_distance should equal last_committed_snapshot
+# (oldest available snapshot is 0, so distance = 0 - 0 = 0 here).
+query III
+SELECT consumer_name, lag_snapshots > 0, gap_distance
+FROM cdc_consumer_stats('lake')
+ORDER BY consumer_name;
+----
+orders_only	true	0
+wide_open	true	0
+
+# Named `consumer` filters to a single row.
+query I
+SELECT count(*) FROM cdc_consumer_stats('lake', consumer => 'orders_only');
+----
+1
+
+# tables/change_types projection round-trips the consumer's filter set.
+# The wide_open consumer was created without filters so both columns
+# project as NULL (matching their on-disk representation).
+query III
+SELECT consumer_name, tables, change_types
+FROM cdc_consumer_stats('lake', consumer => 'orders_only');
+----
+orders_only	[main.orders]	NULL
+
+query III
+SELECT consumer_name, tables, change_types
+FROM cdc_consumer_stats('lake', consumer => 'wide_open');
+----
+wide_open	NULL	NULL
+
+# tables_unresolved is empty when every filtered table exists at the
+# current snapshot. (The wide_open consumer has no filter, so the column
+# is also empty by construction.)
+query II
+SELECT consumer_name, tables_unresolved
+FROM cdc_consumer_stats('lake')
+ORDER BY consumer_name;
+----
+orders_only	[]
+wide_open	[]
+
+# A consumer pinned to a table that does not exist surfaces the missing
+# qualified name in tables_unresolved without raising. Lets dashboards
+# distinguish "filter typo" from "lag" without a separate probe.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'typo', start_at = '0');
+
+statement ok
+UPDATE lake.__ducklake_cdc_consumers
+SET tables = ['main.does_not_exist']
+WHERE consumer_name = 'typo';
+
+query II
+SELECT consumer_name, tables_unresolved
+FROM cdc_consumer_stats('lake', consumer => 'typo');
+----
+typo	[main.does_not_exist]
+
+statement ok
+SELECT * FROM cdc_consumer_drop('lake', 'typo');
+
+# Lease columns: nobody is holding a lease yet, so owner_token is NULL,
+# acquired/heartbeat are NULL, and lease_alive is false.
+query III
+SELECT owner_token IS NULL, owner_acquired_at IS NULL, lease_alive
+FROM cdc_consumer_stats('lake', consumer => 'orders_only');
+----
+true	true	false
+
+# Acquire a lease the normal way (cdc_window grabs it), then heartbeat
+# refreshes it. lease_alive flips to true once a holder is present.
+statement ok
+SELECT * FROM cdc_window('lake', 'orders_only');
+
+statement ok
+SELECT * FROM cdc_consumer_heartbeat('lake', 'orders_only');
+
+query III
+SELECT owner_token IS NULL, owner_acquired_at IS NULL, lease_alive
+FROM cdc_consumer_stats('lake', consumer => 'orders_only');
+----
+false	false	true
+
+# cdc_audit_recent surfaces the consumer lifecycle events that have
+# happened in the lookback window. Defaults to 24h. The fixture has run
+# create x3, drop x1 = 4 audit rows so far. (Lease acquire and heartbeat
+# don't audit on the happy path — only force-acquire and force-release
+# do.)
+query I
+SELECT count(*) FROM cdc_audit_recent('lake') WHERE consumer_name IN ('orders_only', 'wide_open', 'typo');
+----
+4
+
+# Filter by consumer.
+query II
+SELECT action, consumer_name FROM cdc_audit_recent('lake', consumer => 'orders_only')
+ORDER BY ts ASC, audit_id ASC;
+----
+consumer_create	orders_only
+
+# since_seconds = 0 means "right now or in the future", so an empty audit
+# slice. Useful for monitors that want a strict "anything in the last N
+# seconds" probe with a tight lookback.
+query I
+SELECT count(*) FROM cdc_audit_recent('lake', since_seconds => 0);
+----
+0
+
+# Negative since_seconds is rejected. Catches accidental sign flips in
+# dashboards that pass a delta directly.
+statement error
+SELECT * FROM cdc_audit_recent('lake', since_seconds => -1);
+----
+since_seconds must be >= 0
+
+# Both functions are read-only beyond the implicit consumer-state
+# bootstrap. Calling them never touches the consumer cursor.
+query II
+SELECT consumer_name, last_committed_snapshot
+FROM cdc_consumer_stats('lake')
+ORDER BY consumer_name;
+----
+orders_only	0
+wide_open	0
+
+# CDC_INCOMPATIBLE_CATALOG: A DuckLake catalog stamped with an
+# unsupported metadata version is rejected by both helpers via the
+# shared CheckCatalogOrThrow probe. Mirrors the consumer_state.test
+# fixture so the gate behaves identically across primitives, sugar, and
+# observability.
+statement ok
+ATTACH ':memory:' AS fake;
+
+statement ok
+CREATE SCHEMA fake.__ducklake_metadata_fake;
+
+statement ok
+CREATE TABLE fake.__ducklake_metadata_fake.ducklake_metadata (key VARCHAR, value VARCHAR);
+
+statement ok
+INSERT INTO fake.__ducklake_metadata_fake.ducklake_metadata VALUES ('version', '99.99');
+
+statement error
+SELECT * FROM cdc_consumer_stats('fake');
+----
+CDC_INCOMPATIBLE_CATALOG
+
+statement error
+SELECT * FROM cdc_audit_recent('fake');
+----
+CDC_INCOMPATIBLE_CATALOG

@@ -1,0 +1,380 @@
+{
+  "backend": "postgres",
+  "backend_extension_version": null,
+  "captured_at": "2026-04-28T11:29:46Z",
+  "data_inlining_row_limit": 10,
+  "duckdb_version": "1.5.2",
+  "ducklake_extension_version": "415a9ebd",
+  "git_sha": "43de1523f919",
+  "operations": [
+    {
+      "changes_made": "created_schema:\"main\"",
+      "changes_map": {
+        "schemas_created": [
+          "main"
+        ]
+      },
+      "kind": "_seed_attach_initial_snapshot",
+      "note": "baseline snapshot when DuckLake initialises the catalog",
+      "produced_snapshot": true,
+      "snapshot_id": 0,
+      "sql": "(initial snapshot at ATTACH time)",
+      "supported": true
+    },
+    {
+      "changes_made": "created_schema:\"test_s\"",
+      "changes_map": {
+        "schemas_created": [
+          "test_s"
+        ]
+      },
+      "kind": "created_schema",
+      "note": "schema-level DDL",
+      "produced_snapshot": true,
+      "snapshot_id": 1,
+      "sql": "CREATE SCHEMA test_s",
+      "supported": true
+    },
+    {
+      "changes_made": "created_table:\"main\".\"t_main\"",
+      "changes_map": {
+        "tables_created": [
+          "main.t_main"
+        ]
+      },
+      "kind": "created_table_main",
+      "note": "table in default 'main' schema",
+      "produced_snapshot": true,
+      "snapshot_id": 2,
+      "sql": "CREATE TABLE main.t_main (id INTEGER, name VARCHAR)",
+      "supported": true
+    },
+    {
+      "changes_made": "created_table:\"test_s\".\"t_sub\"",
+      "changes_map": {
+        "tables_created": [
+          "test_s.t_sub"
+        ]
+      },
+      "kind": "created_table_qualified",
+      "note": "table in user-created schema",
+      "produced_snapshot": true,
+      "snapshot_id": 3,
+      "sql": "CREATE TABLE test_s.t_sub (id INTEGER, val VARCHAR)",
+      "supported": true
+    },
+    {
+      "changes_made": "inserted_into_table:2",
+      "changes_map": {
+        "tables_inserted_into": [
+          "2"
+        ]
+      },
+      "kind": "inserted_into_table_regular",
+      "note": "insert > DATA_INLINING_ROW_LIMIT=10 \u2192 goes to Parquet",
+      "produced_snapshot": true,
+      "snapshot_id": 4,
+      "sql": "INSERT INTO main.t_main SELECT i, 'name_'||i FROM range(50) AS r(i)",
+      "supported": true
+    },
+    {
+      "changes_made": "inlined_insert:2",
+      "changes_map": {
+        "inlined_insert": [
+          "2"
+        ]
+      },
+      "kind": "inserted_into_table_inlined",
+      "note": "single-row insert \u2264 DATA_INLINING_ROW_LIMIT=10 \u2192 inlined",
+      "produced_snapshot": true,
+      "snapshot_id": 5,
+      "sql": "INSERT INTO main.t_main VALUES (999, 'tiny')",
+      "supported": true
+    },
+    {
+      "changes_made": "inlined_delete:2",
+      "changes_map": {
+        "inlined_delete": [
+          "2"
+        ]
+      },
+      "kind": "deleted_from_table_small",
+      "note": "delete of \u2264 10 rows \u2192 inlined_delete tombstone batch",
+      "produced_snapshot": true,
+      "snapshot_id": 6,
+      "sql": "DELETE FROM main.t_main WHERE id < 5",
+      "supported": true
+    },
+    {
+      "changes_made": "deleted_from_table:2",
+      "changes_map": {
+        "tables_deleted_from": [
+          "2"
+        ]
+      },
+      "kind": "deleted_from_table_large",
+      "note": "delete of > 10 rows \u2192 non-inlined delete file",
+      "produced_snapshot": true,
+      "snapshot_id": 7,
+      "sql": "DELETE FROM main.t_main WHERE id BETWEEN 10 AND 49",
+      "supported": true
+    },
+    {
+      "changes_made": "inlined_delete:2",
+      "changes_map": {
+        "inlined_delete": [
+          "2"
+        ]
+      },
+      "kind": "inlined_delete_inline_on_inline",
+      "note": "delete targeting an inlined-insert row (spec edge case)",
+      "produced_snapshot": true,
+      "snapshot_id": 8,
+      "sql": "DELETE FROM main.t_main WHERE id = 999",
+      "supported": true
+    },
+    {
+      "changes_made": "inserted_into_table:2",
+      "changes_map": {
+        "tables_inserted_into": [
+          "2"
+        ]
+      },
+      "kind": "inserted_into_table_more",
+      "note": "second non-inlined insert (sets up compaction input)",
+      "produced_snapshot": true,
+      "snapshot_id": 9,
+      "sql": "INSERT INTO main.t_main SELECT i, 'more_'||i FROM range(50, 80) AS r(i)",
+      "supported": true
+    },
+    {
+      "changes_made": "created_table:\"main\".\"t_compact\"",
+      "changes_map": {
+        "tables_created": [
+          "main.t_compact"
+        ]
+      },
+      "kind": "_setup_compact_table",
+      "note": "set up dedicated table for the compaction test",
+      "produced_snapshot": true,
+      "snapshot_id": 10,
+      "sql": "CREATE TABLE main.t_compact (id INTEGER, payload VARCHAR)",
+      "supported": true
+    },
+    {
+      "changes_made": "inserted_into_table:4",
+      "changes_map": {
+        "tables_inserted_into": [
+          "4"
+        ]
+      },
+      "kind": "_setup_compact_files_1",
+      "note": "first Parquet file for compaction",
+      "produced_snapshot": true,
+      "snapshot_id": 11,
+      "sql": "INSERT INTO main.t_compact SELECT i, repeat('a', 50) FROM range(20) AS r(i)",
+      "supported": true
+    },
+    {
+      "changes_made": "inserted_into_table:4",
+      "changes_map": {
+        "tables_inserted_into": [
+          "4"
+        ]
+      },
+      "kind": "_setup_compact_files_2",
+      "note": "second Parquet file for compaction",
+      "produced_snapshot": true,
+      "snapshot_id": 12,
+      "sql": "INSERT INTO main.t_compact SELECT i, repeat('b', 50) FROM range(20, 40) AS r(i)",
+      "supported": true
+    },
+    {
+      "changes_made": "inserted_into_table:4",
+      "changes_map": {
+        "tables_inserted_into": [
+          "4"
+        ]
+      },
+      "kind": "_setup_compact_files_3",
+      "note": "third Parquet file for compaction",
+      "produced_snapshot": true,
+      "snapshot_id": 13,
+      "sql": "INSERT INTO main.t_compact SELECT i, repeat('c', 50) FROM range(40, 60) AS r(i)",
+      "supported": true
+    },
+    {
+      "changes_made": "merge_adjacent:4",
+      "changes_map": {
+        "merge_adjacent": [
+          "4"
+        ]
+      },
+      "kind": "compacted_table",
+      "note": "merge adjacent Parquet files (forced via small min_file_size)",
+      "produced_snapshot": true,
+      "snapshot_id": 14,
+      "sql": "CALL ducklake_merge_adjacent_files('lake', min_file_size => 1, max_file_size => 999999999)",
+      "supported": true
+    },
+    {
+      "changes_made": "altered_table:2",
+      "changes_map": {
+        "tables_altered": [
+          "2"
+        ]
+      },
+      "kind": "altered_table_add_column",
+      "note": "ADD COLUMN",
+      "produced_snapshot": true,
+      "snapshot_id": 15,
+      "sql": "ALTER TABLE main.t_main ADD COLUMN extra INTEGER",
+      "supported": true
+    },
+    {
+      "changes_made": "altered_table:2",
+      "changes_map": {
+        "tables_altered": [
+          "2"
+        ]
+      },
+      "kind": "altered_table_drop_column",
+      "note": "DROP COLUMN",
+      "produced_snapshot": true,
+      "snapshot_id": 16,
+      "sql": "ALTER TABLE main.t_main DROP COLUMN extra",
+      "supported": true
+    },
+    {
+      "changes_made": "altered_table:2",
+      "changes_map": {
+        "tables_altered": [
+          "2"
+        ]
+      },
+      "kind": "altered_table_rename_column",
+      "note": "RENAME COLUMN (per spec: surfaces as altered, not renamed)",
+      "produced_snapshot": true,
+      "snapshot_id": 17,
+      "sql": "ALTER TABLE main.t_main RENAME COLUMN name TO label",
+      "supported": true
+    },
+    {
+      "changes_made": "altered_table:2",
+      "changes_map": {
+        "tables_altered": [
+          "2"
+        ]
+      },
+      "kind": "altered_table_change_type",
+      "note": "ALTER COLUMN TYPE",
+      "produced_snapshot": true,
+      "snapshot_id": 18,
+      "sql": "ALTER TABLE main.t_main ALTER COLUMN id TYPE BIGINT",
+      "supported": true
+    },
+    {
+      "changes_made": "created_table:\"main\".\"renamed_main\"",
+      "changes_map": {
+        "tables_created": [
+          "main.renamed_main"
+        ]
+      },
+      "kind": "altered_table_rename_table",
+      "note": "RENAME TABLE (per spec: surfaces as altered, not renamed)",
+      "produced_snapshot": true,
+      "snapshot_id": 19,
+      "sql": "ALTER TABLE main.t_main RENAME TO renamed_main",
+      "supported": true
+    },
+    {
+      "changes_made": "created_view:\"main\".\"v1\"",
+      "changes_map": {
+        "views_created": [
+          "main.v1"
+        ]
+      },
+      "kind": "created_view",
+      "note": "CREATE VIEW",
+      "produced_snapshot": true,
+      "snapshot_id": 20,
+      "sql": "CREATE VIEW main.v1 AS SELECT * FROM main.renamed_main",
+      "supported": true
+    },
+    {
+      "changes_made": "dropped_view:5,created_view:\"main\".\"v1\"",
+      "changes_map": {
+        "views_created": [
+          "main.v1"
+        ],
+        "views_dropped": [
+          "5"
+        ]
+      },
+      "kind": "altered_view",
+      "note": "CREATE OR REPLACE VIEW (the closest DuckDB analogue to ALTER VIEW)",
+      "produced_snapshot": true,
+      "snapshot_id": 21,
+      "sql": "CREATE OR REPLACE VIEW main.v1 AS SELECT id FROM main.renamed_main",
+      "supported": true
+    },
+    {
+      "changes_made": "dropped_view:6",
+      "changes_map": {
+        "views_dropped": [
+          "6"
+        ]
+      },
+      "kind": "dropped_view",
+      "note": "DROP VIEW",
+      "produced_snapshot": true,
+      "snapshot_id": 22,
+      "sql": "DROP VIEW main.v1",
+      "supported": true
+    },
+    {
+      "changes_made": "dropped_table:2",
+      "changes_map": {
+        "tables_dropped": [
+          "2"
+        ]
+      },
+      "kind": "dropped_table",
+      "note": "DROP TABLE",
+      "produced_snapshot": true,
+      "snapshot_id": 23,
+      "sql": "DROP TABLE main.renamed_main",
+      "supported": true
+    },
+    {
+      "changes_made": "dropped_table:3",
+      "changes_map": {
+        "tables_dropped": [
+          "3"
+        ]
+      },
+      "kind": "dropped_table_qualified",
+      "note": "DROP TABLE in user-created schema",
+      "produced_snapshot": true,
+      "snapshot_id": 24,
+      "sql": "DROP TABLE test_s.t_sub",
+      "supported": true
+    },
+    {
+      "changes_made": "dropped_schema:1",
+      "changes_map": {
+        "schemas_dropped": [
+          "1"
+        ]
+      },
+      "kind": "dropped_schema",
+      "note": "DROP SCHEMA",
+      "produced_snapshot": true,
+      "snapshot_id": 25,
+      "sql": "DROP SCHEMA test_s",
+      "supported": true
+    }
+  ],
+  "platform": "darwin-arm64",
+  "python_version": "3.14.0"
+}

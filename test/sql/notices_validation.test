@@ -1,0 +1,136 @@
+# name: test/sql/notices_validation.test
+# description: PR 4 — create-time validation of cdc_consumer_create
+#              (CDC_INVALID_TABLE_FILTER + change_types/event_categories
+#              ALLOWED enum gates), CDC_SCHEMA_BOUNDARY notice on
+#              cdc_window, CDC_WAIT_TIMEOUT_CLAMPED notice on cdc_wait,
+#              and the DDL-vs-DML routing of consumer.event_categories
+#              into cdc_ddl / cdc_changes. All shipped as v0.0.7.
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/notices.ducklake' AS lake (DATA_PATH '__TEST_DIR__/notices_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new');
+
+# tables filter: name that exists at start_at is accepted.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'good_filter', start_at = '1', tables = ['main.orders']);
+
+# tables filter: name that does not exist raises CDC_INVALID_TABLE_FILTER.
+# The reference message includes the supplied list, the missing names,
+# the snapshot id, and the actual catalog tables for diagnosis.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'typo', start_at = '1', tables = ['main.orders', 'main.ordres']);
+----
+CDC_INVALID_TABLE_FILTER
+
+# tables filter: empty list is rejected (it would deny everything,
+# which is almost certainly a bug; consumers that take everything
+# should omit the tables parameter).
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'empty_filter', start_at = '1', tables = []);
+----
+empty tables list
+
+# change_types: known enum entries succeed.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'inserts_only', start_at = '1', change_types = ['insert']);
+
+# change_types: unknown entries are rejected with the allowed set in
+# the message.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'bad_change', start_at = '1', change_types = ['upsert']);
+----
+invalid change_types
+
+# event_categories: known enum entries succeed.
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'ddl_only', start_at = '1', event_categories = ['ddl']);
+
+statement ok
+SELECT * FROM cdc_consumer_create('lake', 'dml_only', start_at = '1', event_categories = ['dml']);
+
+# event_categories: unknown entries rejected.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'bad_event', start_at = '1', event_categories = ['snapshot']);
+----
+invalid event_categories
+
+# event_categories filter is honored at read time. Add some DML so the
+# windows actually have work to do.
+statement ok
+INSERT INTO lake.orders VALUES (2, 'paid');
+
+statement ok
+UPDATE lake.orders SET status = 'shipped' WHERE id = 1;
+
+# DDL-only consumer: cdc_ddl returns the DDL events for snapshots in
+# its window (cdc_recent_ddl picks them up too, but cdc_ddl is the
+# stateful one we're checking here). cdc_changes returns zero rows.
+query I
+SELECT count(*) FROM cdc_changes('lake', 'ddl_only', 'orders');
+----
+0
+
+# DML-only consumer: cdc_ddl returns zero rows, cdc_changes returns
+# DML normally.
+query I
+SELECT count(*) FROM cdc_ddl('lake', 'dml_only');
+----
+0
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'dml_only', 'orders') WHERE change_type IN ('insert', 'update_postimage', 'update_preimage', 'delete');
+----
+4
+
+# cdc_wait clamps timeout_ms above the 5-minute hard cap (300_000ms).
+# The notice fires (asserted via stderr in the unittest run) and the
+# call itself must still succeed — does not reject the clamped value.
+# `good_filter` has pending DML waiting (the INSERT and UPDATE landed
+# after its create), so the wait returns the next snapshot id
+# immediately rather than the timeout NULL. The point of the assertion
+# is "clamping does not raise"; the snapshot id varies with fixture
+# state so we only assert non-NULL.
+query I
+SELECT snapshot_id IS NOT NULL FROM cdc_wait('lake', 'good_filter', timeout_ms = 600000);
+----
+true
+
+# Negative timeout_ms still rejected as a hard error.
+statement error
+SELECT * FROM cdc_wait('lake', 'good_filter', timeout_ms = -1);
+----
+timeout_ms must be >= 0
+
+# CDC_INCOMPATIBLE_CATALOG: validation gates fire only on a real
+# DuckLake catalog (CheckCatalogOrThrow runs first). Fixture identical
+# to consumer_state.test.
+statement ok
+ATTACH ':memory:' AS fake;
+
+statement ok
+CREATE SCHEMA fake.__ducklake_metadata_fake;
+
+statement ok
+CREATE TABLE fake.__ducklake_metadata_fake.ducklake_metadata (key VARCHAR, value VARCHAR);
+
+statement ok
+INSERT INTO fake.__ducklake_metadata_fake.ducklake_metadata VALUES ('version', '99.99');
+
+statement error
+SELECT * FROM cdc_consumer_create('fake', 'shouldfail', tables = ['main.orders']);
+----
+CDC_INCOMPATIBLE_CATALOG

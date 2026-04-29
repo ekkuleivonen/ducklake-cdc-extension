@@ -1,0 +1,112 @@
+name: Bug report
+description: Report unexpected behaviour in the extension or a reference sink.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The more reproducible the report, the faster
+        the fix. The fields below match the diagnostic information called out
+        in `CONTRIBUTING.md` § "Reporting issues".
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing what went wrong.
+      placeholder: cdc_window raised CDC_BUSY immediately after cdc_consumer_create on a fresh consumer.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        SQL or shell commands that reproduce the issue against a fresh DuckDB session.
+        Include any DDL needed to set up the failing state.
+      render: sql
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened, including any error messages verbatim.
+      placeholder: |
+        Error: CDC_BUSY: consumer 'test' is currently held by token ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen instead, and which doc / ADR led you to that expectation.
+    validations:
+      required: true
+
+  - type: input
+    id: extension-version
+    attributes:
+      label: ducklake_cdc version
+      description: |
+        Output of `SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake_cdc';`
+      placeholder: 0.1.0-beta.1
+    validations:
+      required: true
+
+  - type: input
+    id: duckdb-version
+    attributes:
+      label: DuckDB version
+      description: Output of `SELECT version();`
+      placeholder: v1.5.2
+    validations:
+      required: true
+
+  - type: input
+    id: ducklake-version
+    attributes:
+      label: DuckLake extension version
+      description: |
+        Output of `SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake';`
+      placeholder: 415a9ebd
+    validations:
+      required: true
+
+  - type: dropdown
+    id: catalog-backend
+    attributes:
+      label: Catalog backend
+      options:
+        - DuckDB
+        - SQLite
+        - Postgres
+        - Other (please describe in Notes)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 14.5 / Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: relevant-docs
+    attributes:
+      label: Relevant ADR / doc
+      description: |
+        If a specific ADR or doc covers the area you're filing against, link it. (`docs/decisions/0007-concurrency-model.md`,
+        `docs/api.md#filter-composition`, etc.) This helps triage faster.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else relevant — workarounds tried, similar issues you suspect.

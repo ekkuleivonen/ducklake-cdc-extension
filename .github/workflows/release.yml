@@ -1,0 +1,356 @@
+#
+# One-click release automation.
+#
+# A maintainer triggers this from the Actions UI on `main` (for the next
+# minor release line) or on a `release/X.Y` branch (for a patch on a
+# previously-published line). On success, this workflow:
+#
+#   1. Validates the trigger ref and version format against the policy
+#      in docs/decisions/0012-branching-ci-release.md and
+#      docs/decisions/0013-versioning-and-release-automation.md.
+#   2. Verifies that Full CI is green on the trigger SHA — `main` cannot
+#      be released from a SHA that has not passed the full gate.
+#   3. Creates an annotated git tag (vMAJOR.MINOR.PATCH).
+#   4. Creates the maintenance branch `release/MAJOR.MINOR` from the tag
+#      if releasing the first patch of a new line.
+#   5. Creates a GitHub Release with auto-generated notes (driven by
+#      `.github/release.yml` label categories).
+#   6. Opens a PR against `duckdb/community-extensions` that updates this
+#      extension's descriptor to point at the new tag SHA.
+#
+# Set `dry_run: true` (the default) the first time you run it on a new
+# version. Nothing is pushed, nothing is published; the workflow just
+# prints what it *would* do.
+#
+# Required secrets:
+#   - `COMMUNITY_BOT_TOKEN` — a GitHub PAT (or fine-grained token) that
+#     has `contents: write` on a fork of `duckdb/community-extensions` and
+#     can open PRs against the upstream. Only needed for the
+#     `community-pr` job; everything else uses the workflow's own
+#     `GITHUB_TOKEN`.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v0.1.0). Must be vMAJOR.MINOR.PATCH; pre-1.0 keeps MAJOR=0.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run: validate everything, print the plan, but do not push tags/branches or open PRs.'
+        type: boolean
+        default: true
+      skip_community_pr:
+        description: 'Skip the duckdb/community-extensions PR step (use if the PAT is not configured yet, or for a hot patch).'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  EXTENSION_NAME: ducklake_cdc
+
+jobs:
+  release:
+    name: Tag, release, maintenance branch
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ inputs.version }}
+      release_sha: ${{ steps.tag.outputs.sha }}
+      maintenance_branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - name: Validate trigger ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != "refs/heads/main" && ! "$REF" =~ ^refs/heads/release/[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release must be triggered from main or a release/X.Y branch (got $REF)."
+            exit 1
+          fi
+          echo "Triggered from $REF."
+
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v(0\.[0-9]+\.[0-9]+|[1-9][0-9]*\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Version $VERSION must match vMAJOR.MINOR.PATCH where pre-1.0 keeps MAJOR=0."
+            exit 1
+          fi
+
+      - name: Validate version matches branch policy
+        env:
+          REF: ${{ github.ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Strip the leading 'v'.
+          stripped="${VERSION#v}"
+          major="${stripped%%.*}"
+          rest="${stripped#*.}"
+          minor="${rest%%.*}"
+          patch="${stripped##*.}"
+
+          if [[ "$REF" == "refs/heads/main" ]]; then
+            # Releases from main must be a .0 patch (a new minor or major
+            # line). Subsequent patches on a published line must be cut
+            # from the corresponding release/X.Y branch.
+            if [[ "$patch" != "0" ]]; then
+              echo "::error::Patch releases (patch != 0) must be triggered from release/$major.$minor, not main."
+              exit 1
+            fi
+          else
+            # Triggered from refs/heads/release/X.Y; must match the
+            # version's MAJOR.MINOR exactly.
+            branch_mm="${REF#refs/heads/release/}"
+            if [[ "$branch_mm" != "$major.$minor" ]]; then
+              echo "::error::Version $VERSION cannot be released from $REF (expected refs/heads/release/$major.$minor)."
+              exit 1
+            fi
+            # Patches on a maintenance branch must have patch > 0.
+            if [[ "$patch" == "0" ]]; then
+              echo "::error::A .0 release must be cut from main, not from $REF."
+              exit 1
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Verify tag does not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION already exists."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION already exists on origin."
+            exit 1
+          fi
+
+      - name: Verify Full CI is green at the release SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Branch protection on `main` already requires Full CI to pass
+          # before merge, so the latest SHA on `main` should always be
+          # green. We re-verify here as belt-and-braces, and so that
+          # release-from-release/X.Y also requires a green Full CI run on
+          # that branch.
+          status=$(gh api "repos/${{ github.repository }}/commits/$SHA/check-runs" \
+            --jq '[.check_runs[] | select(.name == "CI Pass")] | .[0].conclusion // "missing"')
+          echo "ci-pass status at $SHA: $status"
+          if [[ "$status" != "success" ]]; then
+            echo "::error::Full CI 'CI Pass' check has not succeeded at $SHA. Refusing to release."
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute maintenance branch name
+        id: branch
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          stripped="${VERSION#v}"
+          major="${stripped%%.*}"
+          rest="${stripped#*.}"
+          minor="${rest%%.*}"
+          echo "name=release/$major.$minor" >> "$GITHUB_OUTPUT"
+          echo "Maintenance branch: release/$major.$minor"
+
+      - name: Create annotated tag
+        id: tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git tag -a "$VERSION" -m "Release $VERSION"
+          echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: git push origin "refs/tags/$VERSION"
+
+      - name: Create or fast-forward maintenance branch
+        if: ${{ !inputs.dry_run }}
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+          REF: ${{ github.ref }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Maintenance branch $BRANCH already exists; leaving it alone."
+            echo "(Patch releases must be cut from the existing branch, not main.)"
+          else
+            git push origin "HEAD:refs/heads/$BRANCH"
+            echo "Created maintenance branch $BRANCH at $GITHUB_SHA."
+          fi
+
+      - name: Create GitHub Release with auto-generated notes
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Categorisation comes from .github/release.yml.
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --generate-notes
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        env:
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          {
+            echo "## Dry run — nothing was pushed"
+            echo ""
+            echo "Would have:"
+            echo "- pushed annotated tag \`$VERSION\` at \`$GITHUB_SHA\`"
+            echo "- ensured maintenance branch \`$BRANCH\` exists at the same SHA"
+            echo "- created a GitHub Release with auto-generated notes"
+            echo "- opened a PR against \`duckdb/community-extensions\` (separate job)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  community-pr:
+    name: Open community-extensions PR
+    needs: release
+    if: ${{ !inputs.dry_run && !inputs.skip_community_pr }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check community bot token is configured
+        env:
+          TOKEN: ${{ secrets.COMMUNITY_BOT_TOKEN }}
+        run: |
+          if [[ -z "$TOKEN" ]]; then
+            echo "::error::COMMUNITY_BOT_TOKEN is not set. See docs/decisions/0013-versioning-and-release-automation.md for the one-time setup steps, or re-run with skip_community_pr: true."
+            exit 1
+          fi
+
+      - name: Clone community-extensions
+        env:
+          GH_TOKEN: ${{ secrets.COMMUNITY_BOT_TOKEN }}
+        run: |
+          # Clone via the bot token so subsequent push works.
+          gh auth setup-git
+          git clone "https://x-access-token:$GH_TOKEN@github.com/duckdb/community-extensions.git" community-extensions
+
+      - name: Update extension descriptor
+        working-directory: community-extensions
+        env:
+          VERSION: ${{ needs.release.outputs.tag }}
+          RELEASE_SHA: ${{ needs.release.outputs.release_sha }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          mkdir -p "extensions/$EXTENSION_NAME"
+          DESCRIPTOR="extensions/$EXTENSION_NAME/description.yml"
+          # Community descriptors carry the SemVer without the 'v' prefix.
+          STRIPPED_VERSION="${VERSION#v}"
+
+          if [[ -f "$DESCRIPTOR" ]]; then
+            # Update only the moving fields. Anything else (maintainers,
+            # description, build flags, etc.) is left untouched and stays
+            # under the maintainer's control.
+            DESCRIPTOR="$DESCRIPTOR" \
+            STRIPPED_VERSION="$STRIPPED_VERSION" \
+            RELEASE_SHA="$RELEASE_SHA" \
+            python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["DESCRIPTOR"])
+          version = os.environ["STRIPPED_VERSION"]
+          sha = os.environ["RELEASE_SHA"]
+
+          text = path.read_text()
+          text = re.sub(
+              r'(?m)^(\s*version:\s*)["\']?[^"\'\n]+["\']?',
+              lambda m: f'{m.group(1)}"{version}"',
+              text,
+              count=1,
+          )
+          text = re.sub(
+              r'(?m)^(\s*ref:\s*)["\']?[0-9a-f]{7,40}["\']?',
+              lambda m: f'{m.group(1)}"{sha}"',
+              text,
+              count=1,
+          )
+          path.write_text(text)
+          PY
+          else
+            cat > "$DESCRIPTOR" <<EOF
+          extension:
+            name: $EXTENSION_NAME
+            description: "Stream changes from your DuckLake — durable consumer cursors, single-reader windows, typed DDL events."
+            version: "$STRIPPED_VERSION"
+            language: C++
+            build: cmake
+            license: Apache-2.0
+            excluded_platforms: ""
+            requires_toolchains: ""
+            maintainers:
+              - "$ACTOR"
+
+          repo:
+            github: "$REPO"
+            ref: "$RELEASE_SHA"
+          EOF
+            echo "::warning::Created a new descriptor at $DESCRIPTOR. Review and adjust the maintainer list and description before merging the community PR."
+          fi
+
+          cat "$DESCRIPTOR"
+
+      - name: Configure git for the bot
+        working-directory: community-extensions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit, push, and open PR
+        working-directory: community-extensions
+        env:
+          GH_TOKEN: ${{ secrets.COMMUNITY_BOT_TOKEN }}
+          VERSION: ${{ needs.release.outputs.tag }}
+          RELEASE_SHA: ${{ needs.release.outputs.release_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BRANCH="${EXTENSION_NAME}-${VERSION}"
+          git checkout -b "$BRANCH"
+          git add "extensions/$EXTENSION_NAME/description.yml"
+          git commit -m "$EXTENSION_NAME: $VERSION"
+          git push -u origin "$BRANCH"
+
+          cat > /tmp/community-pr-body.md <<EOF
+          Automated descriptor update for [$REPO@$VERSION](https://github.com/$REPO/releases/tag/$VERSION).
+
+          Release SHA: \`$RELEASE_SHA\`
+
+          Generated by [.github/workflows/release.yml](https://github.com/$REPO/blob/$RELEASE_SHA/.github/workflows/release.yml).
+          EOF
+
+          gh pr create \
+            --repo duckdb/community-extensions \
+            --title "$EXTENSION_NAME: $VERSION" \
+            --body-file /tmp/community-pr-body.md

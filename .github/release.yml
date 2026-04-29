@@ -1,0 +1,42 @@
+#
+# Configuration for GitHub's auto-generated release notes (used by
+# `gh release create --generate-notes` in `.github/workflows/release.yml`).
+#
+# PRs are categorised by label. Add the appropriate label before merging
+# so the release notes group your change correctly. Anything left without
+# a recognised label falls into "Other changes" — that is the catch-all,
+# not a hidden bucket.
+#
+# See docs/decisions/0013-versioning-and-release-automation.md.
+
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - dependencies
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: New features
+      labels:
+        - feature
+        - enhancement
+    - title: Bug fixes
+      labels:
+        - bug
+        - fix
+    - title: Performance
+      labels:
+        - performance
+    - title: Documentation
+      labels:
+        - docs
+        - documentation
+    - title: CI / build
+      labels:
+        - ci
+        - build
+    - title: Other changes
+      labels:
+        - "*"

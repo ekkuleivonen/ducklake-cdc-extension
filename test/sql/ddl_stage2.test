@@ -1,0 +1,218 @@
+# name: test/sql/ddl_stage2.test
+# description: Stage-2 cdc_ddl details payloads (column lists, column-level
+#              diffs, view definitions, Finding-1 rename detection) plus the
+#              cdc_schema_diff sugar that projects per-column rows from the
+#              same extractor.
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl2.ducklake' AS lake (DATA_PATH '__TEST_DIR__/ddl2_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR DEFAULT 'new');
+
+# created.table now ships the column list in details. DuckLake stores
+# types as lowercase strings (`int32`, `varchar`) and the DEFAULT clause as
+# the raw value with no surrounding quotes (`new`, not `'new'`). DuckLake
+# v1.5.1's pinned DuckLake tuple stores an absent default as the literal
+# string `NULL`. column_id and column_order both start at 1 in DuckLake catalogs.
+query I
+SELECT details FROM cdc_recent_ddl('lake', for_table = 'orders')
+WHERE event_kind = 'created' AND object_kind = 'table';
+----
+{"columns":[{"id":1,"order":1,"name":"id","type":"int32","nullable":true,"default":"NULL"},{"id":2,"order":2,"name":"status","type":"varchar","nullable":true,"default":"new"}]}
+
+# ALTER TABLE ADD COLUMN c3
+statement ok
+ALTER TABLE lake.orders ADD COLUMN c3 BIGINT;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake', for_table = 'orders')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id;
+----
+altered	{"added":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+
+# ALTER TABLE DROP COLUMN c3
+statement ok
+ALTER TABLE lake.orders DROP COLUMN c3;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake', for_table = 'orders')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id;
+----
+altered	{"added":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+altered	{"dropped":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+
+# ALTER TABLE RENAME COLUMN status TO state
+statement ok
+ALTER TABLE lake.orders RENAME COLUMN status TO state;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake', for_table = 'orders')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id;
+----
+altered	{"added":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+altered	{"dropped":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+altered	{"renamed":[{"id":2,"old_name":"status","new_name":"state"}]}
+
+# ALTER TABLE ALTER COLUMN id TYPE BIGINT
+statement ok
+ALTER TABLE lake.orders ALTER COLUMN id TYPE BIGINT;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake', for_table = 'orders')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id;
+----
+altered	{"added":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+altered	{"dropped":[{"id":3,"name":"c3","type":"int64","nullable":true,"default":"NULL"}]}
+altered	{"renamed":[{"id":2,"old_name":"status","new_name":"state"}]}
+altered	{"type_changed":[{"id":1,"name":"id","old_type":"int32","new_type":"int64"}]}
+
+# ALTER TABLE RENAME (Finding-1: surfaced as altered.table with old/new
+# table names rather than as a paired drop+create).
+statement ok
+ALTER TABLE lake.orders RENAME TO orders_v2;
+
+# After a rename the for_table filter must use the new name (it works
+# against the post-event qualified name in the row, which is the contract).
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake', for_table = 'orders_v2')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id DESC
+LIMIT 1;
+----
+altered	{"old_table_name":"orders","new_table_name":"orders_v2"}
+
+# created.view ships the definition + dialect + column_aliases.
+statement ok
+CREATE VIEW lake.orders_v AS SELECT id, state FROM lake.main.orders_v2;
+
+query I
+SELECT details FROM cdc_recent_ddl('lake', for_table = 'orders_v2')
+WHERE object_kind = 'view' AND event_kind = 'created';
+----
+
+# (No row above because for_table filters by table identity, not view.
+# Without the filter, the view's details should be present. column_aliases
+# is the empty string when the user did not specify aliases - DuckLake
+# stores empty-string for "no aliases", not NULL.)
+query II
+SELECT object_kind, details FROM cdc_recent_ddl('lake')
+WHERE event_kind = 'created' AND object_kind = 'view'
+ORDER BY snapshot_id;
+----
+view	{"definition":"SELECT id, state FROM lake.main.orders_v2","dialect":"duckdb","column_aliases":""}
+
+# cdc_schema_diff: per-column rows over the diff between two snapshots.
+# Range covers everything from snapshot 0 up through current. We expect:
+#   - 3 added rows (id and status from CREATE TABLE, plus c3 from ADD COLUMN)
+#   - 1 dropped row (c3 from DROP COLUMN)
+#   - 1 renamed row (status -> state)
+#   - 1 type_changed row (id INTEGER -> BIGINT)
+query II
+SELECT change_kind, count(*) FROM cdc_schema_diff('lake', 'orders_v2', 0, 99999)
+GROUP BY change_kind
+ORDER BY change_kind;
+----
+added	3
+dropped	1
+renamed	1
+table_rename	1
+type_changed	1
+
+# A specific column-level row carries old/new fields populated for the
+# dimension that changed.
+query IIII
+SELECT change_kind, column_id, old_type, new_type FROM cdc_schema_diff('lake', 'orders_v2', 0, 99999)
+WHERE change_kind = 'type_changed';
+----
+type_changed	1	int32	int64
+
+# Negative / inverted range is rejected at bind.
+statement error
+SELECT * FROM cdc_schema_diff('lake', 'orders', 5, 1);
+----
+invalid snapshot range
+
+# -----------------------------------------------------------------------------
+# Per ADR 0008 + roadmap "cdc_ddl excludes compacted_table". Maintenance
+# events emitted by `ducklake_merge_adjacent_files` show up in
+# `cdc_events` (the raw stream) but NOT in `cdc_ddl` (typed DDL surface).
+# Operators monitoring compactions read `cdc_events`; sinks consuming
+# typed DDL never see them.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/compaction.ducklake' AS lake_cp (DATA_PATH '__TEST_DIR__/compaction_data');
+
+statement ok
+CREATE TABLE lake_cp.orders(id INTEGER);
+
+statement ok
+INSERT INTO lake_cp.orders VALUES (1);
+
+statement ok
+INSERT INTO lake_cp.orders VALUES (2);
+
+statement ok
+INSERT INTO lake_cp.orders VALUES (3);
+
+statement ok
+CALL ducklake_merge_adjacent_files('lake_cp');
+
+# Stage-1 cdc_ddl scan sees only created/altered/dropped tokens; it
+# does NOT classify `compacted_table:<id>` / `merge_adjacent:<id>` as
+# DDL. The CREATE TABLE event still surfaces; the compaction does not.
+query II
+SELECT event_kind, object_kind FROM cdc_recent_ddl('lake_cp', for_table = 'orders')
+ORDER BY snapshot_id, object_kind;
+----
+created	table
+
+# -----------------------------------------------------------------------------
+# Per ADR 0008 + roadmap: within a single snapshot, DDL rows are
+# delivered in stable (object_kind, object_id) order. The asymmetry is
+# intentional — for `created` events, schemas come before the views/
+# tables they contain; for `dropped` events, the order is reversed
+# (children before parents) so that downstream identity tracking can
+# observe the live row before it disappears.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_order.ducklake' AS lake_or (DATA_PATH '__TEST_DIR__/ddl_order_data');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE SCHEMA lake_or.warehouse;
+
+statement ok
+CREATE TABLE lake_or.warehouse.events(id INTEGER);
+
+statement ok
+COMMIT;
+
+# Within the snapshot, the schema must appear before the table it
+# contains (created.schema rank=0 < created.table rank=1). Restrict to
+# the user-created snapshot — `main` was created at lake init and
+# would otherwise pad the projection.
+query II
+SELECT event_kind, object_kind FROM cdc_recent_ddl('lake_or')
+WHERE event_kind = 'created' AND object_kind IN ('schema', 'table')
+  AND object_name IN ('warehouse', 'events');
+----
+created	schema
+created	table

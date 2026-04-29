@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/ekkuleivonen/ducklake-cdc-extension/discussions
+    about: Open-ended questions, design discussions, and ideas that aren't bugs or feature requests.
+  - name: Security
+    url: https://github.com/ekkuleivonen/ducklake-cdc-extension/security/advisories/new
+    about: Report a security vulnerability privately. Do not file public issues for security reports.

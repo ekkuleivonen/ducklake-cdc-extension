@@ -1,0 +1,41 @@
+# name: test/sql/compat_check.test
+# description: catalog-version compatibility check on LOAD ducklake_cdc;
+#              covers the silent paths (no DuckLake catalog attached, and a
+#              freshly attached compatible catalog). The incompatible-catalog
+#              warning path is covered by test/smoke/compat_warning_smoke.py
+#              because SQLLogicTest can't easily assert on a notice's text.
+# group: [sql]
+
+# Path 1: loading the extension with no DuckLake catalog attached must be
+# silent and must NOT block cdc_version() from returning the build stamp.
+require ducklake_cdc
+
+query I
+SELECT cdc_version() ILIKE 'ducklake_cdc %';
+----
+true
+
+# Path 2: with the DuckLake extension also loaded and a fresh catalog
+# attached, the compat check sees the catalog format stamped by the
+# validated DuckDB v1.5.1 DuckLake tuple. cdc_version() must still work.
+require icu
+
+require ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/compat.ducklake' AS lake (DATA_PATH '__TEST_DIR__/compat_data');
+
+query I
+SELECT cdc_version() ILIKE 'ducklake_cdc %';
+----
+true
+
+# Sanity: confirm the metadata row the compat check reads exists and
+# carries the value docs/compatibility.md claims it does. If this row
+# ever returns a value not listed in `SUPPORTED_DUCKLAKE_CATALOG_VERSIONS`
+# in src/compat_check.cpp, the matrix needs updating in the same PR
+# that bumps the duckdb submodule's `ducklake.cmake` GIT_TAG.
+query I
+SELECT value FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'version';
+----
+0.4

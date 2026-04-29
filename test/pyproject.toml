@@ -1,0 +1,9 @@
+[project]
+name = "ducklake-cdc-tests"
+version = "0.0.0"
+description = "DuckLake CDC upstream probes and smoke tests"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.2",
+    "psycopg[binary]>=3.1",
+]
