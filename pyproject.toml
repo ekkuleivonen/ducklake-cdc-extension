@@ -4,6 +4,6 @@ version = "0.0.0"
 description = "DuckLake CDC upstream probes and smoke tests"
 requires-python = ">=3.11"
 dependencies = [
-    "duckdb>=1.5.2",
+    "duckdb==1.5.1",
     "psycopg[binary]>=3.1",
 ]

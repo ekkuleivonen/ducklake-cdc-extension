@@ -151,6 +151,7 @@ that implement it:
 | --- | --- | --- |
 | `.github/workflows/light-ci.yml` | `push` to non-main, non-release branches | Tight feedback loop: format, tidy, single Linux debug build, smoke test against `test/sql/ducklake_cdc.test`. |
 | `.github/workflows/full-ci.yml` | `pull_request` and `push` to `main` and `release/**`, `tag v*`, `merge_group`, `workflow_dispatch` | Full DuckDB extension matrix via `extension-ci-tools` reusable workflows, plus `format` and `tidy`. Aggregator job `CI Pass` is the single status check branch protection requires. |
+| `.github/workflows/benchmark.yml` | `workflow_dispatch` only | Manual benchmark run. It downloads the `linux_amd64` extension artifact from a successful Full CI run and executes the light benchmark workload against the supported official DuckDB release; it can later grow into scheduled/nightly benchmark coverage without making PR and release gates wait for it. |
 | `.github/workflows/release.yml` | `workflow_dispatch` only | The release contract above. |
 | `.github/release.yml` | (config, not a workflow) | Maps PR labels to changelog sections for auto-generated release notes. |
 

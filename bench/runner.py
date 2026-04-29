@@ -1,9 +1,10 @@
 """Run the Phase 1 ducklake-cdc smoke benchmark.
 
 The Python layer owns workload parsing, command-line overrides, temporary
-paths, result JSON, and CI warnings. The benchmark itself is a tiny C++
-harness compiled against the locally built DuckDB library so it exercises
-the same local extension artifacts as the existing smoke probes.
+paths, result JSON, and CI warnings. Local development can still run a tiny
+C++ harness against a local DuckDB build; CI uses the official DuckDB Python
+package plus a previously built `ducklake_cdc` artifact so benchmarks do not
+rebuild DuckDB or upstream DuckLake from source.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import platform
 import shutil
@@ -18,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -272,6 +275,10 @@ def load_workload(path: Path, args: argparse.Namespace) -> Workload:
     return workload
 
 
+def quote_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def build_paths(build: str) -> dict[str, Path]:
     lib_name = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
     return {
@@ -315,6 +322,134 @@ def compile_harness(tmpdir: Path, paths: dict[str, Path]) -> Path:
     ]
     subprocess.run(cmd, cwd=REPO, check=True)
     return binary
+
+
+def now_nanos() -> int:
+    return time.monotonic_ns()
+
+
+def percentile(values: list[float], percentile_value: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    rank = (percentile_value / 100.0) * (len(sorted_values) - 1)
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return sorted_values[lower]
+    weight = rank - lower
+    return (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
+
+
+def values_for_snapshot(snapshot_index: int, rows_per_snapshot: int, produced_ns: int) -> str:
+    values = []
+    for row in range(rows_per_snapshot):
+        event_id = (snapshot_index * rows_per_snapshot) + row
+        values.append(f"({event_id}, {produced_ns}, {snapshot_index}, {row})")
+    return "INSERT INTO lake.bench_events VALUES " + ", ".join(values)
+
+
+def require_ok_python(conn: Any, sql: str) -> Any:
+    try:
+        return conn.execute(sql)
+    except Exception as exc:
+        raise RuntimeError(f"{sql}\n{exc}") from exc
+
+
+def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) -> dict[str, Any]:
+    import duckdb
+
+    lake = tmpdir / "bench.ducklake"
+    data = tmpdir / "bench_data"
+
+    conn = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    require_ok_python(conn, "INSTALL ducklake")
+    require_ok_python(conn, "LOAD ducklake")
+    require_ok_python(conn, "LOAD parquet")
+    require_ok_python(conn, "LOAD " + quote_string(str(cdc_extension)))
+    require_ok_python(conn, "ATTACH 'ducklake:" + str(lake) + "' AS lake (DATA_PATH " + quote_string(str(data)) + ")")
+    require_ok_python(conn, "CREATE TABLE lake.bench_events(id BIGINT, produced_ns BIGINT, snapshot_no INTEGER, row_no INTEGER)")
+
+    for consumer in range(workload.consumers):
+        require_ok_python(conn, f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}')")
+
+    planned_snapshots = max(1, round((workload.duration_seconds * workload.snapshots_per_minute) / 60.0))
+    interval_seconds = 60.0 / workload.snapshots_per_minute
+    latencies_ms: list[float] = []
+    total_events = 0
+    cdc_window_calls = 0
+    cdc_changes_calls = 0
+    cdc_commit_calls = 0
+    producer_inserts = 0
+    started_at = time.monotonic()
+
+    for snapshot in range(planned_snapshots):
+        target = started_at + (interval_seconds * snapshot)
+        sleep_seconds = target - time.monotonic()
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+        produced_ns = now_nanos()
+        require_ok_python(conn, values_for_snapshot(snapshot, workload.rows_per_snapshot, produced_ns))
+        producer_inserts += 1
+
+        for consumer in range(workload.consumers):
+            consumer_name = f"bench_{consumer}"
+            window_rows = require_ok_python(
+                conn,
+                "SELECT * FROM cdc_window('lake', "
+                + quote_string(consumer_name)
+                + f", max_snapshots => {workload.max_snapshots})",
+            ).fetchall()
+            cdc_window_calls += 1
+            if len(window_rows) != 1 or not window_rows[0][2]:
+                raise RuntimeError(f"expected a non-empty cdc_window for {consumer_name}")
+            end_snapshot = window_rows[0][1]
+
+            change_rows = require_ok_python(
+                conn,
+                "SELECT * FROM cdc_changes('lake', "
+                + quote_string(consumer_name)
+                + ", 'bench_events', max_snapshots => "
+                + str(workload.max_snapshots)
+                + ")",
+            ).fetchall()
+            cdc_changes_calls += 1
+            if len(change_rows) != workload.rows_per_snapshot:
+                raise RuntimeError(f"expected {workload.rows_per_snapshot} rows from cdc_changes, got {len(change_rows)}")
+
+            consumed_ns = now_nanos()
+            for row in change_rows:
+                latencies_ms.append((consumed_ns - int(row[4])) / 1000000.0)
+            total_events += len(change_rows)
+
+            require_ok_python(conn, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer_name)}, {end_snapshot})")
+            cdc_commit_calls += 1
+
+    elapsed_seconds = time.monotonic() - started_at
+    catalog_queries_estimated = cdc_window_calls + cdc_changes_calls + cdc_commit_calls
+    latency_max = max(latencies_ms) if latencies_ms else 0.0
+    latency_mean = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0
+
+    return {
+        "workload_name": workload.name,
+        "planned_snapshots": planned_snapshots,
+        "producer_inserts": producer_inserts,
+        "total_events": total_events,
+        "elapsed_seconds": elapsed_seconds,
+        "events_per_second": total_events / elapsed_seconds,
+        "latency_ms_p50": percentile(latencies_ms, 50),
+        "latency_ms_p95": percentile(latencies_ms, 95),
+        "latency_ms_p99": percentile(latencies_ms, 99),
+        "latency_ms_max": latency_max,
+        "latency_ms_mean": latency_mean,
+        "catalog_queries_estimated": catalog_queries_estimated,
+        "catalog_qps_avg": catalog_queries_estimated / elapsed_seconds,
+        "lag_snapshots_max": 0,
+        "cdc_window_calls": cdc_window_calls,
+        "cdc_changes_calls": cdc_changes_calls,
+        "cdc_commit_calls": cdc_commit_calls,
+    }
 
 
 def run_harness(binary: Path, paths: dict[str, Path], workload: Workload, tmpdir: Path) -> dict[str, Any]:
@@ -362,7 +497,9 @@ def emit_soft_warnings(measurements: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload", type=Path, default=DEFAULT_WORKLOAD)
+    parser.add_argument("--runtime", choices=("local-build", "official"), default="local-build")
     parser.add_argument("--build", choices=("debug", "release"), default="debug")
+    parser.add_argument("--cdc-extension", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--hardware-label", default=f"{platform.system()} {platform.machine()} {socket.gethostname()}")
     parser.add_argument("--duration-seconds", type=int)
@@ -373,20 +510,31 @@ def main() -> int:
     args = parser.parse_args()
 
     workload = load_workload(args.workload, args)
-    paths = build_paths(args.build)
-    require_artifacts(paths, args.build)
 
     with tempfile.TemporaryDirectory(prefix="ducklake_cdc_bench_") as tmp:
         tmpdir = Path(tmp)
-        binary = compile_harness(tmpdir, paths)
-        measurements = run_harness(binary, paths, workload, tmpdir)
+        if args.runtime == "local-build":
+            paths = build_paths(args.build)
+            require_artifacts(paths, args.build)
+            binary = compile_harness(tmpdir, paths)
+            measurements = run_harness(binary, paths, workload, tmpdir)
+            build_label = args.build
+        else:
+            if args.cdc_extension is None:
+                raise ValueError("--cdc-extension is required when --runtime official")
+            cdc_extension = args.cdc_extension.resolve()
+            if not cdc_extension.exists():
+                raise FileNotFoundError(f"missing ducklake_cdc extension artifact: {cdc_extension}")
+            measurements = run_python_benchmark(cdc_extension, workload, tmpdir)
+            build_label = "official"
 
     result = {
         "run_id": str(uuid.uuid4()),
         "timestamp_utc": dt.datetime.now(dt.UTC).isoformat(),
         "commit": git_commit(),
         "hardware_label": args.hardware_label,
-        "build": args.build,
+        "runtime": args.runtime,
+        "build": build_label,
         "workload": asdict(workload),
         "measurements": measurements,
         "soft_gates": {

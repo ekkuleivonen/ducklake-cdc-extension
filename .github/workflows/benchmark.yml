@@ -1,0 +1,92 @@
+#
+# Manual benchmark workflow.
+#
+# This is intentionally outside the Full CI gate. Today it runs the light
+# benchmark smoke workload; over time it can grow into scheduled benchmark
+# coverage without making every PR and release wait for the full benchmark path.
+#
+
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_ci_run_id:
+        description: 'Optional Full CI run ID to download the linux_amd64 extension artifact from. Defaults to the latest successful Full CI run for this commit.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      DUCKDB_VERSION: v1.5.1
+      EXTENSION_ARTIFACT: ducklake_cdc-v1.5.1-extension-linux_amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Resolve Full CI run
+        id: full-ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.full_ci_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_RUN_ID" ]]; then
+            run_id="$INPUT_RUN_ID"
+          else
+            run_id=$(gh run list \
+              --workflow full-ci.yml \
+              --commit "$GITHUB_SHA" \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // ""')
+          fi
+
+          if [[ -z "$run_id" ]]; then
+            echo "::error::No successful Full CI run found for $GITHUB_SHA. Re-run after Full CI succeeds, or pass full_ci_run_id manually."
+            exit 1
+          fi
+
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Using Full CI run $run_id"
+
+      - name: Download extension artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.EXTENSION_ARTIFACT }}
+          path: build/benchmark/extensions
+          run-id: ${{ steps.full-ci.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run light benchmark against official DuckDB
+        run: |
+          uv run --locked python bench/runner.py \
+            --runtime official \
+            --cdc-extension build/benchmark/extensions/ducklake_cdc.duckdb_extension \
+            --workload bench/light.yaml
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-light-result
+          path: bench/results/*.json
