@@ -72,6 +72,62 @@ jobs:
         run: |
           uv run --locked python test/upstream/enumerate_changes_map.py --check
 
+  benchmark-smoke:
+    name: Benchmark smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build ccache
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: full-ci-bench-ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json') }}-${{ github.ref }}
+          restore-keys: |
+            full-ci-bench-ccache-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json') }}-
+            full-ci-bench-ccache-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.5
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build (release)
+        run: |
+          export CCACHE_DIR=~/.ccache
+          ccache -M 2G
+          make release
+          ccache -s
+
+      - name: Run light benchmark smoke
+        run: |
+          uv run --locked python bench/runner.py --build release --workload bench/light.yaml
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-light-result
+          path: bench/results/*.json
+
   # Stable status check name that branch protection should require. As long
   # as both upstream reusable workflows and local contract checks succeed,
   # this job succeeds. If one of them adds or renames matrix legs, branch
@@ -84,6 +140,7 @@ jobs:
       - duckdb-stable-build
       - code-quality-check
       - upstream-contract-check
+      - benchmark-smoke
     if: always()
     steps:
       - name: Verify all required jobs succeeded
@@ -91,11 +148,13 @@ jobs:
           BUILD_RESULT: ${{ needs.duckdb-stable-build.result }}
           QUALITY_RESULT: ${{ needs.code-quality-check.result }}
           UPSTREAM_RESULT: ${{ needs.upstream-contract-check.result }}
+          BENCHMARK_RESULT: ${{ needs.benchmark-smoke.result }}
         run: |
           echo "duckdb-stable-build:    $BUILD_RESULT"
           echo "code-quality-check:     $QUALITY_RESULT"
           echo "upstream-contract-check: $UPSTREAM_RESULT"
-          if [[ "$BUILD_RESULT" != "success" || "$QUALITY_RESULT" != "success" || "$UPSTREAM_RESULT" != "success" ]]; then
+          echo "benchmark-smoke:        $BENCHMARK_RESULT"
+          if [[ "$BUILD_RESULT" != "success" || "$QUALITY_RESULT" != "success" || "$UPSTREAM_RESULT" != "success" || "$BENCHMARK_RESULT" != "success" ]]; then
             echo "::error::Full CI did not pass."
             exit 1
           fi

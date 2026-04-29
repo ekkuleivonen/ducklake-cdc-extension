@@ -345,11 +345,11 @@ The four-axis performance model in `README.md` ("Performance principles") is rat
 
 | Workload | Snapshots/min | Rows/snapshot | Consumers | Sinks | Latency p99 target | Throughput target |
 | --- | --- | --- | --- | --- | --- | --- |
-| **light** | 10 | 100 | 1 | stdout | < 1s | matches producer; 0% lag drift over 24h |
+| **light** | 30 | 100 | 1 | stdout | < 1s | matches producer over a 60s smoke run |
 | **medium** | 100 | 1 000 | 5 | mix (webhook + Kafka) | < 5s | matches producer at steady state |
 | **heavy** | 1 000 | 10 000 | 20 | Kafka | < 30s | matches producer at steady state |
 
-Each workload should be committed as a YAML descriptor when the benchmark harness lands. Phase 1 owns the light harness as an open follow-up in the current clean-slate tree. Phase 2 adds `medium` across the catalog matrix. Phase 5 adds `heavy` and the 72h soak runs both `medium` (chaos) and `heavy` (sustained-load).
+Each workload should be committed as a YAML descriptor when the benchmark harness lands. Phase 1 owns the light harness: a 60-second constant-rate smoke run parameterized by duration, snapshot rate, rows per snapshot, consumer count, and `max_snapshots`. Phase 2 adds `medium` across the catalog matrix. Phase 5 adds `heavy`, variable-load profiles, and the long-running soak / sustained-load jobs.
 
 **Honest publication policy:** numbers go in `docs/performance.md` with date + commit SHA + hardware. Numbers are not removed when they regress — they are explained. **Numbers without history are flat; numbers with history are a story.**
 

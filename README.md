@@ -4,6 +4,13 @@
 
 Postgres has logical replication. Iceberg has table-changes. [DuckLake](https://ducklake.select) has both — `ducklake-cdc` gives you the daemon to consume them.
 
+
+<img src="docs/demo/phase1/producer.png" alt="Producer SQL mutating a DuckLake table">
+<img src="docs/demo/phase1/consumer.png" alt="Consumer SQL reading DuckLake CDC events">
+
+
+Create, insert, update, delete on the left. Discover the table and read the row-level change stream on the right.
+
 ```sql
 -- Preconditions: DuckDB 1.5.1, the bundled `ducklake` and `parquet`
 -- extensions, and a local build of `ducklake_cdc.duckdb_extension`

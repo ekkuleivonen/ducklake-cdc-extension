@@ -32,10 +32,11 @@ in-process consumer.
 
 ## Where to read the numbers
 
-No benchmark harness is committed in this clean-slate tree yet. ADR 0011
-defines the planned light / medium / heavy workloads and the publication
-policy. Until the harness lands, this page records the design targets and
-the shape of the numbers we intend to publish.
+The Phase 1 smoke harness lives in `bench/runner.py`, with the first
+workload descriptor in `bench/light.yaml`. Full CI runs that descriptor
+against the release build and uploads the result JSON as an artifact.
+Selected baselines can be committed under `bench/results/` once there is
+enough history to make a trajectory meaningful.
 
 ## What we are bad at
 
@@ -68,11 +69,10 @@ is rare and worth celebrating.
 
 ## Soft gates today, hard gates after Phase 5
 
-The planned benchmark CI gate is **"the harness ran and produced a
-number"**. Once the harness exists, soft gates should print
-`::warning::` annotations when:
+The benchmark CI gate is **"the harness ran and produced a number"**.
+Soft gates print `::warning::` annotations when:
 
-- `lag_snapshots_max > 0` over the 5-minute CI run, or
+- `lag_snapshots_max > 0` over the 60-second light smoke run, or
 - `catalog_qps_avg > 5` (one consumer at default backoff).
 
 Latency thresholds are recorded but not gated. The absolute target

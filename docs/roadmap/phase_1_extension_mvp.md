@@ -213,21 +213,21 @@ These exist for ergonomics. Each is documented in `docs/api.md` as "1-line compo
 
 - [x] `cdc_window`'s `max_snapshots` arg is hard-capped at the compile-time constant `HARD_MAX_SNAPSHOTS = 1000`. Values above the cap raise `CDC_MAX_SNAPSHOTS_EXCEEDED` (per `docs/errors.md`); covered in `test/sql/consumer_state.test` (`max_snapshots = 1001 → CDC_MAX_SNAPSHOTS_EXCEEDED`). Session-tunable form (`SET ducklake_cdc_max_snapshots_hard_cap = ...`) is deferred until the session-settings/notice helper lands; the error message already advertises the planned `SET` for forward-compat.
 
-### Benchmark harness — planned
+### Benchmark harness
 
-Numbers without history are flat; numbers with history are a story. The clean-slate tree has not restored the benchmark harness yet. ADR 0011 and `docs/performance.md` preserve the workload design and publication policy; the harness remains a Phase 1 follow-up.
+Numbers without history are flat; numbers with history are a story. Phase 1 ships the first fast benchmark harness so every main CI run proves the CDC path is measurable before later phases add longer runs.
 
-- [ ] **Harness skeleton** in `bench/`:
-  - `bench/runner.py` Python harness: seeds a DuckLake with a controllable producer, runs a consumer with the workload's `(max_snapshots, polling_config)`, captures **end-to-end latency p50/p95/p99/max/mean** (via a monotonic-time ledger so cross-process clock skew is irrelevant), **events/sec**, **catalog QPS**, **lag drift over the run** (producer-truth lag, since `cdc_consumer_stats.lag_snapshots` over-counts internal lease/commit UPDATEs). Consumer CPU/RSS is deferred to a future revision — we get the headline metrics this phase needs without a `psutil` dependency.
-  - `bench/light.yaml` workload descriptor — 10 snapshots/min, 100 rows/snapshot, 1 consumer, 24h soak target (`full_seconds: 86400`); CI-shortened to 5min via `--shortened` (`shortened_seconds: 300`); nightly soak job is a follow-up that just calls the runner without `--shortened`.
-  - `bench/results/` — append-only JSON per run with `(run_id, timestamp_utc, commit, hardware_label, workload, measurements)`. The CI workflow commits the result back to `main` with `[skip ci]` so the trajectory is auditable via `git log -- bench/results/`. Per ADR 0011: regressions are explained in commit messages, not deleted.
-- [ ] **CI gate (Phase 1, against light only) — soft, not a build break.**
-  - **Hard requirement (build-break):** the harness ran successfully and produced a number. Wired in `(planned benchmark workflow)` — the workflow runs `make release` then `python bench/runner.py --workload bench/light.yaml --shortened`, fails the build if the runner exits non-zero, and uploads the result file as a workflow artifact even on success.
+- [x] **Harness skeleton** in `bench/`:
+  - `bench/runner.py` Python harness: seeds a DuckLake with a controllable producer, runs a consumer with workload parameters `(duration_seconds, snapshots_per_minute, rows_per_snapshot, consumers, max_snapshots, polling_config)`, captures **end-to-end latency p50/p95/p99/max/mean** (via a monotonic-time ledger so cross-process clock skew is irrelevant), **events/sec**, **catalog QPS**, **lag drift over the run** (producer-truth lag, since `cdc_consumer_stats.lag_snapshots` over-counts internal lease/commit UPDATEs). Consumer CPU/RSS is deferred to a future revision — we get the headline metrics this phase needs without a `psutil` dependency. The runner's shape must make load profiles easy to add later; Phase 1 only needs constant-rate parameters.
+  - `bench/light.yaml` workload descriptor — a fast smoke benchmark, not a soak: 60 seconds, 30 snapshots/min, 100 rows/snapshot, 1 consumer. The CI run uses this descriptor as-is; longer runs and variable-load profiles land after the harness has earned trust.
+  - `bench/results/` — JSON result location with `(run_id, timestamp_utc, commit, hardware_label, workload, measurements)`. CI uploads each result as an artifact; maintainers commit selected baselines when they want an auditable trajectory. Per ADR 0011: committed regressions are explained in commit messages, not deleted.
+- [x] **CI gate (Phase 1, against light only) — soft, not a build break.**
+  - **Hard requirement (build-break):** the harness ran successfully and produced a number. Wired into Full CI as `benchmark-smoke` — the workflow runs `make release` then `uv run --locked python bench/runner.py --build release --workload bench/light.yaml`, fails the build if the runner exits non-zero, and uploads the result file as a workflow artifact even on success.
   - **Soft requirements (warn, don't fail):** the runner emits `::warning::` annotations when `lag_snapshots_max > 0` or `catalog_qps_avg > 5`. These never fail the build in Phase 1; reviewers read the annotations and the result file's `soft_gates` block to decide whether to act.
   - **Latency:** recorded in every result (`p50` / `p95` / `p99` / `max` / `mean`) but not gated. Per the ADR 0011 + Phase 5 hand-off: the absolute target only becomes a hard CI gate after Phase 5 ratifies the production number on representative hardware.
   - Why this discipline: if Phase 1 committed to a 1s p99 hard gate and the first run got 1.2s, the release notes would read "we said p99 < 1s, we got 1.2s" on day one. Soft-gate now, ratify in Phase 5, treat as contract from beta forward.
-- [ ] **Bench-history page (auto-generated):** `bench/README.md` is hand-written for now (covers the harness, the workload, the metrics, and how to read the JSON). Auto-generation from `bench/results/*.json` — trajectory charts per metric per workload — lands once there are enough data points to chart. Phase 5 hardens the auto-generation; Phase 1 keeps it manual because two data points are not yet a trajectory.
-- [ ] Phase 2 adds `bench/medium.yaml` and runs it across the catalog matrix. Phase 5 adds `bench/heavy.yaml` and the 72h soak runs both medium (chaos) and heavy (sustained load).
+- [x] **Bench-history page (manual for now):** `bench/README.md` is hand-written for now (covers the harness, the workload, the metrics, and how to read the JSON). Auto-generation from `bench/results/*.json` — trajectory charts per metric per workload — lands once there are enough committed data points to chart. Phase 5 hardens the auto-generation; Phase 1 keeps it manual because two data points are not yet a trajectory.
+- [ ] Phase 2 adds `bench/medium.yaml` and runs it across the catalog matrix. Phase 5 adds `bench/heavy.yaml`, variable-load profiles, and the long-running soak / sustained-load jobs.
 
 ### Observability
 
@@ -300,11 +300,11 @@ Structured as "primitive in isolation" + "sugar wrapper composition" + "the thin
   - **Force release + stolen-lease commit fails** — `test/smoke/lease_multiconn_smoke.py`: B's `cdc_consumer_force_release` succeeds while A holds the lease; A's later `cdc_commit` raises `CDC_BUSY`; cursor unchanged; audit row landed.
   - **Lease timeout / heartbeat extension / symmetric stolen-lease commit / orchestrator fan-out** — implementation pinned in `src/consumer_state.cpp` (lease predicate is symmetric; heartbeat is a single UPDATE with the cached token; orchestrator-fan-out reuses the same connection's cached token). Dedicated multi-process spike harnesses for the three time-pressure scenarios are deferred to Phase 2's catalog matrix work, where the same harness has to run against Postgres / SQLite anyway.
 
-### The 60-second SQL demo + the README quickstart (NEW exit gate)
+### The SQL walkthrough + the README quickstart (NEW exit gate)
 
-This phase doesn't ship until the demo runs end-to-end **and the README quickstart matches it verbatim**. The README is what you point people at when you ask for early feedback. If the README is wrong (or aspirational) until Phase 5, every reader between now and then is forming their first impression from a misleading description. Phase 5's previous "60-second README quickstart" work item is moved here.
+This phase doesn't ship until the SQL walkthrough runs end-to-end **and the README quickstart matches it verbatim**. The README is what you point people at when you ask for early feedback. If the README is wrong (or aspirational) until Phase 5, every reader between now and then is forming their first impression from a misleading description. Phase 5's previous "60-second README quickstart" work item is moved here.
 
-**Honest preconditions** must be in the README and the demo. The previous "INSTALL ducklake_cdc FROM community; LOAD ducklake_cdc; ATTACH ... CALL ..." undersold the actual ceremony, which includes installing and loading the `ducklake` extension itself. Don't lie about line counts.
+**Honest preconditions** must be in the README and the walkthrough. The previous "INSTALL ducklake_cdc FROM community; LOAD ducklake_cdc; ATTACH ... CALL ..." undersold the actual ceremony, which includes installing and loading the `ducklake` extension itself. Don't lie about line counts.
 
 The honest minimum:
 
@@ -347,26 +347,26 @@ SELECT * FROM cdc_commit('lake', 'demo', /* end_snapshot above */);
 SELECT cdc_wait('lake', 'demo', timeout_ms => 30000);
 ```
 
-**Test the demo on a clean machine** — fresh DuckDB install, no prior extension cache, no environment hand-holding. If a developer who hasn't seen the project before can't go from `INSTALL` to seeing both DDL and DML events in under a minute by following the README verbatim, the demo isn't ready.
+**Test the walkthrough on a clean machine** — fresh DuckDB install, no prior extension cache, no environment hand-holding. If a developer who hasn't seen the project before can't go from `INSTALL` to seeing both DDL and DML events by following the README verbatim, the walkthrough isn't ready.
 
 The README's headline-style `cdc_changes('lake', 'demo', 'orders')` four-line teaser (lede block) is also valid SQL — it requires the same preconditions as the full quickstart, and the README must say so in a sentence right after it. Don't pretend the four lines stand alone; readers will copy-paste them and bounce when they fail.
 
-`cdc_recent_changes` and `cdc_recent_ddl` in this demo are **sugar passthroughs**, not new SQL primitives — they expand to `table_changes(...)` and the stage-2 DDL extractor with bare snapshot bounds. Phase 0 / 1 docs label them as such; the CLI sections in Phase 3 / 4 must do the same and not present them as new functions.
+`cdc_recent_changes` and `cdc_recent_ddl` in this walkthrough are **sugar passthroughs**, not new SQL primitives — they expand to `table_changes(...)` and the stage-2 DDL extractor with bare snapshot bounds. Phase 0 / 1 docs label them as such; the CLI sections in Phase 3 / 4 must do the same and not present them as new functions.
 
 ## Exit criteria
 
 - [ ] `INSTALL` from a local build works in `duckdb` CLI.
-- [ ] The 60-second demo above runs end-to-end against a fresh embedded DuckLake.
+- [ ] The SQL walkthrough above runs end-to-end against a fresh embedded DuckLake.
 - [x] **The README quickstart exists and matches the local-build preconditions.** A cold-machine test still needs to confirm it works in under a minute including extension installs.
-- [ ] `examples/01_basic_consumer.sql` (uses `cdc_window` + `table_changes` + `cdc_commit` directly).
-- [ ] `examples/02_outbox_demo.sql` (uses sugar `cdc_events` to dispatch on `commit_extra_info`).
-- [ ] `examples/03_long_poll.sql` (uses `cdc_wait` for a streaming consumer).
-- [ ] `examples/04_schema_change.sql` (demonstrates `schema_changes_pending`, `cdc_ddl`, and the schema-boundary flow end-to-end).
-- [ ] `examples/05_recent_changes.sql` (stateless ad-hoc exploration with `cdc_recent_changes` and `cdc_recent_ddl`).
-- [ ] `examples/06_parallel_readers.sql` (orchestrator-fans-out pattern: one connection holds the lease + calls `cdc_window`, two more connections run `table_changes` reads in the same window range, single commit).
-- [ ] `examples/07_ddl_only_consumer.sql` (consumer with `event_categories := ['ddl']` for the schema-watcher pattern).
-- [ ] `examples/08_cross_schema_window.sql` (consumer with `stop_at_schema_change := false` for the throughput-over-safety case; demonstrates the documented behaviour).
-- [ ] `examples/09_lease_recovery.sql` (kill the holder mid-stream; show another connection acquiring after the heartbeat times out; show the audit row).
+- [x] `examples/01_basic_consumer.sql` (uses `cdc_window` + `table_changes` + `cdc_commit` directly).
+- [x] `examples/02_outbox_demo.sql` (uses sugar `cdc_events` to dispatch on `commit_extra_info`).
+- [x] `examples/03_long_poll.sql` (uses `cdc_wait` for a streaming consumer).
+- [x] `examples/04_schema_change.sql` (demonstrates `schema_changes_pending`, `cdc_ddl`, and the schema-boundary flow end-to-end).
+- [x] `examples/05_recent_changes.sql` (stateless ad-hoc exploration with `cdc_recent_changes` and `cdc_recent_ddl`).
+- [x] `examples/06_parallel_readers.sql` (orchestrator-fans-out pattern: one connection holds the lease + calls `cdc_window`, two more connections run `table_changes` reads in the same window range, single commit).
+- [x] `examples/07_ddl_only_consumer.sql` (consumer with `event_categories := ['ddl']` for the schema-watcher pattern).
+- [x] `examples/08_cross_schema_window.sql` (consumer with `stop_at_schema_change := false` for the throughput-over-safety case; demonstrates the documented behaviour).
+- [x] `examples/09_lease_recovery.sql` (kill the holder mid-stream; show another connection acquiring after the heartbeat times out; show the audit row).
 - [ ] All tests green on CI, including:
   - **The TOCTOU race test, deterministic interleaving** (per the spelled-out work item above).
   - **The lease test suite** (same-connection idempotence, different-connection rejection, lease timeout, stolen-lease commit fails, force release, heartbeat extension, orchestrator fan-out).
@@ -377,7 +377,7 @@ The README's headline-style `cdc_changes('lake', 'demo', 'orders')` four-line te
   - The DDL-only and DML-only consumer tests.
   - The interrupt-during-`cdc_wait` test.
   - The `cdc_wait` timeout-clamp test.
-- [ ] **The 60-second demo recorded as a 20-second GIF and committed to `docs/demo.gif`.** This is the asset the README points at; without it, the README's lede is broken. Two terminal panes: one inserting / altering, one running the SQL CLI demo.
+- [x] **Two-screenshot DDL-discovery + row-level CDC walkthrough committed under `docs/demo/phase1/`.** This is the README-sized Phase 1 asset: one producer-side screenshot showing inserts, one update, and one delete; and one consumer-side screenshot showing `cdc_recent_ddl` discovering the table and durable `cdc_changes` returning the row-level events for that table. The full cursor loop (`cdc_window` / `cdc_changes` / `cdc_commit`) stays in the quickstart and examples; the README image uses the smallest stable SQL surface. A moving GIF/video is deferred until Phase 3 or 4, when a Python or Go client can stream ordered events to JSONL and make the live experience visually obvious.
 - [ ] **At least four release tags between the first `v0.0.x` tag and the Phase 1 cut**, with honest "what works / what doesn't" release notes for each. Demonstrates the visible-cadence discipline that Phase 5 launch depends on.
 - [x] Zero runtime dependency on Python.
 - [x] `docs/api.md` lists every function with its classification (`primitive` / `observability` / `acknowledged sugar`) and, for sugar, the SQL recipe it composes. `cdc_ddl` is listed as a primitive; `cdc_schema_diff`, `cdc_recent_changes`, `cdc_recent_ddl` are listed as sugar.
@@ -385,6 +385,6 @@ The README's headline-style `cdc_changes('lake', 'demo', 'orders')` four-line te
 - [x] `docs/operational/audit-limitations.md` documents the column-drop-with-DML-in-same-snapshot loss. **Leads with a runnable worked example** showing the workload, what `cdc_changes` returns, the `tbl AT (VERSION => snapshot_before_drop)` recovery query, and the JOIN that reconciles the dropped column back onto the delete events. Recovery comes before rationale.
 - [x] `docs/operational/lease.md` documents the owner-token lease, heartbeat semantics, force-release escape hatch.
 - [x] `docs/operational/wait.md` documents the `cdc_wait` connection-starvation foot gun and the timeout cap.
-- [ ] `bench/runner.py` + `bench/light.yaml` ship and run on every CI build against embedded DuckDB. First baseline numbers committed to `bench/results/`. **The harness is the deliverable** — bad numbers are acceptable in Phase 1 because we now have a way to show improvement.
+- [x] `bench/runner.py` + `bench/light.yaml` ship and run on every Full CI build against embedded DuckDB. CI uploads result JSON as an artifact; selected baselines can be committed to `bench/results/` once there is a trajectory worth preserving. **The harness is the deliverable** — bad numbers are acceptable in Phase 1 because we now have a way to show improvement.
 - [x] `__ducklake_cdc_dlq` table schema is created (empty, feature lands Phase 2).
 - [x] `__ducklake_cdc_audit` table is created and emits Phase-1 actions (`consumer_create`, `consumer_drop`, `consumer_reset`, `consumer_force_release`, `lease_force_acquire`).

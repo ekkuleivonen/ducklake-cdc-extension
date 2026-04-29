@@ -276,6 +276,7 @@ The Python CLI is the operator-facing artifact for users in the Python ecosystem
 - `--follow` mode survives killed connections and resumes cleanly via `cdc_wait`'s natural retry semantics.
 - `Sink` protocol documented with at least two custom-sink examples (one DML-only, one DDL-aware) in `docs/python/sinks.md`.
 - Per-sink DDL support matrix published; v0.1 limitations on Kafka / Redis / Postgres mirror DDL handling explicit.
+- Streaming demo GIF/video exists once `tail --sink stdout --format jsonl --follow` works: two panes, producer mutates DuckLake, Python client streams interleaved DDL/DML JSONL with the `event_type` discriminator. This becomes the README hero asset candidate; Phase 1 only carries a screenshot walkthrough because SQL output is better read than watched.
 - Async surface verified to cancel within 500ms on `asyncio.CancelledError`.
 - Parity scenario green against the Go client (post Phase 4) — same input → byte-identical output, DDL included.
 - Deployment caveat doc lists the serverless platforms where this won't work and why.

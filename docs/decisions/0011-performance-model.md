@@ -182,7 +182,7 @@ resolve via `cdc_dlq_clear` / `cdc_dlq_replay` / `cdc_dlq_acknowledge`
 
 | Workload | Snapshots/min | Rows/snapshot | Consumers | Sinks | Latency p99 design target | Throughput design target |
 | --- | --- | --- | --- | --- | --- | --- |
-| **light** | 10 | 100 | 1 | stdout | < 1s | matches producer; 0% lag drift over 24h |
+| **light** | 30 | 100 | 1 | stdout | < 1s | matches producer over a 60s smoke run |
 | **medium** | 100 | 1 000 | 5 | mix (webhook + Kafka) | < 5s | matches producer at steady state |
 | **heavy** | 1 000 | 10 000 | 20 | Kafka | < 30s | matches producer at steady state |
 
@@ -191,9 +191,13 @@ harness lands. The descriptor is the source of truth: the harness reads
 it, the README links it, and release notes embed the most recent
 measurement.
 
-The intended rollout is light first, medium across the catalog matrix
-next, then heavy and sustained-load runs once the implementation has
-enough history for the numbers to be credible.
+The intended rollout is a short, constant-rate `light` smoke benchmark
+first, medium across the catalog matrix next, then heavy, variable-load
+profiles, and sustained-load runs once the implementation has enough
+history for the numbers to be credible. The runner should take duration,
+snapshot rate, rows per snapshot, consumer count, and `max_snapshots` as
+parameters from the workload descriptor so later phases can add richer
+load profiles without replacing the harness.
 
 ### Honest publication policy
 
@@ -250,7 +254,8 @@ at. The contract:
 - **Phase impact.**
   - **Phase 1** ships:
     - The benchmark design and publication policy. The harness itself
-      remains future work in the clean-slate tree.
+      lives in `bench/runner.py` and runs the `bench/light.yaml` smoke
+      workload in Full CI.
     - The `max_snapshots` hard cap (default 100, hard cap 1000)
       enforced inside `cdc_window` with `CDC_MAX_SNAPSHOTS_EXCEEDED`
       raised on violation.
