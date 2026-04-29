@@ -98,3 +98,9 @@ jobs:
           uv run --locked python test/smoke/lease_multiconn_smoke.py
           uv run --locked python test/smoke/cdc_wait_interrupt_smoke.py
           uv run --locked python test/smoke/toctou_expire_smoke.py
+
+      - name: Catalog matrix smoke
+        run: |
+          docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
+          trap 'docker compose -f test/catalog_matrix/docker-compose.yml down -v' EXIT
+          uv run --locked python test/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
