@@ -180,11 +180,11 @@ resolve via `cdc_dlq_clear` / `cdc_dlq_replay` / `cdc_dlq_acknowledge`
 
 ### Three planned benchmark workloads
 
-| Workload | Snapshots/min | Rows/snapshot | Consumers | Sinks | Latency p99 design target | Throughput design target |
-| --- | --- | --- | --- | --- | --- | --- |
-| **light** | 30 | 100 | 1 | stdout | < 1s | matches producer over a 60s smoke run |
-| **medium** | 100 | 1 000 | 5 | mix (webhook + Kafka) | < 5s | matches producer at steady state |
-| **heavy** | 1 000 | 10 000 | 20 | Kafka | < 30s | matches producer at steady state |
+| Workload | Load profile | Target snapshots/sec | Target rows/snapshot | Consumers | Sinks | Latency p99 design target | Throughput design target |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **light** | flat | 0.5 | 100 | 1 | stdout | < 1s | matches producer over a 60s smoke run |
+| **medium** | flat | 1.67 | 1 000 | 5 | mix (webhook + Kafka) | < 5s | matches producer at steady state |
+| **heavy** | flat | 16.67 | 10 000 | 20 | Kafka | < 30s | matches producer at steady state |
 
 Each workload should be committed as a YAML descriptor when the benchmark
 harness lands. The descriptor is the source of truth: the harness reads
@@ -195,9 +195,9 @@ The intended rollout is a short, constant-rate `light` smoke benchmark
 first, medium across the catalog matrix next, then heavy, variable-load
 profiles, and sustained-load runs once the implementation has enough
 history for the numbers to be credible. The runner should take duration,
-snapshot rate, rows per snapshot, consumer count, and `max_snapshots` as
-parameters from the workload descriptor so later phases can add richer
-load profiles without replacing the harness.
+load profile, target snapshots/second, target rows/snapshot, consumer
+count, and `max_snapshots` as parameters from the workload descriptor so
+later phases can add richer load profiles without replacing the harness.
 
 The mature CI shape is different from Phase 1's local rebuild: run the
 benchmark **after** the extension distribution matrix has produced its
@@ -262,8 +262,9 @@ at. The contract:
 - **Phase impact.**
   - **Phase 1** ships:
     - The benchmark design and publication policy. The harness itself
-      lives in `bench/runner.py` and runs the `bench/light.yaml` smoke
-      workload in Full CI.
+      lives in `bench/runner.py`; the manual benchmark workflow runs
+      the `bench/light.yaml` smoke workload against a Full-CI-built
+      extension artifact.
     - The `max_snapshots` hard cap (default 100, hard cap 1000)
       enforced inside `cdc_window` with `CDC_MAX_SNAPSHOTS_EXCEEDED`
       raised on violation.

@@ -30,6 +30,8 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_WORKLOAD = REPO / "bench" / "light.yaml"
 DEFAULT_RESULTS_DIR = REPO / "bench" / "results"
+RESULT_SCHEMA_VERSION = 1
+SUPPORTED_LOAD_PROFILES = {"flat"}
 
 
 HARNESS = r'''
@@ -238,9 +240,10 @@ int main(int argc, char **argv) {
 @dataclass
 class Workload:
     name: str
+    load_profile: str
     duration_seconds: int
-    snapshots_per_minute: float
-    rows_per_snapshot: int
+    target_snapshots_per_second: float
+    target_rows_per_snapshot: int
     consumers: int
     max_snapshots: int
 
@@ -260,18 +263,50 @@ def parse_flat_yaml(path: Path) -> dict[str, str]:
 
 def load_workload(path: Path, args: argparse.Namespace) -> Workload:
     raw = parse_flat_yaml(path)
+    load_profile = raw.get("load_profile", "flat")
+    if load_profile not in SUPPORTED_LOAD_PROFILES:
+        supported = ", ".join(sorted(SUPPORTED_LOAD_PROFILES))
+        raise ValueError(f"{path}: unsupported load_profile {load_profile!r}; supported: {supported}")
+
+    if "target_snapshots_per_second" in raw:
+        target_snapshots_per_second = float(raw["target_snapshots_per_second"])
+    else:
+        # Backward-compatible parser for pre-schema-v1 descriptors.
+        target_snapshots_per_second = float(raw["snapshots_per_minute"]) / 60.0
+
+    target_rows_per_snapshot = int(raw.get("target_rows_per_snapshot", raw.get("rows_per_snapshot", "0")))
     workload = Workload(
         name=raw.get("name", path.stem),
+        load_profile=load_profile,
         duration_seconds=int(raw["duration_seconds"]),
-        snapshots_per_minute=float(raw["snapshots_per_minute"]),
-        rows_per_snapshot=int(raw["rows_per_snapshot"]),
+        target_snapshots_per_second=target_snapshots_per_second,
+        target_rows_per_snapshot=target_rows_per_snapshot,
         consumers=int(raw["consumers"]),
         max_snapshots=int(raw["max_snapshots"]),
     )
-    for field_name in ("duration_seconds", "snapshots_per_minute", "rows_per_snapshot", "consumers", "max_snapshots"):
+    for field_name in (
+        "duration_seconds",
+        "target_snapshots_per_second",
+        "target_rows_per_snapshot",
+        "consumers",
+        "max_snapshots",
+    ):
         override = getattr(args, field_name)
         if override is not None:
             setattr(workload, field_name, override)
+    if args.load_profile is not None:
+        if args.load_profile not in SUPPORTED_LOAD_PROFILES:
+            supported = ", ".join(sorted(SUPPORTED_LOAD_PROFILES))
+            raise ValueError(f"unsupported --load-profile {args.load_profile!r}; supported: {supported}")
+        workload.load_profile = args.load_profile
+    if (
+        workload.duration_seconds <= 0
+        or workload.target_snapshots_per_second <= 0
+        or workload.target_rows_per_snapshot <= 0
+        or workload.consumers <= 0
+        or workload.max_snapshots <= 0
+    ):
+        raise ValueError("all numeric workload parameters must be positive")
     return workload
 
 
@@ -341,6 +376,40 @@ def percentile(values: list[float], percentile_value: float) -> float:
     return (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
 
 
+def metric_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+        }
+    return {
+        "p50": percentile(values, 50),
+        "p95": percentile(values, 95),
+        "p99": percentile(values, 99),
+        "max": max(values),
+        "mean": sum(values) / len(values),
+    }
+
+
+def timed_execute(conn: Any, sql: str, samples_ms: list[float]) -> Any:
+    started_ns = now_nanos()
+    try:
+        return require_ok_python(conn, sql)
+    finally:
+        samples_ms.append((now_nanos() - started_ns) / 1000000.0)
+
+
+def timed_fetchall(conn: Any, sql: str, samples_ms: list[float]) -> list[Any]:
+    started_ns = now_nanos()
+    try:
+        return require_ok_python(conn, sql).fetchall()
+    finally:
+        samples_ms.append((now_nanos() - started_ns) / 1000000.0)
+
+
 def values_for_snapshot(snapshot_index: int, rows_per_snapshot: int, produced_ns: int) -> str:
     values = []
     for row in range(rows_per_snapshot):
@@ -373,14 +442,19 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
     for consumer in range(workload.consumers):
         require_ok_python(conn, f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}')")
 
-    planned_snapshots = max(1, round((workload.duration_seconds * workload.snapshots_per_minute) / 60.0))
-    interval_seconds = 60.0 / workload.snapshots_per_minute
-    latencies_ms: list[float] = []
-    total_events = 0
+    planned_snapshots = max(1, math.floor(workload.duration_seconds * workload.target_snapshots_per_second))
+    interval_seconds = 1.0 / workload.target_snapshots_per_second
+    end_to_end_latencies_ms: list[float] = []
+    producer_insert_ms: list[float] = []
+    cdc_window_ms: list[float] = []
+    cdc_changes_ms: list[float] = []
+    cdc_commit_ms: list[float] = []
+    consumed_events = 0
     cdc_window_calls = 0
     cdc_changes_calls = 0
     cdc_commit_calls = 0
     producer_inserts = 0
+    produced_rows = 0
     started_at = time.monotonic()
 
     for snapshot in range(planned_snapshots):
@@ -390,61 +464,81 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
             time.sleep(sleep_seconds)
 
         produced_ns = now_nanos()
-        require_ok_python(conn, values_for_snapshot(snapshot, workload.rows_per_snapshot, produced_ns))
+        timed_execute(
+            conn,
+            values_for_snapshot(snapshot, workload.target_rows_per_snapshot, produced_ns),
+            producer_insert_ms,
+        )
         producer_inserts += 1
+        produced_rows += workload.target_rows_per_snapshot
 
         for consumer in range(workload.consumers):
             consumer_name = f"bench_{consumer}"
-            window_rows = require_ok_python(
+            window_rows = timed_fetchall(
                 conn,
                 "SELECT * FROM cdc_window('lake', "
                 + quote_string(consumer_name)
                 + f", max_snapshots => {workload.max_snapshots})",
-            ).fetchall()
+                cdc_window_ms,
+            )
             cdc_window_calls += 1
             if len(window_rows) != 1 or not window_rows[0][2]:
                 raise RuntimeError(f"expected a non-empty cdc_window for {consumer_name}")
             end_snapshot = window_rows[0][1]
 
-            change_rows = require_ok_python(
+            change_rows = timed_fetchall(
                 conn,
                 "SELECT * FROM cdc_changes('lake', "
                 + quote_string(consumer_name)
                 + ", 'bench_events', max_snapshots => "
                 + str(workload.max_snapshots)
                 + ")",
-            ).fetchall()
+                cdc_changes_ms,
+            )
             cdc_changes_calls += 1
-            if len(change_rows) != workload.rows_per_snapshot:
-                raise RuntimeError(f"expected {workload.rows_per_snapshot} rows from cdc_changes, got {len(change_rows)}")
+            if len(change_rows) != workload.target_rows_per_snapshot:
+                raise RuntimeError(
+                    f"expected {workload.target_rows_per_snapshot} rows from cdc_changes, got {len(change_rows)}"
+                )
 
             consumed_ns = now_nanos()
             for row in change_rows:
-                latencies_ms.append((consumed_ns - int(row[4])) / 1000000.0)
-            total_events += len(change_rows)
+                end_to_end_latencies_ms.append((consumed_ns - int(row[4])) / 1000000.0)
+            consumed_events += len(change_rows)
 
-            require_ok_python(conn, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer_name)}, {end_snapshot})")
+            timed_execute(
+                conn,
+                f"SELECT * FROM cdc_commit('lake', {quote_string(consumer_name)}, {end_snapshot})",
+                cdc_commit_ms,
+            )
             cdc_commit_calls += 1
 
-    elapsed_seconds = time.monotonic() - started_at
+    actual_duration_seconds = time.monotonic() - started_at
     catalog_queries_estimated = cdc_window_calls + cdc_changes_calls + cdc_commit_calls
-    latency_max = max(latencies_ms) if latencies_ms else 0.0
-    latency_mean = sum(latencies_ms) / len(latencies_ms) if latencies_ms else 0.0
 
     return {
         "workload_name": workload.name,
+        "load_profile": workload.load_profile,
+        "scheduled_duration_seconds": workload.duration_seconds,
+        "actual_duration_seconds": actual_duration_seconds,
+        "target_snapshots_per_second": workload.target_snapshots_per_second,
+        "actual_snapshots_per_second": producer_inserts / actual_duration_seconds,
+        "target_rows_per_snapshot": workload.target_rows_per_snapshot,
+        "actual_rows_per_second": produced_rows / actual_duration_seconds,
         "planned_snapshots": planned_snapshots,
         "producer_inserts": producer_inserts,
-        "total_events": total_events,
-        "elapsed_seconds": elapsed_seconds,
-        "events_per_second": total_events / elapsed_seconds,
-        "latency_ms_p50": percentile(latencies_ms, 50),
-        "latency_ms_p95": percentile(latencies_ms, 95),
-        "latency_ms_p99": percentile(latencies_ms, 99),
-        "latency_ms_max": latency_max,
-        "latency_ms_mean": latency_mean,
+        "produced_rows": produced_rows,
+        "consumed_events": consumed_events,
+        "consumed_events_per_second": consumed_events / actual_duration_seconds,
+        "end_to_end_latency_ms": metric_summary(end_to_end_latencies_ms),
+        "operation_ms": {
+            "producer_insert": metric_summary(producer_insert_ms),
+            "cdc_window": metric_summary(cdc_window_ms),
+            "cdc_changes": metric_summary(cdc_changes_ms),
+            "cdc_commit": metric_summary(cdc_commit_ms),
+        },
         "catalog_queries_estimated": catalog_queries_estimated,
-        "catalog_qps_avg": catalog_queries_estimated / elapsed_seconds,
+        "catalog_qps_avg": catalog_queries_estimated / actual_duration_seconds,
         "lag_snapshots_max": 0,
         "cdc_window_calls": cdc_window_calls,
         "cdc_changes_calls": cdc_changes_calls,
@@ -462,8 +556,8 @@ def run_harness(binary: Path, paths: dict[str, Path], workload: Workload, tmpdir
         str(lake),
         str(data),
         str(workload.duration_seconds),
-        str(workload.snapshots_per_minute),
-        str(workload.rows_per_snapshot),
+        str(workload.target_snapshots_per_second * 60.0),
+        str(workload.target_rows_per_snapshot),
         str(workload.consumers),
         str(workload.max_snapshots),
         workload.name,
@@ -476,6 +570,43 @@ def run_harness(binary: Path, paths: dict[str, Path], workload: Workload, tmpdir
     if completed.stderr:
         sys.stderr.write(completed.stderr)
     return json.loads(completed.stdout)
+
+
+def normalize_legacy_measurements(measurements: dict[str, Any], workload: Workload) -> dict[str, Any]:
+    """Normalize local C++ harness output into the schema-v1 envelope."""
+    actual_duration_seconds = float(measurements["elapsed_seconds"])
+    consumed_events = int(measurements["total_events"])
+    producer_inserts = int(measurements["producer_inserts"])
+    produced_rows = producer_inserts * workload.target_rows_per_snapshot
+    return {
+        "workload_name": workload.name,
+        "load_profile": workload.load_profile,
+        "scheduled_duration_seconds": workload.duration_seconds,
+        "actual_duration_seconds": actual_duration_seconds,
+        "target_snapshots_per_second": workload.target_snapshots_per_second,
+        "actual_snapshots_per_second": producer_inserts / actual_duration_seconds,
+        "target_rows_per_snapshot": workload.target_rows_per_snapshot,
+        "actual_rows_per_second": produced_rows / actual_duration_seconds,
+        "planned_snapshots": int(measurements["planned_snapshots"]),
+        "producer_inserts": producer_inserts,
+        "produced_rows": produced_rows,
+        "consumed_events": consumed_events,
+        "consumed_events_per_second": consumed_events / actual_duration_seconds,
+        "end_to_end_latency_ms": {
+            "p50": float(measurements["latency_ms_p50"]),
+            "p95": float(measurements["latency_ms_p95"]),
+            "p99": float(measurements["latency_ms_p99"]),
+            "max": float(measurements["latency_ms_max"]),
+            "mean": float(measurements["latency_ms_mean"]),
+        },
+        "operation_ms": {},
+        "catalog_queries_estimated": int(measurements["catalog_queries_estimated"]),
+        "catalog_qps_avg": float(measurements["catalog_qps_avg"]),
+        "lag_snapshots_max": int(measurements["lag_snapshots_max"]),
+        "cdc_window_calls": int(measurements["cdc_window_calls"]),
+        "cdc_changes_calls": int(measurements["cdc_changes_calls"]),
+        "cdc_commit_calls": int(measurements["cdc_commit_calls"]),
+    }
 
 
 def result_path(workload: Workload, output: Path | None) -> Path:
@@ -502,9 +633,10 @@ def main() -> int:
     parser.add_argument("--cdc-extension", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--hardware-label", default=f"{platform.system()} {platform.machine()} {socket.gethostname()}")
+    parser.add_argument("--load-profile", choices=sorted(SUPPORTED_LOAD_PROFILES))
     parser.add_argument("--duration-seconds", type=int)
-    parser.add_argument("--snapshots-per-minute", type=float)
-    parser.add_argument("--rows-per-snapshot", type=int)
+    parser.add_argument("--target-snapshots-per-second", type=float)
+    parser.add_argument("--target-rows-per-snapshot", type=int)
     parser.add_argument("--consumers", type=int)
     parser.add_argument("--max-snapshots", type=int)
     args = parser.parse_args()
@@ -517,7 +649,7 @@ def main() -> int:
             paths = build_paths(args.build)
             require_artifacts(paths, args.build)
             binary = compile_harness(tmpdir, paths)
-            measurements = run_harness(binary, paths, workload, tmpdir)
+            measurements = normalize_legacy_measurements(run_harness(binary, paths, workload, tmpdir), workload)
             build_label = args.build
         else:
             if args.cdc_extension is None:
@@ -529,6 +661,7 @@ def main() -> int:
             build_label = "official"
 
     result = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_id": str(uuid.uuid4()),
         "timestamp_utc": dt.datetime.now(dt.UTC).isoformat(),
         "commit": git_commit(),
@@ -549,9 +682,9 @@ def main() -> int:
     print(f"benchmark result written to {out}")
     print(
         "summary: "
-        f"events={measurements['total_events']} "
-        f"elapsed={measurements['elapsed_seconds']:.2f}s "
-        f"p99={measurements['latency_ms_p99']:.2f}ms "
+        f"events={measurements['consumed_events']} "
+        f"elapsed={measurements['actual_duration_seconds']:.2f}s "
+        f"p99={measurements['end_to_end_latency_ms']['p99']:.2f}ms "
         f"catalog_qps={measurements['catalog_qps_avg']:.3f}"
     )
     emit_soft_warnings(measurements)

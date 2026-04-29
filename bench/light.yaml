@@ -1,6 +1,7 @@
 name: light
+load_profile: flat
 duration_seconds: 60
-snapshots_per_minute: 30
-rows_per_snapshot: 100
+target_snapshots_per_second: 0.5
+target_rows_per_snapshot: 100
 consumers: 1
 max_snapshots: 100

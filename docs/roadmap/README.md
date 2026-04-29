@@ -48,7 +48,7 @@ The contracts these axes imply, stated as principles:
 3. **`max_snapshots` is hard-capped.** Default 100, hard cap 1000 (configurable to a higher value per session via `SET ducklake_cdc_max_snapshots_hard_cap = ...`, but never silently). Stops users self-DOSing on `max_snapshots := 1000000` reads of the entire lake history. Phase 0 ratifies the cap.
 4. **Multiple consumers in one process share snapshot polling via `LakeWatcher`.** One goroutine / async task per `(catalog_uri)` polls `current_snapshot()` and broadcasts to local consumers. N consumers ≠ N times the polling load. Phase 3 / 4 client-side optimisation; the extension surface is unchanged.
 5. **The compaction contract bounds maximum lag, and that's the operator's choice.** `expire_older_than` has to exceed worst-case consumer lag. We surface lag in `cdc_consumer_stats()`; we do not negotiate with `ducklake_expire_snapshots`. Pillar 7 is the design-side companion to this.
-6. **We publish honest benchmark numbers, not hero numbers.** Three benchmark workloads (light / medium / heavy, ratified in Phase 0) are the intended release measurement set. Phase 1 runs the short `light` smoke benchmark in Full CI; `docs/performance.md` records the targets and publication policy while longer histories accumulate.
+6. **We publish honest benchmark numbers, not hero numbers.** Three benchmark workloads (light / medium / heavy, ratified in Phase 0) are the intended release measurement set. Phase 1 runs the short `light` smoke benchmark as a manual artifact-based workflow; `docs/performance.md` records the targets and publication policy while longer histories accumulate.
 
 ### Workloads we are good at, workloads we are not
 

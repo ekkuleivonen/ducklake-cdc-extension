@@ -33,10 +33,12 @@ in-process consumer.
 ## Where to read the numbers
 
 The Phase 1 smoke harness lives in `bench/runner.py`, with the first
-workload descriptor in `bench/light.yaml`. Full CI runs that descriptor
-against the release build and uploads the result JSON as an artifact.
-Selected baselines can be committed under `bench/results/` once there is
-enough history to make a trajectory meaningful.
+workload descriptor in `bench/light.yaml`. The manual benchmark workflow
+downloads the `linux_amd64` extension artifact from a successful Full CI
+run, executes that descriptor against the supported official DuckDB
+release, and uploads the result JSON as an artifact. Selected baselines
+can be committed under `bench/results/` once there is enough history to
+make a trajectory meaningful.
 
 ## What we are bad at
 
@@ -69,7 +71,7 @@ is rare and worth celebrating.
 
 ## Soft gates today, hard gates after Phase 5
 
-The benchmark CI gate is **"the harness ran and produced a number"**.
+The manual benchmark gate is **"the harness ran and produced a number"**.
 Soft gates print `::warning::` annotations when:
 
 - `lag_snapshots_max > 0` over the 60-second light smoke run, or
@@ -83,10 +85,9 @@ previous run for this workload + commit-relative hardware label" — the
 trajectory matters more than the absolute number until the absolute
 number has been measured on representative hardware.
 
-Future CI should move the benchmark later in the workflow: after the
-extension distribution matrix has built platform artifacts, run the
-benchmark against those exact artifacts instead of rebuilding locally. The
-likely regular CI gate is a 5-minute `medium` workload on every platform
-the matrix builds and every supported catalog backend available there.
-Long soaks, heavy workloads, and variable-load profiles remain scheduled
-or release-gated checks rather than the default PR loop.
+The benchmark workflow already runs after the extension distribution
+matrix by downloading the matrix-built artifact. The likely future regular
+CI gate is a 5-minute `medium` workload on every platform the matrix
+builds and every supported catalog backend available there. Long soaks,
+heavy workloads, and variable-load profiles remain scheduled or
+release-gated checks rather than the default PR loop.
