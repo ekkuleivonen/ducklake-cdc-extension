@@ -82,3 +82,11 @@ representative hardware. The interim discipline is "no regression vs
 previous run for this workload + commit-relative hardware label" — the
 trajectory matters more than the absolute number until the absolute
 number has been measured on representative hardware.
+
+Future CI should move the benchmark later in the workflow: after the
+extension distribution matrix has built platform artifacts, run the
+benchmark against those exact artifacts instead of rebuilding locally. The
+likely regular CI gate is a 5-minute `medium` workload on every platform
+the matrix builds and every supported catalog backend available there.
+Long soaks, heavy workloads, and variable-load profiles remain scheduled
+or release-gated checks rather than the default PR loop.

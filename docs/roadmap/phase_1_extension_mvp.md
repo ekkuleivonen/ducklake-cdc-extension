@@ -227,7 +227,7 @@ Numbers without history are flat; numbers with history are a story. Phase 1 ship
   - **Latency:** recorded in every result (`p50` / `p95` / `p99` / `max` / `mean`) but not gated. Per the ADR 0011 + Phase 5 hand-off: the absolute target only becomes a hard CI gate after Phase 5 ratifies the production number on representative hardware.
   - Why this discipline: if Phase 1 committed to a 1s p99 hard gate and the first run got 1.2s, the release notes would read "we said p99 < 1s, we got 1.2s" on day one. Soft-gate now, ratify in Phase 5, treat as contract from beta forward.
 - [x] **Bench-history page (manual for now):** `bench/README.md` is hand-written for now (covers the harness, the workload, the metrics, and how to read the JSON). Auto-generation from `bench/results/*.json` — trajectory charts per metric per workload — lands once there are enough committed data points to chart. Phase 5 hardens the auto-generation; Phase 1 keeps it manual because two data points are not yet a trajectory.
-- [ ] Phase 2 adds `bench/medium.yaml` and runs it across the catalog matrix. Phase 5 adds `bench/heavy.yaml`, variable-load profiles, and the long-running soak / sustained-load jobs.
+- [ ] Phase 2 adds `bench/medium.yaml` and evolves CI to run a 5-minute medium workload against the artifacts produced by the extension distribution matrix, across every built platform and supported catalog backend. Phase 5 adds `bench/heavy.yaml`, variable-load profiles, and the long-running soak / sustained-load jobs.
 
 ### Observability
 

@@ -199,6 +199,14 @@ snapshot rate, rows per snapshot, consumer count, and `max_snapshots` as
 parameters from the workload descriptor so later phases can add richer
 load profiles without replacing the harness.
 
+The mature CI shape is different from Phase 1's local rebuild: run the
+benchmark **after** the extension distribution matrix has produced its
+platform artifacts, and benchmark those exact artifacts. The likely
+default gate is a 5-minute `medium` run on every platform the matrix
+builds, across the supported catalog backends available on that runner.
+That may be sufficient as the regular CI performance signal; longer soak,
+heavy, and variable-load runs can stay scheduled or release-gated.
+
 ### Honest publication policy
 
 Numbers go in `docs/performance.md` with **date + commit SHA +
