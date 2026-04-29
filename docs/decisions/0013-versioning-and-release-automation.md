@@ -71,7 +71,7 @@ branch and refuses to tag a `.PATCH` (with `PATCH > 0`) from `main`.
 
 ### Release workflow contract
 
-`.github/workflows/release.yml` is `workflow_dispatch`-only with three
+`.github/workflows/release.yml` is `workflow_dispatch`-only with four
 inputs:
 
 - `version` — the tag to create (required).
@@ -81,6 +81,11 @@ inputs:
 - `skip_community_pr` — defaults to `false`. Set to `true` to release
   to GitHub only (e.g. while iterating on the community PR descriptor
   or before the bot token is configured).
+- `community_pr_only` — defaults to `false`. Set to `true` with
+  `dry_run: false` to retry only the `duckdb/community-extensions` PR
+  for an existing release tag. This does not create or push tags,
+  maintenance branches, or GitHub Releases, and it does not re-check the
+  trigger SHA's `CI Pass` status.
 
 On a non-dry-run, the workflow does this **in order**:
 
@@ -109,6 +114,12 @@ On a non-dry-run, the workflow does this **in order**:
 Steady-state maintainer experience: open Actions, pick `Release`, type
 `v0.2.0`, untick `dry_run`, click `Run workflow`. Done.
 
+If the community PR step fails after the tag and GitHub Release have
+already been created, re-run `Release` from a branch that contains the
+workflow fix with the same `version`, `dry_run: false`, and
+`community_pr_only: true`. The workflow resolves the existing tag SHA
+and retries only the fork branch push plus upstream PR creation.
+
 ### One-time human setup
 
 These are configured once in the GitHub UI / the repository's secrets
@@ -128,10 +139,11 @@ not let workflows configure their own protection rules.
    - Require status checks to pass: `CI Pass`
 3. **Community bot token (Settings → Secrets → Actions):**
    - Add a repository secret `COMMUNITY_BOT_TOKEN`
-   - Use a fine-grained PAT scoped to a fork of
-     `duckdb/community-extensions` with `contents: write`. The PAT only
-     needs to push branches to the fork; PRs are opened against the
-     upstream via `gh pr create --repo duckdb/community-extensions`.
+   - Use a PAT that can push branches to a fork of
+     `duckdb/community-extensions` and open PRs against the upstream. The
+     account that owns the PAT must already have that fork. The workflow
+     pushes branches to the fork and opens PRs against the upstream via
+     `gh pr create --repo duckdb/community-extensions --head OWNER:BRANCH`.
    - If this secret is missing, the release workflow's `community-pr`
      job fails fast with a pointer back to this ADR.
 4. **First community descriptor:**

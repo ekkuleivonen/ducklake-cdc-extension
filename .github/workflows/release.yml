@@ -22,12 +22,15 @@
 # version. Nothing is pushed, nothing is published; the workflow just
 # prints what it *would* do.
 #
+# Set `community_pr_only: true` with `dry_run: false` to retry the
+# community-extensions PR step for an already-created release tag. This
+# does not create or push tags, maintenance branches, or GitHub Releases.
+#
 # Required secrets:
-#   - `COMMUNITY_BOT_TOKEN` — a GitHub PAT (or fine-grained token) that
-#     has `contents: write` on a fork of `duckdb/community-extensions` and
-#     can open PRs against the upstream. Only needed for the
-#     `community-pr` job; everything else uses the workflow's own
-#     `GITHUB_TOKEN`.
+#   - `COMMUNITY_BOT_TOKEN` — a GitHub PAT that can push to the token
+#     owner's fork of `duckdb/community-extensions` and open PRs against
+#     the upstream. Only needed for the `community-pr` job; everything
+#     else uses the workflow's own `GITHUB_TOKEN`.
 
 name: Release
 
@@ -44,6 +47,10 @@ on:
         default: true
       skip_community_pr:
         description: 'Skip the duckdb/community-extensions PR step (use if the PAT is not configured yet, or for a hot patch).'
+        type: boolean
+        default: false
+      community_pr_only:
+        description: 'Retry only the duckdb/community-extensions PR step for an existing tag. Requires dry_run: false.'
         type: boolean
         default: false
 
@@ -65,10 +72,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ inputs.version }}
-      release_sha: ${{ steps.tag.outputs.sha }}
+      release_sha: ${{ steps.tag.outputs.sha || steps.existing_tag.outputs.sha }}
       maintenance_branch: ${{ steps.branch.outputs.name }}
     steps:
+      - name: Validate dispatch mode
+        run: |
+          if [[ "${{ inputs.community_pr_only }}" == "true" && "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "::error::community_pr_only retries push a branch and open a PR, so dry_run must be false."
+            exit 1
+          fi
+          if [[ "${{ inputs.community_pr_only }}" == "true" && "${{ inputs.skip_community_pr }}" == "true" ]]; then
+            echo "::error::community_pr_only and skip_community_pr cannot both be true."
+            exit 1
+          fi
+
       - name: Validate trigger ref
+        if: ${{ !inputs.community_pr_only }}
         env:
           REF: ${{ github.ref }}
         run: |
@@ -88,6 +107,7 @@ jobs:
           fi
 
       - name: Validate version matches branch policy
+        if: ${{ !inputs.community_pr_only }}
         env:
           REF: ${{ github.ref }}
           VERSION: ${{ inputs.version }}
@@ -128,6 +148,7 @@ jobs:
           submodules: recursive
 
       - name: Verify tag does not already exist
+        if: ${{ !inputs.community_pr_only }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -140,7 +161,21 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve existing release tag
+        id: existing_tag
+        if: ${{ inputs.community_pr_only }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION does not exist on origin; community_pr_only can only retry an existing release."
+            exit 1
+          fi
+          git fetch origin "refs/tags/$VERSION:refs/tags/$VERSION"
+          echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
+
       - name: Verify Full CI is green at the release SHA
+        if: ${{ !inputs.community_pr_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
@@ -177,6 +212,7 @@ jobs:
 
       - name: Create annotated tag
         id: tag
+        if: ${{ !inputs.community_pr_only }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -184,13 +220,13 @@ jobs:
           echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Push tag
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
         env:
           VERSION: ${{ inputs.version }}
         run: git push origin "refs/tags/$VERSION"
 
       - name: Create or fast-forward maintenance branch
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
           REF: ${{ github.ref }}
@@ -204,7 +240,7 @@ jobs:
           fi
 
       - name: Create GitHub Release with auto-generated notes
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
@@ -231,6 +267,19 @@ jobs:
             echo "- opened a PR against \`duckdb/community-extensions\` (separate job)"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Community PR retry summary
+        if: ${{ inputs.community_pr_only }}
+        env:
+          VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ steps.existing_tag.outputs.sha }}
+        run: |
+          {
+            echo "## Community PR retry"
+            echo ""
+            echo "Will retry the \`duckdb/community-extensions\` PR for existing tag \`$VERSION\` at \`$RELEASE_SHA\`."
+            echo "No tags, branches, or GitHub Releases will be created in this repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   community-pr:
     name: Open community-extensions PR
     needs: release
@@ -250,9 +299,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.COMMUNITY_BOT_TOKEN }}
         run: |
-          # Clone via the bot token so subsequent push works.
+          set -euo pipefail
+          # Clone upstream for the edit, then push the PR branch to the
+          # token owner's fork.
           gh auth setup-git
-          git clone "https://x-access-token:$GH_TOKEN@github.com/duckdb/community-extensions.git" community-extensions
+          BOT_LOGIN="$(gh api user --jq .login)"
+          echo "BOT_LOGIN=$BOT_LOGIN" >> "$GITHUB_ENV"
+
+          git clone "https://github.com/duckdb/community-extensions.git" community-extensions
+          cd community-extensions
+          git remote rename origin upstream
+          git remote add origin "https://github.com/$BOT_LOGIN/community-extensions.git"
+          if ! git ls-remote --exit-code origin >/dev/null 2>&1; then
+            echo "::error::COMMUNITY_BOT_TOKEN belongs to '$BOT_LOGIN', but https://github.com/$BOT_LOGIN/community-extensions.git is not reachable. Create a fork of duckdb/community-extensions for that account and grant the token contents: write on the fork."
+            exit 1
+          fi
 
       - name: Update extension descriptor
         working-directory: community-extensions
@@ -337,11 +398,15 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          BRANCH="${EXTENSION_NAME}-${VERSION}"
+          if [[ "${{ inputs.community_pr_only }}" == "true" ]]; then
+            BRANCH="${EXTENSION_NAME}-${VERSION}-retry-${GITHUB_RUN_ID}"
+          else
+            BRANCH="${EXTENSION_NAME}-${VERSION}"
+          fi
           git checkout -b "$BRANCH"
           git add "extensions/$EXTENSION_NAME/description.yml"
           git commit -m "$EXTENSION_NAME: $VERSION"
-          git push -u origin "$BRANCH"
+          git push -u origin "HEAD:$BRANCH"
 
           cat > /tmp/community-pr-body.md <<EOF
           Automated descriptor update for [$REPO@$VERSION](https://github.com/$REPO/releases/tag/$VERSION).
@@ -353,5 +418,7 @@ jobs:
 
           gh pr create \
             --repo duckdb/community-extensions \
+            --base main \
+            --head "$BOT_LOGIN:$BRANCH" \
             --title "$EXTENSION_NAME: $VERSION" \
             --body-file /tmp/community-pr-body.md

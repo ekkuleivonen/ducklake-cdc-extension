@@ -152,6 +152,10 @@ The first run of any new version should be a **dry run** (the default)
 so the workflow prints the plan without pushing anything. Once the plan
 looks right, untick `dry_run` and re-run.
 
+If the GitHub Release succeeds but the community-extensions PR step
+fails, re-run **Release** with the same version, `dry_run: false`, and
+`community_pr_only: true` to retry only that PR.
+
 The exact contract — version policy, validations, branch rules, and the
 one-time GitHub setup (branch protection rules and the
 `COMMUNITY_BOT_TOKEN` secret) — is in
