@@ -31,8 +31,7 @@ inline void CdcVersionScalarFun(DataChunk &args, ExpressionState &state, Vector 
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	auto cdc_version_function =
-	    ScalarFunction("cdc_version", {}, LogicalType::VARCHAR, CdcVersionScalarFun);
+	auto cdc_version_function = ScalarFunction("cdc_version", {}, LogicalType::VARCHAR, CdcVersionScalarFun);
 	loader.RegisterFunction(cdc_version_function);
 	duckdb_cdc::RegisterConsumerStateFunctions(loader);
 

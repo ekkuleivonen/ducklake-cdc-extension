@@ -66,12 +66,11 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: test/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Check DuckLake changes-map reference
         run: |
-          cd test
-          uv run --locked python upstream/enumerate_changes_map.py --check
+          uv run --locked python test/upstream/enumerate_changes_map.py --check
 
   # Stable status check name that branch protection should require. As long
   # as both upstream reusable workflows and local contract checks succeed,

@@ -1,11 +1,12 @@
 # name: test/sql/recent_sugar.test
 # description: Stateless sugar wrappers (cdc_recent_changes, cdc_recent_ddl).
+# group: [sql]
+
 #              No consumer required, no cursor, no commit. Compose
 #              <lake>.table_changes(...) and the cdc_ddl extractor with bare
 #              snapshot bounds derived from now() - INTERVAL since_seconds
 #              SECOND. Bootstrapping the CDC state tables is NOT required for
 #              these to work - they read upstream catalog state directly.
-# group: [sql]
 
 require ducklake_cdc
 

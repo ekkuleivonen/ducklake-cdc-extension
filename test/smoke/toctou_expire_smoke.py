@@ -19,8 +19,7 @@ CDC_GAP cleanly with the recovery message documented in
 
 Usage:
 
-    cd test
-    uv run python smoke/toctou_expire_smoke.py
+    uv run python test/smoke/toctou_expire_smoke.py
 
 Run `make debug` first.
 """

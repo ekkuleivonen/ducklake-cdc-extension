@@ -47,8 +47,7 @@ after the debug build so the structured notice/error contract stays pinned.
 
 Usage:
 
-    cd test
-    uv run python smoke/compat_warning_smoke.py
+    uv run python test/smoke/compat_warning_smoke.py
 
 Exit codes:
 
@@ -118,11 +117,7 @@ def seed_fake_catalog(db_path: Path, catalog_name: str) -> None:
         check=False,
     )
     if result.returncode != 0:
-        sys.stderr.write(
-            "seed step failed:\n"
-            f"  stdout: {result.stdout}\n"
-            f"  stderr: {result.stderr}\n"
-        )
+        sys.stderr.write("seed step failed:\n" f"  stdout: {result.stdout}\n" f"  stderr: {result.stderr}\n")
         sys.exit(1)
 
 
@@ -144,11 +139,7 @@ def capture_load_notice(db_path: Path) -> str:
         check=False,
     )
     if result.returncode != 0:
-        sys.stderr.write(
-            "smoke run exited non-zero:\n"
-            f"  stdout: {result.stdout}\n"
-            f"  stderr: {result.stderr}\n"
-        )
+        sys.stderr.write("smoke run exited non-zero:\n" f"  stdout: {result.stdout}\n" f"  stderr: {result.stderr}\n")
         sys.exit(1)
     return result.stderr
 
@@ -171,9 +162,7 @@ def capture_call_time_error(db_path: Path, catalog_name: str) -> str:
     )
     if result.returncode == 0:
         sys.stderr.write(
-            "call-time smoke unexpectedly succeeded:\n"
-            f"  stdout: {result.stdout}\n"
-            f"  stderr: {result.stderr}\n"
+            "call-time smoke unexpectedly succeeded:\n" f"  stdout: {result.stdout}\n" f"  stderr: {result.stderr}\n"
         )
         sys.exit(1)
     return result.stderr
@@ -201,9 +190,7 @@ def assert_required_fields(catalog_name: str, notice: str) -> list[str]:
 
 def main() -> int:
     if not DUCKDB_CLI.exists():
-        sys.stderr.write(
-            f"locally-built duckdb CLI not found at {DUCKDB_CLI}; run `make debug` first.\n"
-        )
+        sys.stderr.write(f"locally-built duckdb CLI not found at {DUCKDB_CLI}; run `make debug` first.\n")
         return 1
 
     catalog_name = "smokelake"
@@ -217,17 +204,10 @@ def main() -> int:
         notice = capture_load_notice(db_path)
         call_error = capture_call_time_error(db_path, catalog_name)
 
-    problems = [
-        f"LOAD-time notice: {p}" for p in assert_required_fields(catalog_name, notice)
-    ]
-    problems.extend(
-        f"call-time exception: {p}"
-        for p in assert_required_fields(catalog_name, call_error)
-    )
+    problems = [f"LOAD-time notice: {p}" for p in assert_required_fields(catalog_name, notice)]
+    problems.extend(f"call-time exception: {p}" for p in assert_required_fields(catalog_name, call_error))
     if problems:
-        sys.stderr.write(
-            "compat_warning_smoke FAILED — expected compatibility text not produced.\n"
-        )
+        sys.stderr.write("compat_warning_smoke FAILED — expected compatibility text not produced.\n")
         sys.stderr.write("--- captured LOAD-time stderr ---\n")
         sys.stderr.write(notice if notice else "(empty)\n")
         sys.stderr.write("--- captured call-time stderr ---\n")

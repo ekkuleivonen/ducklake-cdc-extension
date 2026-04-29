@@ -11,9 +11,9 @@ testext
 test/python/__pycache__/
 .Rhistory
 
-# Test venv and Python runtime artifacts. The committed outputs under
+# Python runtime artifacts. The committed outputs under
 # test/upstream/output/ are reference data and should stay tracked.
-test/.venv/
+.venv/
 test/smoke/__pycache__/
 test/upstream/__pycache__/
 __pycache__/

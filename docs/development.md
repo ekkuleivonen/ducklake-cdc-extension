@@ -100,13 +100,11 @@ Swap the path for any file under `test/sql/`.
 ## Python smoke and upstream probes
 
 Some behaviours are easier to smoke-test from Python (stderr notices,
-multi-connection leases, explicit interrupts, etc.). Dependencies live in
-`test/pyproject.toml`; run from that directory:
+multi-connection leases, explicit interrupts, etc.). Dependencies live in the root `pyproject.toml`; run from the repository root:
 
 ```bash
-cd test
-uv run python smoke/lease_multiconn_smoke.py
-uv run python upstream/enumerate_changes_map.py --check
+uv run python test/smoke/lease_multiconn_smoke.py
+uv run python test/upstream/enumerate_changes_map.py --check
 ```
 
 See [`test/smoke/README.md`](../test/smoke/README.md) and

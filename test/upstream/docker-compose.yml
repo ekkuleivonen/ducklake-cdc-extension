@@ -4,9 +4,9 @@
 #   postgres → localhost:5433
 #
 # Usage:
-#   docker compose up -d
-#   cd .. && uv run python upstream/enumerate_changes_map.py --backends duckdb sqlite postgres
-#   docker compose down -v   # clean up between runs
+#   docker compose -f test/upstream/docker-compose.yml up -d
+#   uv run python test/upstream/enumerate_changes_map.py --backends duckdb sqlite postgres
+#   docker compose -f test/upstream/docker-compose.yml down -v   # clean up between runs
 
 services:
   postgres:

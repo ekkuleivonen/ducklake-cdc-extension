@@ -19,8 +19,7 @@ This script compiles a tiny C++ harness that:
 
 Usage:
 
-    cd test
-    uv run python smoke/cdc_wait_interrupt_smoke.py
+    uv run python test/smoke/cdc_wait_interrupt_smoke.py
 
 Run `make debug` first.
 """

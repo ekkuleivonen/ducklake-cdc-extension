@@ -109,8 +109,7 @@ std::string ReadCatalogVersion(duckdb::Connection &conn, const std::string &cata
 //
 // Returns rows of (catalog_name VARCHAR, version VARCHAR). `version`
 // is NULL if the metadata row is missing.
-std::vector<std::pair<std::string, std::string>>
-ReadAllCatalogVersions(duckdb::Connection &conn) {
+std::vector<std::pair<std::string, std::string>> ReadAllCatalogVersions(duckdb::Connection &conn) {
 	// Two-stage probe.
 	//
 	// Stage 1 — discovery: one query against `duckdb_schemas()` listing
@@ -127,11 +126,10 @@ ReadAllCatalogVersions(duckdb::Connection &conn) {
 	// returned by stage 1. In practice users have a handful of attached
 	// databases — the per-attachment cost is negligible.
 	std::vector<std::pair<std::string, std::string>> out;
-	auto schemas = conn.Query(
-	    "SELECT database_name, schema_name "
-	    "FROM duckdb_schemas() "
-	    "WHERE schema_name LIKE '\\_\\_ducklake\\_metadata\\_%' ESCAPE '\\' "
-	    "  AND schema_name = '__ducklake_metadata_' || database_name");
+	auto schemas = conn.Query("SELECT database_name, schema_name "
+	                          "FROM duckdb_schemas() "
+	                          "WHERE schema_name LIKE '\\_\\_ducklake\\_metadata\\_%' ESCAPE '\\' "
+	                          "  AND schema_name = '__ducklake_metadata_' || database_name");
 	if (!schemas || schemas->HasError()) {
 		return out;
 	}

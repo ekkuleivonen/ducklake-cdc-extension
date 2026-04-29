@@ -1,9 +1,10 @@
 # name: test/sql/observability.test
 # description: Observability sugar shipped in v0.0.6 — cdc_consumer_stats and
+# group: [sql]
+
 #              cdc_audit_recent. Both are read-only stateless wrappers, never
 #              acquire the consumer's owner-token lease, and never write to
 #              the catalog beyond the implicit consumer-state bootstrap.
-# group: [sql]
 
 require ducklake_cdc
 

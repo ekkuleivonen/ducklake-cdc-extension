@@ -1,11 +1,12 @@
 # name: test/sql/notices_validation.test
 # description: PR 4 — create-time validation of cdc_consumer_create
+# group: [sql]
+
 #              (CDC_INVALID_TABLE_FILTER + change_types/event_categories
 #              ALLOWED enum gates), CDC_SCHEMA_BOUNDARY notice on
 #              cdc_window, CDC_WAIT_TIMEOUT_CLAMPED notice on cdc_wait,
 #              and the DDL-vs-DML routing of consumer.event_categories
 #              into cdc_ddl / cdc_changes. All shipped as v0.0.7.
-# group: [sql]
 
 require ducklake_cdc
 

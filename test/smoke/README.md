@@ -13,9 +13,8 @@ make debug
 Run all smoke probes from the shared test Python project:
 
 ```bash
-cd test
-uv run python smoke/compat_warning_smoke.py
-uv run python smoke/lease_multiconn_smoke.py
-uv run python smoke/cdc_wait_interrupt_smoke.py
-uv run python smoke/toctou_expire_smoke.py
+uv run python test/smoke/compat_warning_smoke.py
+uv run python test/smoke/lease_multiconn_smoke.py
+uv run python test/smoke/cdc_wait_interrupt_smoke.py
+uv run python test/smoke/toctou_expire_smoke.py
 ```

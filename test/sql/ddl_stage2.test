@@ -1,9 +1,10 @@
 # name: test/sql/ddl_stage2.test
 # description: Stage-2 cdc_ddl details payloads (column lists, column-level
+# group: [sql]
+
 #              diffs, view definitions, Finding-1 rename detection) plus the
 #              cdc_schema_diff sugar that projects per-column rows from the
 #              same extractor.
-# group: [sql]
 
 require ducklake_cdc
 

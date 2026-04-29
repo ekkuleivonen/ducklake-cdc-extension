@@ -1,9 +1,10 @@
 # name: test/sql/sugar.test
 # description: Acknowledged sugar wrappers (cdc_events, cdc_changes) shipped in
+# group: [sql]
+
 #              v0.0.3. Both compose cdc_window with DuckLake builtins; both
 #              acquire the consumer's owner-token lease the same way the
 #              underlying primitive does and never auto-commit.
-# group: [sql]
 
 require ducklake_cdc
 

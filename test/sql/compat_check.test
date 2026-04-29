@@ -1,10 +1,11 @@
 # name: test/sql/compat_check.test
 # description: catalog-version compatibility check on LOAD ducklake_cdc;
+# group: [sql]
+
 #              covers the silent paths (no DuckLake catalog attached, and a
 #              freshly attached compatible catalog). The incompatible-catalog
 #              warning path is covered by test/smoke/compat_warning_smoke.py
 #              because SQLLogicTest can't easily assert on a notice's text.
-# group: [sql]
 
 # Path 1: loading the extension with no DuckLake catalog attached must be
 # silent and must NOT block cdc_version() from returning the build stamp.

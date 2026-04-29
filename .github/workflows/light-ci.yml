@@ -61,7 +61,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: test/uv.lock
+          cache-dependency-glob: uv.lock
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -94,8 +94,7 @@ jobs:
 
       - name: Python smoke probes
         run: |
-          cd test
-          uv run --locked python smoke/compat_warning_smoke.py
-          uv run --locked python smoke/lease_multiconn_smoke.py
-          uv run --locked python smoke/cdc_wait_interrupt_smoke.py
-          uv run --locked python smoke/toctou_expire_smoke.py
+          uv run --locked python test/smoke/compat_warning_smoke.py
+          uv run --locked python test/smoke/lease_multiconn_smoke.py
+          uv run --locked python test/smoke/cdc_wait_interrupt_smoke.py
+          uv run --locked python test/smoke/toctou_expire_smoke.py

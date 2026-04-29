@@ -1,8 +1,9 @@
 # name: test/sql/always_breaks.test
 # description: "Always breaks" coverage for edge cases that repeatedly regress.
+# group: [sql]
+
 #              Runs against the embedded DuckDB catalog and uses only shipped
 #              Phase-1 primitives + sugar.
-# group: [sql]
 
 require ducklake_cdc
 

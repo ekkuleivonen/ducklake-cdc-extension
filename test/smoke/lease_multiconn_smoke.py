@@ -13,8 +13,7 @@ process, and asserts:
 
 Usage:
 
-    cd test
-    uv run python smoke/lease_multiconn_smoke.py
+    uv run python test/smoke/lease_multiconn_smoke.py
 
 Run `make debug` first.
 """

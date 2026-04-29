@@ -18,9 +18,9 @@ After all backends:
      "fail the build on any diff" rule once promoted to recurring CI).
 
 Usage:
-    cd test && uv run python upstream/enumerate_changes_map.py --backends duckdb sqlite [postgres]
-    cd test && uv run python upstream/enumerate_changes_map.py --backends duckdb sqlite [postgres] --check
-    cd test && uv run python upstream/enumerate_changes_map.py --update-docs
+    uv run python test/upstream/enumerate_changes_map.py --backends duckdb sqlite [postgres]
+    uv run python test/upstream/enumerate_changes_map.py --backends duckdb sqlite [postgres] --check
+    uv run python test/upstream/enumerate_changes_map.py --update-docs
 
 Exit codes:
     0 = all backends ran cleanly and key sets agree
@@ -100,8 +100,7 @@ def operation_script() -> list[Op]:
         # --- DML: regular insert above the inlining row limit ---
         Op(
             "inserted_into_table_regular",
-            "INSERT INTO main.t_main "
-            "SELECT i, 'name_'||i FROM range(50) AS r(i)",
+            "INSERT INTO main.t_main " "SELECT i, 'name_'||i FROM range(50) AS r(i)",
             f"insert > DATA_INLINING_ROW_LIMIT={INLINING_LIMIT} → goes to Parquet",
         ),
         # --- DML: small insert at-or-below the inlining row limit ---
@@ -145,8 +144,7 @@ def operation_script() -> list[Op]:
         # Add more rows so we have something non-trivial to compact.
         Op(
             "inserted_into_table_more",
-            "INSERT INTO main.t_main "
-            "SELECT i, 'more_'||i FROM range(50, 80) AS r(i)",
+            "INSERT INTO main.t_main " "SELECT i, 'more_'||i FROM range(50, 80) AS r(i)",
             "second non-inlined insert (sets up compaction input)",
         ),
         # --- maintenance: compact the catalog's adjacent files ---
@@ -167,26 +165,22 @@ def operation_script() -> list[Op]:
         ),
         Op(
             "_setup_compact_files_1",
-            "INSERT INTO main.t_compact "
-            "SELECT i, repeat('a', 50) FROM range(20) AS r(i)",
+            "INSERT INTO main.t_compact " "SELECT i, repeat('a', 50) FROM range(20) AS r(i)",
             "first Parquet file for compaction",
         ),
         Op(
             "_setup_compact_files_2",
-            "INSERT INTO main.t_compact "
-            "SELECT i, repeat('b', 50) FROM range(20, 40) AS r(i)",
+            "INSERT INTO main.t_compact " "SELECT i, repeat('b', 50) FROM range(20, 40) AS r(i)",
             "second Parquet file for compaction",
         ),
         Op(
             "_setup_compact_files_3",
-            "INSERT INTO main.t_compact "
-            "SELECT i, repeat('c', 50) FROM range(40, 60) AS r(i)",
+            "INSERT INTO main.t_compact " "SELECT i, repeat('c', 50) FROM range(40, 60) AS r(i)",
             "third Parquet file for compaction",
         ),
         Op(
             "compacted_table",
-            "CALL ducklake_merge_adjacent_files("
-            "'lake', min_file_size => 1, max_file_size => 999999999)",
+            "CALL ducklake_merge_adjacent_files(" "'lake', min_file_size => 1, max_file_size => 999999999)",
             "merge adjacent Parquet files (forced via small min_file_size)",
         ),
         # --- DDL: ALTER TABLE variants ---
@@ -224,8 +218,7 @@ def operation_script() -> list[Op]:
         ),
         Op(
             "altered_view",
-            "CREATE OR REPLACE VIEW main.v1 AS "
-            "SELECT id FROM main.renamed_main",
+            "CREATE OR REPLACE VIEW main.v1 AS " "SELECT id FROM main.renamed_main",
             "CREATE OR REPLACE VIEW (the closest DuckDB analogue to ALTER VIEW)",
             optional=True,
         ),
@@ -275,8 +268,7 @@ def backend_duckdb(workdir: Path) -> Iterator[tuple[duckdb.DuckDBPyConnection, s
     data.mkdir(parents=True, exist_ok=True)
     with _ducklake_con() as con:
         con.execute(
-            f"ATTACH 'ducklake:{catalog}' AS lake "
-            f"(DATA_PATH '{data}', DATA_INLINING_ROW_LIMIT {INLINING_LIMIT})"
+            f"ATTACH 'ducklake:{catalog}' AS lake " f"(DATA_PATH '{data}', DATA_INLINING_ROW_LIMIT {INLINING_LIMIT})"
         )
         con.execute("USE lake")
         yield con, "lake"
@@ -395,15 +387,11 @@ def _max_snapshot_id(con: duckdb.DuckDBPyConnection, alias: str) -> int | None:
     backend, where direct queries against the metadata table take
     connections from the backend extension's pool (default 8) and can
     exhaust it across the upstream probe's ~25 ops."""
-    row = con.execute(
-        f"SELECT max(snapshot_id) FROM {alias}.snapshots()"
-    ).fetchone()
+    row = con.execute(f"SELECT max(snapshot_id) FROM {alias}.snapshots()").fetchone()
     return None if row is None or row[0] is None else int(row[0])
 
 
-def _changes_map(
-    con: duckdb.DuckDBPyConnection, alias: str, snapshot_id: int
-) -> dict[str, list[str]]:
+def _changes_map(con: duckdb.DuckDBPyConnection, alias: str, snapshot_id: int) -> dict[str, list[str]]:
     row = con.execute(
         f"SELECT changes FROM {alias}.snapshots() WHERE snapshot_id = ?",
         [snapshot_id],
@@ -446,12 +434,11 @@ def _changes_made_for(
         # the underlying postgres schema is just `public`. We bypass the
         # DuckLake-on-postgres pool by going direct.
         import psycopg
+
         with psycopg.connect(PG_DSN) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT changes_made "
-                    "FROM public.ducklake_snapshot_changes "
-                    "WHERE snapshot_id = %s",
+                    "SELECT changes_made " "FROM public.ducklake_snapshot_changes " "WHERE snapshot_id = %s",
                     [snapshot_id],
                 )
                 row = cur.fetchone()
@@ -476,29 +463,33 @@ def run_backend(
         # catalog). It's not produced by an op in the script, but it shows
         # the schemas_created=[main] baseline that all backends share.
         if prior_snapshot is not None:
-            ops_results.append({
-                "kind": "_seed_attach_initial_snapshot",
-                "sql": "(initial snapshot at ATTACH time)",
-                "note": "baseline snapshot when DuckLake initialises the catalog",
-                "supported": True,
-                "produced_snapshot": True,
-                "snapshot_id": prior_snapshot,
-                "changes_map": _changes_map(con, alias, prior_snapshot),
-                "changes_made": _changes_made_for(con, name, alias, prior_snapshot),
-            })
+            ops_results.append(
+                {
+                    "kind": "_seed_attach_initial_snapshot",
+                    "sql": "(initial snapshot at ATTACH time)",
+                    "note": "baseline snapshot when DuckLake initialises the catalog",
+                    "supported": True,
+                    "produced_snapshot": True,
+                    "snapshot_id": prior_snapshot,
+                    "changes_map": _changes_map(con, alias, prior_snapshot),
+                    "changes_made": _changes_made_for(con, name, alias, prior_snapshot),
+                }
+            )
 
         for op in operation_script():
             try:
                 con.execute(op.sql)
             except duckdb.Error as e:
                 err = str(e).strip().splitlines()[0]
-                ops_results.append({
-                    "kind": op.kind,
-                    "sql": op.sql,
-                    "note": op.note,
-                    "supported": False,
-                    "error": err,
-                })
+                ops_results.append(
+                    {
+                        "kind": op.kind,
+                        "sql": op.sql,
+                        "note": op.note,
+                        "supported": False,
+                        "error": err,
+                    }
+                )
                 if not op.optional:
                     print(f"[{name}]   {op.kind}: HARD FAILURE — {err}", flush=True)
                 else:
@@ -506,30 +497,32 @@ def run_backend(
                 continue
 
             new_snapshot = _max_snapshot_id(con, alias)
-            if new_snapshot is None or (
-                prior_snapshot is not None and new_snapshot == prior_snapshot
-            ):
-                ops_results.append({
+            if new_snapshot is None or (prior_snapshot is not None and new_snapshot == prior_snapshot):
+                ops_results.append(
+                    {
+                        "kind": op.kind,
+                        "sql": op.sql,
+                        "note": op.note,
+                        "supported": True,
+                        "produced_snapshot": False,
+                        "changes_map": {},
+                        "changes_made": None,
+                    }
+                )
+                continue
+
+            ops_results.append(
+                {
                     "kind": op.kind,
                     "sql": op.sql,
                     "note": op.note,
                     "supported": True,
-                    "produced_snapshot": False,
-                    "changes_map": {},
-                    "changes_made": None,
-                })
-                continue
-
-            ops_results.append({
-                "kind": op.kind,
-                "sql": op.sql,
-                "note": op.note,
-                "supported": True,
-                "produced_snapshot": True,
-                "snapshot_id": new_snapshot,
-                "changes_map": _changes_map(con, alias, new_snapshot),
-                "changes_made": _changes_made_for(con, name, alias, new_snapshot),
-            })
+                    "produced_snapshot": True,
+                    "snapshot_id": new_snapshot,
+                    "changes_map": _changes_map(con, alias, new_snapshot),
+                    "changes_made": _changes_made_for(con, name, alias, new_snapshot),
+                }
+            )
             prior_snapshot = new_snapshot
 
     return {
@@ -690,19 +683,21 @@ def _format_reference_drift(deltas: dict[str, dict[str, dict[str, list[str]]]]) 
             if delta["removed"]:
                 out.append("    Removed keys: " + ", ".join(delta["removed"]))
         out.append("")
-    out.extend([
-        "What to do:",
-        "  - If this divergence is the upstream change you expected (e.g. you",
-        "    bumped the duckdb submodule's ducklake GIT_TAG): run",
-        "      cd test && uv run python upstream/enumerate_changes_map.py \\",
-        "          --backends duckdb sqlite postgres --update-docs",
-        "    locally, review the resulting diff, and commit the regenerated",
-        "    test/upstream/output/ files plus the docs/api.md splice. The cdc_ddl /",
-        "    cdc_events extractor work item also needs an update; see ADR 0008.",
-        "  - If this divergence is unexpected: open a docs/upstream-asks.md",
-        "    entry. Backend MAP-key drift between releases is exactly the class",
-        "    of upstream behaviour ADR 0008's recurring CI gate exists to surface.",
-    ])
+    out.extend(
+        [
+            "What to do:",
+            "  - If this divergence is the upstream change you expected (e.g. you",
+            "    bumped the duckdb submodule's ducklake GIT_TAG): run",
+            "      uv run python test/upstream/enumerate_changes_map.py \\",
+            "          --backends duckdb sqlite postgres --update-docs",
+            "    locally, review the resulting diff, and commit the regenerated",
+            "    test/upstream/output/ files plus the docs/api.md splice. The cdc_ddl /",
+            "    cdc_events extractor work item also needs an update; see ADR 0008.",
+            "  - If this divergence is unexpected: open a docs/upstream-asks.md",
+            "    entry. Backend MAP-key drift between releases is exactly the class",
+            "    of upstream behaviour ADR 0008's recurring CI gate exists to surface.",
+        ]
+    )
     return "\n".join(out)
 
 
@@ -710,16 +705,10 @@ def _backend_health(results: dict[str, dict[str, Any]]) -> dict[str, dict[str, i
     """Per-backend op tally: ran-successfully, hard-failed, no-snapshot."""
     health: dict[str, dict[str, int]] = {}
     for backend, result in results.items():
-        ok = sum(
-            1
-            for o in result["operations"]
-            if o.get("supported", True) and o.get("produced_snapshot", True)
-        )
+        ok = sum(1 for o in result["operations"] if o.get("supported", True) and o.get("produced_snapshot", True))
         failed = sum(1 for o in result["operations"] if not o.get("supported", True))
         no_snap = sum(
-            1
-            for o in result["operations"]
-            if o.get("supported", True) and not o.get("produced_snapshot", True)
+            1 for o in result["operations"] if o.get("supported", True) and not o.get("produced_snapshot", True)
         )
         health[backend] = {"ok": ok, "failed": failed, "no_snapshot": no_snap}
     return health
@@ -751,11 +740,13 @@ def _render_reference_markdown(results: dict[str, dict[str, Any]]) -> str:
         f"`platform={', '.join(platforms)}`."
     )
     out.append("")
-    out.append("Each row is one operation kind from the upstream probe script. The "
-               "`changes_made` column shows the per-spec text key as it appears "
-               "in `__ducklake_metadata_<lake>.ducklake_snapshot_changes`. The "
-               "MAP-key columns show the keys observed in `<lake>.snapshots().changes` "
-               "for the same snapshot, per backend.")
+    out.append(
+        "Each row is one operation kind from the upstream probe script. The "
+        "`changes_made` column shows the per-spec text key as it appears "
+        "in `__ducklake_metadata_<lake>.ducklake_snapshot_changes`. The "
+        "MAP-key columns show the keys observed in `<lake>.snapshots().changes` "
+        "for the same snapshot, per backend."
+    )
     out.append("")
 
     header_cells = ["Kind", "Example `changes_made`"]
@@ -783,9 +774,7 @@ def _render_reference_markdown(results: dict[str, dict[str, Any]]) -> str:
             else:
                 keys = sorted(op.get("changes_map", {}).keys())
                 keys_cells.append(", ".join(f"`{k}`" for k in keys) if keys else "_(empty MAP)_")
-        out.append(
-            "| `" + kind + "` | " + cm_cell + " | " + " | ".join(keys_cells) + " |"
-        )
+        out.append("| `" + kind + "` | " + cm_cell + " | " + " | ".join(keys_cells) + " |")
 
     out.append("")
     out.append("### Per-backend health")
@@ -797,9 +786,11 @@ def _render_reference_markdown(results: dict[str, dict[str, Any]]) -> str:
         h = health[b]
         out.append(f"| `{b}` | {h['ok']} | {h['failed']} | {h['no_snapshot']} |")
     out.append("")
-    out.append("Hard failures indicate a DuckLake-on-backend bug; the "
-               "operation does not produce a snapshot and the backend is "
-               "excluded from divergence comparison for that operation.")
+    out.append(
+        "Hard failures indicate a DuckLake-on-backend bug; the "
+        "operation does not produce a snapshot and the backend is "
+        "excluded from divergence comparison for that operation."
+    )
     out.append("")
     out.append("### Backend divergence (only backends that ran the op)")
     out.append("")
@@ -821,10 +812,12 @@ def _render_reference_markdown(results: dict[str, dict[str, Any]]) -> str:
                 "every backend can perform."
             )
     else:
-        out.append("The following operation kinds emit different MAP keys "
-                   "across backends that all ran the op successfully. "
-                   "Stage-1 discovery code MUST handle the union (per "
-                   "ADR 0008's hard-fail-on-divergence CI gate):")
+        out.append(
+            "The following operation kinds emit different MAP keys "
+            "across backends that all ran the op successfully. "
+            "Stage-1 discovery code MUST handle the union (per "
+            "ADR 0008's hard-fail-on-divergence CI gate):"
+        )
         out.append("")
         for kind, per_backend in diffs.items():
             out.append(f"- `{kind}`:")
@@ -874,9 +867,7 @@ def _update_docs_api_md(reference_md: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _run_one_backend_in_subprocess(
-    name: str, workdir: Path, out_dir: Path, captured_at: str
-) -> dict[str, Any] | None:
+def _run_one_backend_in_subprocess(name: str, workdir: Path, out_dir: Path, captured_at: str) -> dict[str, Any] | None:
     """Spawn this script under the active `uv run` Python for one backend
     so each backend gets a fresh Python process with no stale extension
     state. Returns the parsed JSON or None on failure.
@@ -932,7 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=sorted(BACKENDS.keys()),
         default=["duckdb", "sqlite"],
         help="Which catalog backends to run against. Postgres requires "
-             "`docker compose up -d` from this directory first.",
+        "`docker compose up -d` from this directory first.",
     )
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument(
@@ -982,18 +973,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.keep_workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
 
-    reference_projections = (
-        _load_reference_projections(args.backends) if args.check else {}
-    )
+    reference_projections = _load_reference_projections(args.backends) if args.check else {}
     captured_at = _utc_now_isoformat()
     results: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
-    print(f"running {len(args.backends)} backend(s) in isolated subprocesses "
-          f"(captured_at={captured_at})", flush=True)
+    print(
+        f"running {len(args.backends)} backend(s) in isolated subprocesses " f"(captured_at={captured_at})", flush=True
+    )
     for name in args.backends:
-        result = _run_one_backend_in_subprocess(
-            name, Path("."), out_dir, captured_at
-        )
+        result = _run_one_backend_in_subprocess(name, Path("."), out_dir, captured_at)
         if result is None:
             failures.append(name)
         else:
@@ -1032,8 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
     diffs = _diff_key_sets(results)
     if diffs:
         print(
-            f"backend MAP-key divergence in {len(diffs)} op kinds: "
-            + ", ".join(sorted(diffs.keys())),
+            f"backend MAP-key divergence in {len(diffs)} op kinds: " + ", ".join(sorted(diffs.keys())),
             flush=True,
         )
         return 2
