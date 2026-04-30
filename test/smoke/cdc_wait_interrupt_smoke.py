@@ -41,17 +41,8 @@ REPO = Path(__file__).resolve().parents[2]
 BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
 DUCKDB_INCLUDE = REPO / "duckdb" / "src" / "include"
 LIBDUCKDB_DIR = REPO / "build" / BUILD / "src"
-LIBDUCKDB = LIBDUCKDB_DIR / (
-    "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
-)
-CDC_EXTENSION = (
-    REPO
-    / "build"
-    / BUILD
-    / "extension"
-    / "ducklake_cdc"
-    / "ducklake_cdc.duckdb_extension"
-)
+LIBDUCKDB = LIBDUCKDB_DIR / ("libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so")
+CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
 
 
 def _platform_dir() -> str:
@@ -60,11 +51,7 @@ def _platform_dir() -> str:
     Makefile."""
     os_name = "osx" if sys.platform == "darwin" else "linux"
     machine = os.uname().machine
-    arch = (
-        "amd64"
-        if machine == "x86_64"
-        else ("arm64" if machine == "aarch64" else machine)
-    )
+    arch = "amd64" if machine == "x86_64" else ("arm64" if machine == "aarch64" else machine)
     return f"{os_name}_{arch}"
 
 
