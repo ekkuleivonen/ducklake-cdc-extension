@@ -331,7 +331,10 @@ jobs:
           # run on that branch. The full extension matrix is a separate
           # release-time gate (the `full-matrix-build` job in this
           # workflow) since it only matters when we ship.
-          status=$(gh api "repos/${{ github.repository }}/commits/$SHA/check-runs" \
+          # NOTE: filter API-side via ?check_name= because a release SHA
+          # can easily exceed the default 30-result page (full matrix +
+          # release jobs all attach checks to the tagged commit).
+          status=$(gh api "repos/${{ github.repository }}/commits/$SHA/check-runs?check_name=CI+Pass&per_page=100" \
             --jq '[.check_runs[] | select(.name == "CI Pass")] | .[0].conclusion // "missing"')
           echo "ci-pass status at $SHA: $status"
           if [[ "$status" != "success" ]]; then
