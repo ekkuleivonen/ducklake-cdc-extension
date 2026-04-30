@@ -26,10 +26,10 @@ our community:
   mistakes, and learning from the experience.
 - Focusing on what is best not just for us as individuals but for
   the overall community.
-- Engaging on the technical merits. ADRs, code, and benchmark
+- Engaging on the technical merits. Code, design notes, and benchmark
   numbers are the substrate of disagreement here; "I disagree with
-  the trade-off in ADR 0007 because [...]" is welcome,
-  "[contributor] is wrong" without context is not.
+  this lease trade-off because [...]" is welcome, "[contributor] is wrong"
+  without context is not.
 
 Examples of unacceptable behaviour:
 

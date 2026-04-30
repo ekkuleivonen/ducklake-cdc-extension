@@ -1,12 +1,12 @@
 # Catalog Matrix Smoke Tests
 
-Phase 2 starts by proving that the Phase 1 extension semantics hold across
+The catalog matrix smoke proves that the main extension semantics hold across
 DuckLake's supported catalog backends: embedded DuckDB, SQLite, and Postgres.
 
 This smoke harness is deliberately narrower than the full SQLLogic suite. It
 checks the README-style DDL + DML consumer flow, schema-boundary behavior, and
-owner-token lease rejection on each backend. The full Phase 1 test suite still
-needs a backend-matrix runner before Phase 2 can close.
+owner-token lease rejection on each backend. It is intentionally not a full
+backend certification suite.
 
 Build the debug extension first:
 

@@ -118,16 +118,13 @@ The branch flow is:
 feature_* -> main -> manual release
 ```
 
-- Work on a short-lived `feature_*` branch created from `main`.
-- `feature_*` branches run light CI for fast feedback.
+- Work on a short-lived branch created from `main`.
+- Feature branches run day-to-day CI for fast feedback.
 - Open the PR into `main`.
-- `main` is protected and requires full CI before merge.
-- Releases are manual actions from `main`.
+- `main` is protected and requires the required CI gate before merge.
+- Releases are manual actions from `main` or the relevant maintenance branch.
 - `release/0.x` branches are created only when an already-published line needs
   patch maintenance after `main` has moved on.
-
-See [`docs/decisions/0012-branching-ci-release.md`](./decisions/0012-branching-ci-release.md)
-for the full policy and the DuckDB Community Extensions publishing notes.
 
 ## Where to start
 

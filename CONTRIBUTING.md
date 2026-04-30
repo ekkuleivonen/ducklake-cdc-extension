@@ -1,8 +1,8 @@
 # Contributing
 
-This project is pre-alpha. The local build and test loop is in
-[`docs/development.md`](./docs/development.md); this file covers contribution
-policy and review expectations.
+This project is an early community extension. The local build and test loop is
+in [`docs/development.md`](./docs/development.md); this file covers
+contribution policy and review expectations.
 
 ## License
 
@@ -10,13 +10,11 @@ Contributions are accepted under the project's
 [Apache-2.0 license](./LICENSE) via the standard
 ["inbound = outbound"](https://www.apache.org/licenses/contributor-agreements.html)
 GitHub norm: opening a PR represents that the contribution is
-licensed under the project's license. There is no separate CLA. See
-[ADR 0003](./docs/decisions/0003-license.md) for the full rationale.
+licensed under the project's license. There is no separate CLA.
 
 ## Branching and CI
 
-The project uses the branch and release flow locked in
-[ADR 0012](./docs/decisions/0012-branching-ci-release.md):
+The project uses a simple branch and release flow:
 
 ```text
 feature_* -> main -> manual release
@@ -24,28 +22,26 @@ feature_* -> main -> manual release
 
 - Create feature branches from `main`.
 - Open feature PRs from `feature_*` branches into `main`.
-- Feature branches run light CI for fast feedback.
-- `main` is protected and must pass full CI before merge.
-- Release tags are created manually from `main`.
+- Feature branches run day-to-day CI for fast feedback.
+- `main` is protected and must pass the required CI gate before merge.
+- Release tags are created manually from `main` or the relevant maintenance
+  branch.
 - `release/0.x` branches are maintenance branches for already-published lines,
   not pre-release staging branches.
 
-The CI levels are intentionally simple: feature branches get fast feedback,
-and merge attempts into `main` pay for the full DuckDB extension matrix. If an
-older released line needs a patch after `main` has moved on, the patch lands on
-the relevant `release/0.x` branch and is then merged or cherry-picked back to
+The CI levels are intentionally simple: day-to-day CI stays cheap, while the
+full DuckDB extension distribution matrix runs as a release gate. If an older
+released line needs a patch after `main` has moved on, the patch lands on the
+relevant `release/0.x` branch and is then merged or cherry-picked back to
 `main`.
 
 ## C++ code style
 
 The extension is implemented in C++17 against the
 [`duckdb/extension-template`](https://github.com/duckdb/extension-template)
-scaffold. The language and toolchain decisions are locked in
-[ADR 0001](./docs/decisions/0001-extension-language.md); the items
-below are coding-standard conventions that apply at PR review time.
-Disagreement with a convention is appropriately resolved in PR
-discussion (or a CONTRIBUTING.md PR), not via an ADR amendment —
-ADRs lock decisions, not style.
+scaffold. The items below are coding-standard conventions that apply at PR
+review time. Disagreement with a convention is appropriately resolved in PR
+discussion or a CONTRIBUTING.md PR.
 
 ### Memory and lifetime
 
@@ -78,11 +74,8 @@ ADRs lock decisions, not style.
 
 ### Linting and sanitisers
 
-- ASan + UBSan run on Linux x86 in CI on every push; TSan runs on a
-  separate matrix entry that exercises the lease test suite from
-  [ADR 0007](./docs/decisions/0007-concurrency-model.md). The lease
-  contention scenarios are where TSan finds bugs that the unit tests
-  cannot.
+- ASan + UBSan run as release-time smoke coverage. The lease contention
+  scenarios are where deeper sanitizer work is most likely to pay off.
 - New code that introduces a sanitiser-clean carve-out (a
   `__attribute__((no_sanitize(...)))` block, a TSan exclusion) must
   document the reason inline and reference the issue or design note
@@ -97,6 +90,6 @@ extension_name = 'ducklake_cdc'`), the DuckDB version, the catalog
 backend (DuckDB / SQLite / Postgres), and a minimal reproducer when
 applicable.
 
-For documentation issues, the relevant ADR's "Open questions
-deferred" section is often where to look first — many of the
-"why does it work this way?" questions are already answered there.
+For documentation issues, start with [`docs/design.md`](./docs/design.md),
+[`docs/roadmap.md`](./docs/roadmap.md), and
+[`docs/hazard-log.md`](./docs/hazard-log.md).

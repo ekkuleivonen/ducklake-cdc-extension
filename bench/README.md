@@ -1,6 +1,6 @@
 # Benchmarks
 
-Phase 1 ships a fast smoke benchmark, not a soak test. The goal is to
+This is a fast smoke benchmark, not a soak test. The goal is to
 prove the extension path is measurable without making every PR wait for
 the benchmark path. The manual benchmark workflow downloads a
 Full-CI-built extension artifact and runs it against the supported

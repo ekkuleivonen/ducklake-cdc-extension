@@ -3,12 +3,12 @@
 A DuckDB extension that adds a row-level change-data-capture cursor on top
 of [DuckLake](https://ducklake.select).
 
-> **Status: pre-alpha, Phase 1 in progress.** The SQL surface described
-> below works against an embedded DuckDB-backed DuckLake catalog. There is
-> no published binary, no language client, no reference sink, and the
-> Postgres / SQLite catalog backends have not yet been validated. See
-> [`docs/roadmap/`](./docs/roadmap/) for the full plan and
-> [`VISION.md`](./VISION.md) for what this project intends to become.
+> **Status: early community release (`v0.2.0`).** The SQL extension is
+> published through DuckDB community extensions, and the core cursor / DDL /
+> DML surface is usable today. Catalog coverage is smoke-tested across DuckDB,
+> SQLite, and PostgreSQL, but this is still an early project: there are no
+> language clients or reference sinks yet. See [`docs/roadmap.md`](./docs/roadmap.md)
+> for direction and [`docs/hazard-log.md`](./docs/hazard-log.md) for known risks.
 
 ## What works today
 
@@ -25,30 +25,28 @@ of [DuckLake](https://ducklake.select).
   `CDC_SCHEMA_BOUNDARY`, `CDC_WAIT_TIMEOUT_CLAMPED`,
   `CDC_WAIT_SHARED_CONNECTION` — full list in
   [`docs/errors.md`](./docs/errors.md).
-- Embedded DuckDB catalog backend, validated against DuckDB **v1.5.1**
-  and a pinned DuckLake commit (see [`docs/development.md`](./docs/development.md)).
+- Community-extension install: `INSTALL ducklake_cdc FROM community`.
+- DuckDB, SQLite, and PostgreSQL DuckLake catalog smoke coverage in CI.
+- Validated against DuckDB **v1.5.1** and the runtime-installed DuckLake
+  extension (see [`docs/development.md`](./docs/development.md)).
 - A bench smoke harness (`bench/runner.py` + `bench/light.yaml`) that
   reports end-to-end latency, throughput, catalog QPS, and lag drift.
 
 ## What does *not* work yet
 
-- **No published extension binary.** `INSTALL ducklake_cdc FROM community`
-  does not resolve. You must build from source. Community-extensions
-  publishing is part of Phase 5.
-- **No Python or Go client.** The `import ducklake_cdc` snippet you may
-  have seen in older drafts is roadmap material (Phases 3 and 4).
+- **No Python client yet.** The `import ducklake_cdc` snippet you may
+  have seen in older drafts is roadmap material.
 - **No reference sinks.** Stdout, file, webhook, Kafka, Redis Streams,
-  and Postgres-mirror sinks are roadmap material (Phases 3–5).
-- **Only the embedded DuckDB catalog has been exercised.** SQLite and
-  PostgreSQL catalog backends are part of the Phase 2 matrix; their
-  behaviour is currently unproven.
+  and Postgres-mirror sinks are not shipped.
+- **Backend coverage is smoke-level.** DuckDB, SQLite, and PostgreSQL
+  catalog paths are exercised in CI, but not exhaustively certified.
 - **No DLQ semantics.** The `__ducklake_cdc_dlq` table is created at
   bootstrap with the locked schema, but write/read/replay/acknowledge
-  helpers and the DDL-blocks-DML policy land in Phase 2.
-- **No `doctor` command.** Planned for Phase 2.
-- **No release tags.** Release automation exists
-  ([`.github/workflows/release.yml`](./.github/workflows/release.yml))
-  but no `v0.0.x` tags have been cut yet.
+  helpers and the DDL-blocks-DML policy are not shipped.
+- **No `doctor` command.** Operational diagnostics are still manual SQL
+  via `cdc_consumer_stats` and `cdc_audit_recent`.
+- **Performance numbers are early signal.** The light benchmark harness
+  exists, but published numbers are not production contracts.
 
 ## Build and run
 
@@ -66,19 +64,19 @@ build commit, otherwise the short SHA — so an unstable build reports
 something like `ducklake_cdc 7a3b9c1`. Full build / test / sanitiser
 guidance lives in [`docs/development.md`](./docs/development.md).
 
-## Quickstart (against your local debug build)
+## Quickstart
 
 ![Producer SQL mutating a DuckLake table](./docs/demo/phase1/producer.png)
 ![Consumer SQL reading DuckLake CDC events](./docs/demo/phase1/consumer.png)
 
 ```sql
--- Preconditions: DuckDB v1.5.1, the official `ducklake` and `parquet`
--- extensions (`INSTALL`'d at runtime), and a local build of
--- `ducklake_cdc.duckdb_extension` (no community-extension publish yet).
+-- Preconditions: DuckDB v1.5.1 and the official `ducklake`, `parquet`,
+-- and `ducklake_cdc` extensions.
 INSTALL ducklake;
+INSTALL ducklake_cdc FROM community;
 LOAD ducklake;
 LOAD parquet;
-LOAD 'build/debug/extension/ducklake_cdc/ducklake_cdc.duckdb_extension';
+LOAD ducklake_cdc;
 ATTACH 'ducklake:my.ducklake' AS lake (DATA_PATH 'my_data');
 
 CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
@@ -126,10 +124,8 @@ gap / lease columns) and `cdc_audit_recent('lake')` (lifecycle audit
 trail).
 
 The full primitive + sugar surface, with row shapes and behaviour notes
-per function, is in [`docs/api.md`](./docs/api.md). Operational guidance
-for the lease lifecycle and the `cdc_wait` connection-starvation foot
-gun is in [`docs/operational/lease.md`](./docs/operational/lease.md) and
-[`docs/operational/wait.md`](./docs/operational/wait.md).
+per function, is in [`docs/api.md`](./docs/api.md). Known risks and sharp
+edges are tracked in [`docs/hazard-log.md`](./docs/hazard-log.md).
 
 ## Examples
 
@@ -151,26 +147,22 @@ self-contained script you can pipe into `./build/debug/duckdb`:
 ## Backends
 
 DuckLake supports DuckDB, SQLite and PostgreSQL as metadata catalogs.
-Today this extension has only been validated against the **embedded
-DuckDB** catalog. SQLite and PostgreSQL coverage is the work item of
-Phase 2 — see [`docs/roadmap/phase_2_backend_agnostic.md`](./docs/roadmap/phase_2_backend_agnostic.md).
-Until that phase ships, treat the SQLite / Postgres paths as untested.
+This extension has smoke coverage for all three catalog backends in CI.
+Treat SQLite and PostgreSQL support as usable but young: the catalog matrix
+currently proves the main cursor loop, schema-boundary path, and lease
+rejection flow, not every SQLLogic edge case.
 
 ## Versioning and releases
 
-Versioning policy and the one-button release workflow are documented in
-[`docs/decisions/0013-versioning-and-release-automation.md`](./docs/decisions/0013-versioning-and-release-automation.md).
-Day-to-day branch flow is in
-[`docs/decisions/0012-branching-ci-release.md`](./docs/decisions/0012-branching-ci-release.md).
+The release flow is described in [`docs/design.md`](./docs/design.md).
 
-No `v0.0.x` tag has been cut yet. The first one lands as part of closing
-out Phase 1.
+Current community release line: `v0.2.0`.
 
 ## Where to go next
 
 - **What this project intends to become** — [`VISION.md`](./VISION.md).
-- **Roadmap and exit criteria per phase** — [`docs/roadmap/`](./docs/roadmap/).
-- **Architecture decisions** — [`docs/decisions/`](./docs/decisions/).
+- **Roadmap** — [`docs/roadmap.md`](./docs/roadmap.md).
+- **Design notes** — [`docs/design.md`](./docs/design.md).
 - **Public API reference** — [`docs/api.md`](./docs/api.md).
 - **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md) and
   [`docs/development.md`](./docs/development.md).

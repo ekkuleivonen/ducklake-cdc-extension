@@ -1,0 +1,99 @@
+# Design Notes
+
+These are the project decisions worth keeping close at hand. The old decision
+log was useful while the extension shape was still unsettled, but it became too
+heavy for a small weekend-maintained project.
+
+## What This Extension Is
+
+`ducklake-cdc` is a small DuckDB extension that adds a durable CDC cursor on
+top of DuckLake. It does not try to replace DuckLake's own snapshot, time
+travel, or table-change APIs.
+
+The extension exists to make the same SQL surface work from the DuckDB CLI and
+from future clients without each client reimplementing cursor state, leasing,
+schema-boundary logic, and typed DDL extraction.
+
+## Use DuckLake Directly
+
+Anything DuckLake already exposes should stay DuckLake's job:
+
+- `snapshots()` tells us what changed.
+- `table_changes()` reads row-level changes.
+- Time travel reads historical state.
+- Commit metadata carries producer-side context.
+- DuckLake maintenance handles compaction, file rewrites, and cleanup.
+
+The extension adds only the parts needed for consumer workflows: cursor state,
+gap detection, long-polling, typed DDL events, schema-boundary handling, lease
+enforcement, and basic observability.
+
+## Cursor State
+
+Consumer state lives in regular DuckLake catalog tables:
+
+- `__ducklake_cdc_consumers`
+- `__ducklake_cdc_audit`
+- `__ducklake_cdc_dlq`
+
+This keeps state close to the catalog snapshots it tracks. There is no external
+state store and no side database to keep in sync.
+
+## Read and Commit Stay Separate
+
+`cdc_window` opens a bounded read window. `cdc_commit` advances the cursor.
+
+Those are intentionally separate calls. A consumer should only commit after its
+downstream write has succeeded. This is the core at-least-once contract.
+
+The sugar functions (`cdc_changes`, `cdc_events`, `cdc_ddl`) do not
+auto-commit.
+
+## One Consumer, One Logical Reader
+
+One consumer name means one logical reader. The extension enforces this with an
+owner-token lease stored on the consumer row.
+
+The holder can call `cdc_window` repeatedly and get the same window until it
+commits. Another connection trying to read the same consumer gets `CDC_BUSY`.
+
+Parallel reads are still possible inside one window: an orchestrator can hold
+the consumer lease, fan out ordinary `table_changes` reads, then commit once.
+
+## Schema Changes Are Boundaries
+
+By default, `cdc_window` avoids crossing schema-version boundaries. The window
+result tells the caller whether schema changes are pending.
+
+This keeps consumers from applying rows under a downstream schema that has not
+been updated yet. Consumers that can tolerate cross-schema windows can opt out
+with `stop_at_schema_change := false`.
+
+## DDL Is First-Class
+
+DDL changes are part of the stream. `cdc_ddl` surfaces typed schema events, and
+consumers should apply DDL before DML for the same snapshot.
+
+`cdc_schema_diff` reuses the same extraction logic for ad-hoc inspection.
+
+## Values Stay Native in SQL
+
+The extension exposes DuckLake values as DuckDB values. Serialization choices
+such as JSON, GeoJSON, base64, Avro, or sink-specific formats belong in clients
+or sinks, not in the extension.
+
+## Release Flow
+
+Releases are manual and pragmatic:
+
+- day-to-day CI stays relatively small;
+- release CI builds the full DuckDB extension matrix;
+- community extension publishing is the main distribution path.
+
+The project should prefer clear docs, focused tests, and honest limitations
+over process-heavy release gates.
+
+## What Is Deferred
+
+The next serious client target is Python. Go and other bindings are deferred
+until there is clear outside demand or another maintainer wants to own them.

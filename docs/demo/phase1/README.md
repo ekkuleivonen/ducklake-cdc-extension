@@ -1,6 +1,10 @@
-# Phase 1 Screenshot Pair
+# SQL Screenshot Pair
 
-Phase 1 proves the SQL CDC surface is real and composable: discover that a table was created, then read row-level changes for that table. Use a two-screenshot pair here, not a GIF: the README needs a compact visual proof, and SQL output is more useful when readers can inspect DDL, row events, and snapshot ids at their own pace.
+The screenshot pair proves the SQL CDC surface is real and composable: discover
+that a table was created, then read row-level changes for that table. Use a
+two-screenshot pair here, not a GIF: the README needs a compact visual proof,
+and SQL output is more useful when readers can inspect DDL, row events, and
+snapshot ids at their own pace.
 
 ## Capture Setup
 
@@ -29,7 +33,8 @@ Prefer two separate screenshots over one crowded two-pane screenshot. In the REA
 
 ## Deferred Video
 
-The moving demo belongs to the client phase. Record it once Python or Go can run:
+The moving demo belongs with the Python client. Record it once a small client
+can run:
 
 ```shell
 ducklake-cdc tail --catalog ducklake:demo.ducklake --table orders --consumer demo --sink stdout --format jsonl --follow
