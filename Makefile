@@ -4,6 +4,16 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=ducklake_cdc
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# DuckLake is loaded at runtime from the official extensions.duckdb.org
+# repository instead of compiled from source. The unittest binary needs the
+# autoinstall/autoload code paths compiled in so that explicit INSTALL/LOAD
+# statements work; SQL tests that need DuckLake do `INSTALL ducklake;
+# LOAD ducklake;` explicitly rather than `require ducklake`, because the
+# `require <ext>` directive in sqllogictest only checks for statically-loaded
+# extensions and we don't statically link DuckLake.
+ENABLE_EXTENSION_AUTOLOADING=1
+ENABLE_EXTENSION_AUTOINSTALL=1
+
 SQL_TEST_SMOKE=test/sql/ducklake_cdc.test, test/sql/compat_check.test
 SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test
 

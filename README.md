@@ -12,9 +12,11 @@ Postgres has logical replication. Iceberg has table-changes. [DuckLake](https://
 Create, insert, update, delete on the left. Discover the table and read the row-level change stream on the right.
 
 ```sql
--- Preconditions: DuckDB 1.5.1, the bundled `ducklake` and `parquet`
--- extensions, and a local build of `ducklake_cdc.duckdb_extension`
--- until the community-extension publish lands in Phase 5.
+-- Preconditions: DuckDB 1.5.1, the official `ducklake` and `parquet`
+-- extensions (`INSTALL`'d at runtime), and a local build of
+-- `ducklake_cdc.duckdb_extension` until the community-extension publish
+-- lands in Phase 5.
+INSTALL ducklake;
 LOAD ducklake;
 LOAD parquet;
 LOAD ducklake_cdc;

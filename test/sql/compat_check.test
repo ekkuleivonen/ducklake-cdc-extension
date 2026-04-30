@@ -21,7 +21,15 @@ true
 # validated DuckDB v1.5.1 DuckLake tuple. cdc_version() must still work.
 require icu
 
-require ducklake
+# Pull DuckLake from the official extension repository at runtime instead
+# of compiling it from source. `require ducklake` cannot be used here
+# because sqllogictest's `require <ext>` only checks for statically-loaded
+# extensions, and we deliberately don't bundle DuckLake into our build.
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
 
 statement ok
 ATTACH 'ducklake:__TEST_DIR__/compat.ducklake' AS lake (DATA_PATH '__TEST_DIR__/compat_data');

@@ -38,11 +38,13 @@ runtime currently marked supported by this branch.
 
 The validated target tuple is:
 
-- DuckDB submodule: `v1.5.1`
+- DuckDB submodule: `v1.5.1` (canonical source: `.github/duckdb-version`)
 - `extension-ci-tools`: `v1.5.1`
-- DuckLake test dependency:
-  `67480b1d5c76f29276b4195bdd1175e2fe066236`, matching
-  `duckdb/.github/config/extensions/ducklake.cmake` in DuckDB `v1.5.1`
+- DuckLake: pulled at runtime via `INSTALL ducklake` against the official
+  `extensions.duckdb.org` repository for the same DuckDB target. We do not
+  pin a DuckLake source commit because we do not compile DuckLake; the
+  upstream binary published for our DuckDB version is the one we test
+  against.
 - DuckLake catalog format observed and guarded below: `0.4`
 
 Older DuckDB versions must be validated as their own tuple before they appear

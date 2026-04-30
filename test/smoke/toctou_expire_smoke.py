@@ -21,11 +21,16 @@ Usage:
 
     uv run python test/smoke/toctou_expire_smoke.py
 
-Run `make debug` first.
+Defaults to the release build because the harness loads the official prebuilt
+DuckLake extension binary (no ASAN runtime), which conflicts with our debug
+build's ASAN. Build it via `make release` first, or override with
+`DUCKLAKE_CDC_BUILD=debug` if you have built debug without sanitizers
+(`DISABLE_SANITIZER=1 make debug`).
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -34,11 +39,11 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[2]
+BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
 DUCKDB_INCLUDE = REPO / "duckdb" / "src" / "include"
-LIBDUCKDB_DIR = REPO / "build" / "debug" / "src"
+LIBDUCKDB_DIR = REPO / "build" / BUILD / "src"
 LIBDUCKDB = LIBDUCKDB_DIR / ("libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so")
-DUCKLAKE_EXTENSION = REPO / "build" / "debug" / "extension" / "ducklake" / "ducklake.duckdb_extension"
-CDC_EXTENSION = REPO / "build" / "debug" / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
+CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
 
 
 HARNESS = r'''
@@ -85,23 +90,25 @@ std::string QuotePath(const std::string &path) {
 }
 
 int main(int argc, char **argv) {
-	if (argc != 5) {
-		std::cerr << "usage: harness <ducklake-extension> <cdc-extension> <lake-path> <data-path>\n";
+	if (argc != 4) {
+		std::cerr << "usage: harness <cdc-extension> <lake-path> <data-path>\n";
 		return 2;
 	}
-	const std::string ducklake_extension = argv[1];
-	const std::string cdc_extension = argv[2];
-	const std::string lake_path = argv[3];
-	const std::string data_path = argv[4];
+	const std::string cdc_extension = argv[1];
+	const std::string lake_path = argv[2];
+	const std::string data_path = argv[3];
 
 	DBConfig config;
 	config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+	config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(true));
+	config.SetOptionByName("autoload_known_extensions", Value::BOOLEAN(true));
 	DuckDB db(nullptr, &config);
 	Connection a(db);
 	Connection b(db);
 
+	RequireOk(a, "INSTALL ducklake");
 	for (auto *conn : {&a, &b}) {
-		RequireOk(*conn, "LOAD " + QuotePath(ducklake_extension));
+		RequireOk(*conn, "LOAD ducklake");
 		RequireOk(*conn, "LOAD parquet");
 		RequireOk(*conn, "LOAD " + QuotePath(cdc_extension));
 	}
@@ -172,10 +179,10 @@ int main(int argc, char **argv) {
 
 def main() -> int:
     if not LIBDUCKDB.exists():
-        print(f"missing {LIBDUCKDB}; run `make debug` first", file=sys.stderr)
+        print(f"missing {LIBDUCKDB}; run `make {BUILD}` first", file=sys.stderr)
         return 1
-    if not DUCKLAKE_EXTENSION.exists() or not CDC_EXTENSION.exists():
-        print("missing debug extension artifacts; run `make debug` first", file=sys.stderr)
+    if not CDC_EXTENSION.exists():
+        print(f"missing ducklake_cdc {BUILD} artifact; run `make {BUILD}` first", file=sys.stderr)
         return 1
 
     with tempfile.TemporaryDirectory(prefix="ducklake_cdc_toctou_") as tmp:
@@ -204,7 +211,7 @@ def main() -> int:
         ]
         subprocess.run(compile_cmd, cwd=REPO, check=True)
         completed = subprocess.run(
-            [str(binary), str(DUCKLAKE_EXTENSION), str(CDC_EXTENSION), str(lake), str(data)],
+            [str(binary), str(CDC_EXTENSION), str(lake), str(data)],
             cwd=REPO,
             text=True,
             stdout=subprocess.PIPE,

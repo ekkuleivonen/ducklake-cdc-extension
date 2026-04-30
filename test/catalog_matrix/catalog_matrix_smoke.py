@@ -33,7 +33,8 @@ from typing import Any
 import duckdb
 
 REPO = Path(__file__).resolve().parents[2]
-DEFAULT_CDC_EXTENSION = REPO / "build" / "debug" / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
+BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
+DEFAULT_CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
 DEFAULT_BACKENDS = ("duckdb", "sqlite")
 ALL_BACKENDS = ("duckdb", "sqlite", "postgres")
 DEFAULT_PG_DSN = "host=127.0.0.1 port=5434 user=ducklake password=ducklake dbname=ducklake"

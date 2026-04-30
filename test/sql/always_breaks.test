@@ -9,9 +9,17 @@ require ducklake_cdc
 
 require icu
 
-require ducklake
-
 require parquet
+
+# DuckLake is loaded at runtime from the official extension repository
+# instead of being compiled from source. `require ducklake` cannot be used
+# because sqllogictest's `require <ext>` only checks for statically-loaded
+# extensions, which DuckLake is not in this build.
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
 
 # -----------------------------------------------------------------------------
 # Inlined-data path. DuckLake's DATA_INLINING_ROW_LIMIT controls when small
