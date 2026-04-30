@@ -416,3 +416,83 @@ ORDER BY change_kind;
 ----
 added	3
 table_rename	1
+
+# -----------------------------------------------------------------------------
+# Phase 2 deferral 1: Stage-1 source switched from the comma-separated text
+# form (`__ducklake_metadata_<lake>.ducklake_snapshot_changes.changes_made`)
+# to the typed MAP form (`<lake>.snapshots().changes`). cdc_ddl,
+# cdc_recent_ddl, and cdc_schema_diff all consume the new source; the text
+# form stays alive for cdc_events (its surface still emits `changes_made`
+# verbatim) and for ChangesTouchConsumerTables (consumer-filter eval).
+#
+# The upstream probe in test/upstream/output/ confirms all three DuckLake
+# backends (DuckDB, SQLite, Postgres) emit identical MAP key sets for
+# every DDL kind, so the MAP-driven dispatcher is backend-agnostic by
+# construction. Per ADR 0008.
+#
+# This block exercises every Stage-1-relevant MAP key in one lake so a
+# regression in the MAP unnest path or the per-key dispatcher would
+# fail loudly here. The existing suite (ddl_stage2.test from line 30
+# onwards, sugar.test, recent_sugar.test, ddl_order block above) is
+# the broader regression coverage — it asserts byte-exact JSON
+# payloads for every DDL kind under both Stage-1 sources.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_map.ducklake' AS lake_m (DATA_PATH '__TEST_DIR__/ddl_map_data');
+
+statement ok
+CREATE SCHEMA lake_m.warehouse;
+
+statement ok
+CREATE TABLE lake_m.warehouse.events(id INTEGER, kind VARCHAR);
+
+statement ok
+ALTER TABLE lake_m.warehouse.events ADD COLUMN amount BIGINT;
+
+statement ok
+CREATE VIEW lake_m.warehouse.recent AS SELECT * FROM lake_m.warehouse.events;
+
+statement ok
+DROP VIEW lake_m.warehouse.recent;
+
+statement ok
+DROP TABLE lake_m.warehouse.events;
+
+statement ok
+DROP SCHEMA lake_m.warehouse;
+
+# All seven Stage-1 MAP keys exercised above (schemas_created x2 [main +
+# warehouse], tables_created, tables_altered, views_created, views_dropped,
+# tables_dropped, schemas_dropped) must surface as the seven typed cdc_ddl
+# events. We assert the (event_kind, object_kind) tuples in snapshot order;
+# the implicit `main` schema created at lake init is suppressed via
+# event_kind+object_kind+object_name filter.
+query III
+SELECT event_kind, object_kind, object_name FROM cdc_recent_ddl('lake_m')
+WHERE NOT (event_kind = 'created' AND object_kind = 'schema' AND object_name = 'main')
+ORDER BY snapshot_id, object_kind, event_kind;
+----
+created	schema	warehouse
+created	table	events
+altered	table	events
+created	view	recent
+dropped	view	recent
+dropped	table	events
+dropped	schema	warehouse
+
+# Direct probe of the Stage-1 source: the MAP form returns one (key, list)
+# row per DDL kind per snapshot. All keys observed across the test must
+# come from the documented Stage-1 set. Phase 0 upstream probe + ADR 0008.
+query I
+SELECT DISTINCT e.key
+FROM lake_m.snapshots() s, UNNEST(map_entries(s.changes)) AS u(e)
+ORDER BY e.key;
+----
+schemas_created
+schemas_dropped
+tables_altered
+tables_created
+tables_dropped
+views_created
+views_dropped

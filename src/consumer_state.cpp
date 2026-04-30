@@ -2363,10 +2363,9 @@ std::string BuildCreatedTableDetails(duckdb::Connection &conn, const std::string
 //! skip them and let downstream serialise the empty diff group.
 bool TableSchemaVersionBumpedAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                                 int64_t snapshot_id) {
-	auto result =
-	    conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_schema_versions") +
-	               " WHERE table_id = " + std::to_string(table_id) +
-	               " AND begin_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
+	auto result = conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_schema_versions") +
+	                         " WHERE table_id = " + std::to_string(table_id) +
+	                         " AND begin_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
 	if (!result || result->HasError()) {
 		// On error, fall back to "assume bump" so the caller still runs
 		// the full diff path. Better to do redundant work than to drop a
@@ -2420,6 +2419,123 @@ std::string BuildCreatedViewDetails(duckdb::Connection &conn, const std::string 
 	out << "{\"definition\":\"" << JsonEscape(info.sql) << "\",\"dialect\":\"" << JsonEscape(info.dialect)
 	    << "\",\"column_aliases\":" << JsonOptionalString(info.column_aliases) << "}";
 	return out.str();
+}
+
+//! Phase 2 deferral 1: typed Stage-1 dispatcher driven by MAP keys
+//! from `<lake>.snapshots().changes` rather than text tokens from
+//! `__ducklake_metadata_<lake>.ducklake_snapshot_changes.changes_made`.
+//!
+//! Each MAP key signals a DDL kind; each value in the per-key list is
+//! either an unquoted qualified name (`schema.table` for tables/views,
+//! `schema` for schemas) or the stringified `<id>` for kinds that
+//! reference catalog rows by id. Per the upstream probe in
+//! `test/upstream/enumerate_changes_map.py` (committed JSONs in
+//! `test/upstream/output/`), all three DuckLake catalog backends
+//! (DuckDB, SQLite, Postgres) emit identical MAP key sets for every
+//! DDL operation, so this dispatcher is backend-agnostic by
+//! construction. ADR 0008 makes the MAP form the canonical Stage-1
+//! source; the text scan path stays alive only for `cdc_events`
+//! (which still surfaces `changes_made` as a user-facing column) and
+//! for `ChangesTouchConsumerTables` (per-snapshot consumer-filter
+//! evaluation).
+//!
+//! DML / maintenance MAP keys (`tables_inserted_into`, `inlined_insert`,
+//! `inlined_delete`, `tables_deleted_from`, `merge_adjacent`) are
+//! silently skipped — Stage-1 is a typed DDL surface only, per
+//! ADR 0008's `cdc_ddl excludes compacted_table` rule.
+void AddDdlRowFromMapEntry(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
+                           const duckdb::Value &snapshot_time, const std::string &map_key, const std::string &value,
+                           std::vector<std::vector<duckdb::Value>> &rows) {
+	if (map_key == "schemas_created") {
+		rows.push_back(DdlRow(snapshot_id, snapshot_time, "created", "schema",
+		                      LookupSchemaByName(conn, catalog_name, snapshot_id, value)));
+		return;
+	}
+	if (map_key == "tables_created") {
+		// Finding-1 (ADR 0008): a `tables_created` value `schema.name`
+		// whose table_id already had a different name in the previous
+		// snapshot is a RENAME, not a creation. Emit `altered.table`
+		// with a rename payload in that case so downstream consumers
+		// see the rename explicitly rather than as a paired drop +
+		// create that would confuse identity. Mirrors the equivalent
+		// branch in the text-token path.
+		const auto dot = value.find('.');
+		if (dot == std::string::npos) {
+			return;
+		}
+		const auto schema_name = value.substr(0, dot);
+		const auto object_name = value.substr(dot + 1);
+		const auto object = LookupTableByName(conn, catalog_name, snapshot_id, schema_name, object_name);
+		if (!object.object_id.IsNull()) {
+			const auto table_id = object.object_id.GetValue<int64_t>();
+			const auto previous_name = PreviousTableName(conn, catalog_name, table_id, snapshot_id);
+			if (!previous_name.IsNull() && previous_name.ToString() != object_name) {
+				const auto details = BuildAlteredTableDetails(conn, catalog_name, snapshot_id, table_id,
+				                                              previous_name.ToString(), object_name);
+				rows.push_back(DdlRow(snapshot_id, snapshot_time, "altered", "table", object, details));
+			} else {
+				const auto details = BuildCreatedTableDetails(conn, catalog_name, snapshot_id, table_id);
+				rows.push_back(DdlRow(snapshot_id, snapshot_time, "created", "table", object, details));
+			}
+		} else {
+			rows.push_back(DdlRow(snapshot_id, snapshot_time, "created", "table", object));
+		}
+		return;
+	}
+	if (map_key == "tables_altered") {
+		int64_t id = 0;
+		if (!TryParseInt64(value, id)) {
+			return;
+		}
+		const auto object = LookupTableById(conn, catalog_name, id);
+		const auto details =
+		    BuildAlteredTableDetails(conn, catalog_name, snapshot_id, id, std::string(),
+		                             object.object_name.IsNull() ? std::string() : object.object_name.ToString());
+		rows.push_back(DdlRow(snapshot_id, snapshot_time, "altered", "table", object, details));
+		return;
+	}
+	if (map_key == "views_created") {
+		const auto dot = value.find('.');
+		if (dot == std::string::npos) {
+			return;
+		}
+		const auto schema_name = value.substr(0, dot);
+		const auto object_name = value.substr(dot + 1);
+		const auto object = LookupViewByName(conn, catalog_name, snapshot_id, schema_name, object_name);
+		std::string details = "{}";
+		if (!object.object_id.IsNull()) {
+			details = BuildCreatedViewDetails(conn, catalog_name, snapshot_id, object.object_id.GetValue<int64_t>());
+		}
+		rows.push_back(DdlRow(snapshot_id, snapshot_time, "created", "view", object, details));
+		return;
+	}
+	if (map_key == "schemas_dropped") {
+		int64_t id = 0;
+		if (!TryParseInt64(value, id)) {
+			return;
+		}
+		rows.push_back(
+		    DdlRow(snapshot_id, snapshot_time, "dropped", "schema", LookupSchemaById(conn, catalog_name, id)));
+		return;
+	}
+	if (map_key == "tables_dropped") {
+		int64_t id = 0;
+		if (!TryParseInt64(value, id)) {
+			return;
+		}
+		rows.push_back(DdlRow(snapshot_id, snapshot_time, "dropped", "table", LookupTableById(conn, catalog_name, id)));
+		return;
+	}
+	if (map_key == "views_dropped") {
+		int64_t id = 0;
+		if (!TryParseInt64(value, id)) {
+			return;
+		}
+		rows.push_back(DdlRow(snapshot_id, snapshot_time, "dropped", "view", LookupViewById(conn, catalog_name, id)));
+		return;
+	}
+	// Other MAP keys are DML / maintenance and not Stage-1 DDL events.
+	// Silently skipped per ADR 0008 (`cdc_ddl excludes compacted_table`).
 }
 
 void AddDdlRowsForToken(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
@@ -2565,50 +2681,104 @@ void SortDdlRowsForSnapshot(std::vector<std::vector<duckdb::Value>> &rows, size_
 	                 });
 }
 
+//! Apply the cdc_ddl `for_table` filter to the rows in `[begin, end)`
+//! (one snapshot's worth of typed DDL output). Schema-level events
+//! have an empty `schema.object_name` identity and are dropped — the
+//! `for_table` filter is a table-scoped projection. Used by both the
+//! Stage-1 MAP scan (cdc_ddl) and the Stage-1 text scan (cdc_events
+//! does not call this; it has its own per-token table filter).
+void ApplyDdlTableFilter(std::vector<std::vector<duckdb::Value>> &rows, size_t begin, const std::string &table_filter) {
+	if (table_filter.empty()) {
+		return;
+	}
+	auto out_idx = begin;
+	for (auto i = begin; i < rows.size(); ++i) {
+		const auto &row = rows[i];
+		if (row.size() < 8) {
+			continue;
+		}
+		const auto schema_value = row[5];
+		const auto name_value = row[7];
+		if (schema_value.IsNull() || name_value.IsNull()) {
+			continue;
+		}
+		const auto qualified = schema_value.ToString() + "." + name_value.ToString();
+		if (qualified == table_filter) {
+			if (out_idx != i) {
+				rows[out_idx] = rows[i];
+			}
+			out_idx++;
+		}
+	}
+	rows.resize(out_idx);
+}
+
+//! Phase 2 deferral 1: scan `<lake>.snapshots()` over `[start_snapshot,
+//! end_snapshot]` via the typed `changes` MAP and reconstruct typed DDL
+//! rows for every recognised MAP key. Replaces the prior text-token
+//! scan of `__ducklake_metadata_<lake>.ducklake_snapshot_changes.changes_made`
+//! for cdc_ddl / cdc_recent_ddl. Backend-agnostic (the upstream probe in
+//! `test/upstream/output/` confirms all three DuckLake backends emit
+//! identical MAP key sets); future-proof against the comma-separated
+//! text format moving.
+//!
+//! Per-snapshot DDL ordering rank per ADR 0008. Within one snapshot the
+//! contract is `(object_kind, object_id)` ascending, with `object_kind`
+//! sort order `schema, view, table` for `created`/`altered` so dependents
+//! land after their parents, and the reverse order for `dropped` so
+//! tables and views are dropped before their containing schemas. Within
+//! the same `(event_kind, object_kind)` we tie-break on `object_id`.
 void ExtractDdlRows(duckdb::Connection &conn, const std::string &catalog_name, int64_t start_snapshot,
                     int64_t end_snapshot, const std::string &table_filter,
                     std::vector<std::vector<duckdb::Value>> &rows) {
-	auto changes =
-	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id BETWEEN " + std::to_string(start_snapshot) + " AND " +
-	               std::to_string(end_snapshot) + " ORDER BY snapshot_id ASC");
+	// Project (snapshot_id, snapshot_time, key, value-list) by joining
+	// `<catalog>.snapshots()` to its own MAP entries. ORDER BY the
+	// snapshot_id so per-snapshot rows are contiguous; ordering within
+	// a snapshot is reapplied via `SortDdlRowsForSnapshot` after the
+	// per-key value list has been expanded into typed DdlRow output.
+	const auto query = std::string("SELECT s.snapshot_id, s.snapshot_time, e.key AS map_key, e.value AS map_values "
+	                               "FROM ") +
+	                   QuoteIdentifier(catalog_name) +
+	                   ".snapshots() s, "
+	                   "UNNEST(map_entries(s.changes)) AS u(e) "
+	                   "WHERE s.snapshot_id BETWEEN " +
+	                   std::to_string(start_snapshot) + " AND " + std::to_string(end_snapshot) +
+	                   " ORDER BY s.snapshot_id ASC";
+	auto changes = conn.Query(query);
 	if (!changes || changes->HasError()) {
-		throw duckdb::Exception(duckdb::ExceptionType::INVALID, changes ? changes->GetError() : "DDL scan failed");
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID, changes ? changes->GetError() : "DDL MAP scan failed");
 	}
+	int64_t current_snapshot = -1;
+	size_t snapshot_begin = rows.size();
+	auto flush_snapshot = [&]() {
+		if (current_snapshot == -1) {
+			return;
+		}
+		ApplyDdlTableFilter(rows, snapshot_begin, table_filter);
+		SortDdlRowsForSnapshot(rows, snapshot_begin, rows.size());
+	};
 	for (duckdb::idx_t row_idx = 0; row_idx < changes->RowCount(); ++row_idx) {
 		const auto snapshot_id = changes->GetValue(0, row_idx).GetValue<int64_t>();
-		const auto snapshot_time = SnapshotTime(conn, catalog_name, snapshot_id);
-		auto before_size = rows.size();
-		for (const auto &token : SplitChangeTokens(changes->GetValue(1, row_idx).ToString())) {
-			AddDdlRowsForToken(conn, catalog_name, snapshot_id, snapshot_time, token, rows);
+		const auto snapshot_time = changes->GetValue(1, row_idx);
+		const auto key_value = changes->GetValue(2, row_idx);
+		const auto values_value = changes->GetValue(3, row_idx);
+		if (snapshot_id != current_snapshot) {
+			flush_snapshot();
+			current_snapshot = snapshot_id;
+			snapshot_begin = rows.size();
 		}
-		if (!table_filter.empty()) {
-			// Keep only rows whose schema.object_name matches; everything
-			// emitted in this snapshot lives between [before_size, rows.size())
-			// in the result so we can do an in-place rewrite cheaply.
-			auto out_idx = before_size;
-			for (auto i = before_size; i < rows.size(); ++i) {
-				const auto &row = rows[i];
-				if (row.size() < 8) {
-					continue;
-				}
-				const auto schema_value = row[5];
-				const auto name_value = row[7];
-				if (schema_value.IsNull() || name_value.IsNull()) {
-					continue;
-				}
-				const auto qualified = schema_value.ToString() + "." + name_value.ToString();
-				if (qualified == table_filter) {
-					if (out_idx != i) {
-						rows[out_idx] = rows[i];
-					}
-					out_idx++;
-				}
+		if (key_value.IsNull() || values_value.IsNull()) {
+			continue;
+		}
+		const auto map_key = key_value.ToString();
+		for (const auto &v : duckdb::ListValue::GetChildren(values_value)) {
+			if (v.IsNull()) {
+				continue;
 			}
-			rows.resize(out_idx);
+			AddDdlRowFromMapEntry(conn, catalog_name, snapshot_id, snapshot_time, map_key, v.ToString(), rows);
 		}
-		SortDdlRowsForSnapshot(rows, before_size, rows.size());
 	}
+	flush_snapshot();
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientContext &context,
@@ -3192,9 +3362,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcSchemaDiffBind(duckdb::ClientContext
 	}
 	CheckCatalogOrThrow(context, result->catalog_name);
 
-	names = {"snapshot_id", "snapshot_time", "change_kind",  "column_id",    "old_name",    "new_name",
-	         "old_type",    "new_type",      "old_default",  "new_default",  "old_nullable", "new_nullable",
-	         "parent_column_id"};
+	names = {"snapshot_id",  "snapshot_time", "change_kind",     "column_id",   "old_name",
+	         "new_name",     "old_type",      "new_type",        "old_default", "new_default",
+	         "old_nullable", "new_nullable",  "parent_column_id"};
 	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
 	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
 	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
@@ -3253,23 +3423,44 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 		return std::move(result);
 	}
 
-	// Use the same Stage-1 token scan as cdc_ddl. Each token is checked
-	// against `target_ids` by table_id (not by name) so renames don't
-	// fragment the timeline. For each surfaced create/altered pair we emit
-	// per-column diff rows plus an explicit `table_rename` row when the
-	// table itself was renamed at that snapshot.
-	auto changes = conn.Query("SELECT snapshot_id, changes_made FROM " +
-	                          MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
-	                          " WHERE snapshot_id BETWEEN " + std::to_string(data.from_snapshot) + " AND " +
-	                          std::to_string(data.to_snapshot) + " ORDER BY snapshot_id ASC");
+	// Phase 2 deferral 1: Stage-1 source switched to the typed
+	// `<lake>.snapshots().changes` MAP form. Each row of the join below
+	// is `(snapshot_id, snapshot_time, map_key, value-list)`; we only
+	// care about `tables_created` (Finding-1 detection promotes a
+	// rename to `altered.table`) and `tables_altered` (direct ALTER on
+	// a table id). Other MAP keys (`schemas_*`, `views_*`, DML, and
+	// maintenance) are irrelevant for cdc_schema_diff. Each surfaced
+	// table_id is checked against `target_ids` so renames do not
+	// fragment the timeline. Per-snapshot output: zero or one
+	// `table_rename` row + zero or more per-column diff rows.
+	auto changes =
+	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, e.key AS map_key, e.value AS map_values "
+	                           "FROM ") +
+	               QuoteIdentifier(data.catalog_name) +
+	               ".snapshots() s, "
+	               "UNNEST(map_entries(s.changes)) AS u(e) "
+	               "WHERE s.snapshot_id BETWEEN " +
+	               std::to_string(data.from_snapshot) + " AND " + std::to_string(data.to_snapshot) +
+	               " AND e.key IN ('tables_created', 'tables_altered') "
+	               "ORDER BY s.snapshot_id ASC");
 	if (!changes || changes->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        changes ? changes->GetError() : "cdc_schema_diff scan failed");
+		                        changes ? changes->GetError() : "cdc_schema_diff MAP scan failed");
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < changes->RowCount(); ++row_idx) {
 		const auto snapshot_id = changes->GetValue(0, row_idx).GetValue<int64_t>();
-		const auto snapshot_time = SnapshotTime(conn, data.catalog_name, snapshot_id);
-		for (const auto &token : SplitChangeTokens(changes->GetValue(1, row_idx).ToString())) {
+		const auto snapshot_time = changes->GetValue(1, row_idx);
+		const auto key_value = changes->GetValue(2, row_idx);
+		const auto values_value = changes->GetValue(3, row_idx);
+		if (key_value.IsNull() || values_value.IsNull()) {
+			continue;
+		}
+		const auto map_key = key_value.ToString();
+		for (const auto &v : duckdb::ListValue::GetChildren(values_value)) {
+			if (v.IsNull()) {
+				continue;
+			}
+			const auto value = v.ToString();
 			std::string schema_name;
 			std::string object_name;
 			int64_t table_id = 0;
@@ -3277,7 +3468,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 			std::string new_table_name;
 			bool is_pure_create = false;
 
-			if (ParseQualifiedNameToken(token, "created_table:", schema_name, object_name)) {
+			if (map_key == "tables_created") {
+				const auto dot = value.find('.');
+				if (dot == std::string::npos) {
+					continue;
+				}
+				schema_name = value.substr(0, dot);
+				object_name = value.substr(dot + 1);
 				const auto object = LookupTableByName(conn, data.catalog_name, snapshot_id, schema_name, object_name);
 				if (object.object_id.IsNull()) {
 					continue;
@@ -3293,12 +3490,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 					old_table_name = previous.ToString();
 					new_table_name = object_name;
 				}
-			} else if (ParseIdToken(token, "altered_table:", table_id)) {
+			} else {
+				// map_key == "tables_altered"
+				if (!TryParseInt64(value, table_id)) {
+					continue;
+				}
 				if (target_ids.find(table_id) == target_ids.end()) {
 					continue;
 				}
-			} else {
-				continue;
 			}
 
 			if (is_pure_create) {
@@ -3330,13 +3529,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 					}
 				};
 				std::vector<ColumnInfo> ordered = new_cols;
-				std::stable_sort(ordered.begin(), ordered.end(),
-				                 [&](const ColumnInfo &a, const ColumnInfo &b) {
-					                 return create_depth(a.column_id) < create_depth(b.column_id);
-				                 });
+				std::stable_sort(ordered.begin(), ordered.end(), [&](const ColumnInfo &a, const ColumnInfo &b) {
+					return create_depth(a.column_id) < create_depth(b.column_id);
+				});
 				for (const auto &c : ordered) {
-					duckdb::Value parent_value =
-					    c.parent_column.IsNull() ? duckdb::Value() : duckdb::Value::BIGINT(c.parent_column.GetValue<int64_t>());
+					duckdb::Value parent_value = c.parent_column.IsNull()
+					                                 ? duckdb::Value()
+					                                 : duckdb::Value::BIGINT(c.parent_column.GetValue<int64_t>());
 					result->rows.push_back(
 					    {duckdb::Value::BIGINT(snapshot_id), snapshot_time, duckdb::Value("added"),
 					     duckdb::Value::BIGINT(c.column_id), duckdb::Value(), duckdb::Value(c.column_name),
@@ -3348,11 +3547,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 			}
 
 			if (!old_table_name.empty() && old_table_name != new_table_name) {
-				result->rows.push_back({duckdb::Value::BIGINT(snapshot_id), snapshot_time,
-				                        duckdb::Value("table_rename"), duckdb::Value(), duckdb::Value(old_table_name),
-				                        duckdb::Value(new_table_name), duckdb::Value(), duckdb::Value(),
-				                        duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value(),
-				                        duckdb::Value()});
+				result->rows.push_back(
+				    {duckdb::Value::BIGINT(snapshot_id), snapshot_time, duckdb::Value("table_rename"), duckdb::Value(),
+				     duckdb::Value(old_table_name), duckdb::Value(new_table_name), duckdb::Value(), duckdb::Value(),
+				     duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value()});
 			}
 
 			std::vector<ColumnDiff> diffs;
@@ -3379,8 +3577,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 				    (d.kind == ColumnDiff::Kind::ADDED || d.kind == ColumnDiff::Kind::NULLABLE_CHANGED)
 				        ? duckdb::Value::BOOLEAN(d.new_nullable)
 				        : duckdb::Value();
-				duckdb::Value parent_value =
-				    d.has_parent ? duckdb::Value::BIGINT(d.parent_column_id) : duckdb::Value();
+				duckdb::Value parent_value = d.has_parent ? duckdb::Value::BIGINT(d.parent_column_id) : duckdb::Value();
 				result->rows.push_back({duckdb::Value::BIGINT(snapshot_id), snapshot_time,
 				                        duckdb::Value(DiffKindToString(d.kind)), duckdb::Value::BIGINT(d.column_id),
 				                        old_name, new_name, old_type, new_type, old_default, new_default, old_nullable,
