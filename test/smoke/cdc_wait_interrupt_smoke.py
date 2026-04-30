@@ -65,7 +65,12 @@ using namespace duckdb;
 // 1.6s sleep" run while still failing fast on a real regression.
 static constexpr int64_t WAIT_DEADLINE_MS = 3000;
 
-unique_ptr<QueryResult> RequireOk(Connection &conn, const std::string &sql) {
+// Return the concrete `MaterializedQueryResult` rather than the polymorphic
+// `QueryResult` base. `Connection::Query` already returns a
+// `unique_ptr<MaterializedQueryResult>`; macOS clang implicit-converts that
+// to a `unique_ptr<QueryResult>` on return, but Linux GCC refuses, and
+// hand-rolling `std::move` plus `unique_ptr_cast` here just adds noise.
+unique_ptr<MaterializedQueryResult> RequireOk(Connection &conn, const std::string &sql) {
 	auto result = conn.Query(sql);
 	if (!result || result->HasError()) {
 		throw std::runtime_error(sql + "\n" + (result ? result->GetError() : "no result"));

@@ -17,23 +17,47 @@ ENABLE_EXTENSION_AUTOINSTALL=1
 SQL_TEST_SMOKE=test/sql/ducklake_cdc.test, test/sql/compat_check.test
 SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test
 
+# DuckLake binary cache layout: ~/.duckdb/extensions/<version>/<platform>/
+# Pre-staging the binary here lets sqllogictest's `INSTALL ducklake` resolve
+# to a local file instead of hitting extensions.duckdb.org over HTTP, which
+# (a) is what causes the silent "skip on error_message matching 'HTTP'" path
+# in CI runners and (b) keeps the iteration loop offline-friendly.
+DUCKDB_VERSION ?= $(shell cat ${PROJ_DIR}.github/duckdb-version)
+DUCKDB_PLATFORM ?= $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed -e 's/darwin/osx/')_$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+EXT_CACHE_DIR ?= $(HOME)/.duckdb/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}
+EXT_REPO_BASE ?= http://extensions.duckdb.org
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-.PHONY: test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+.PHONY: prepare_tests test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
 
-test_debug_smoke:
+# Pre-fetch the official ducklake binary for our DuckDB target into the local
+# extension cache so the `INSTALL ducklake` statement in SQL tests resolves
+# from disk instead of going over HTTP. CI runners trip the sqllogictest
+# default "skip on error_message matching 'HTTP'" rule otherwise, which
+# silently turns failing tests into green-skipped ones.
+prepare_tests:
+	@mkdir -p "$(EXT_CACHE_DIR)"
+	@if [ ! -f "$(EXT_CACHE_DIR)/ducklake.duckdb_extension" ]; then \
+		echo "Fetching ducklake.duckdb_extension for $(DUCKDB_VERSION)/$(DUCKDB_PLATFORM)"; \
+		curl -fsSL "$(EXT_REPO_BASE)/$(DUCKDB_VERSION)/$(DUCKDB_PLATFORM)/ducklake.duckdb_extension.gz" \
+			| gunzip > "$(EXT_CACHE_DIR)/ducklake.duckdb_extension.tmp"; \
+		mv "$(EXT_CACHE_DIR)/ducklake.duckdb_extension.tmp" "$(EXT_CACHE_DIR)/ducklake.duckdb_extension"; \
+	fi
+
+test_debug_smoke: prepare_tests
 	./build/debug/$(TEST_PATH) "$(SQL_TEST_SMOKE)"
 
-test_debug_default:
+test_debug_default: prepare_tests
 	./build/debug/$(TEST_PATH) "$(SQL_TEST_DEFAULT)"
 
-test_debug_full: test_debug
+test_debug_full: prepare_tests test_debug
 
-test_release_smoke:
+test_release_smoke: prepare_tests
 	./build/release/$(TEST_PATH) "$(SQL_TEST_SMOKE)"
 
-test_release_default:
+test_release_default: prepare_tests
 	./build/release/$(TEST_PATH) "$(SQL_TEST_DEFAULT)"
 
-test_release_full: test
+test_release_full: prepare_tests test
