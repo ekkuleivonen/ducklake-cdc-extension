@@ -20,9 +20,10 @@ What this script does (no Docker, no PyPI deps; all stdlib):
    makes this test meaningful: the probe's discovery query (`schema
    exists, then SELECT value FROM ducklake_metadata WHERE key='version'`)
    does not distinguish a fake from a real catalog.
-2. Spawns a fresh subprocess of the **locally-built debug duckdb CLI**
-   (`build/debug/duckdb`) with the seeded file as the *initial* attached
-   database. The CLI's static-link of `ducklake_cdc` triggers
+2. Spawns a fresh subprocess of the **locally-built duckdb CLI**
+   (`build/release/duckdb` by default, override with
+   `DUCKLAKE_CDC_BUILD=debug`) with the seeded file as the *initial*
+   attached database. The CLI's static-link of `ducklake_cdc` triggers
    `LoadInternal` at session start, after the initial database is
    visible. The probe then hits the seeded `__ducklake_metadata_<name>`
    schema, reads `'99.99'`, and emits the structured notice on stderr.
@@ -43,11 +44,15 @@ Why this is a Python smoke probe:
 
 SQLLogicTest can cover the silent compatibility paths, but it cannot easily
 assert the LOAD-time notice text that clients parse. CI runs this probe
-after the debug build so the structured notice/error contract stays pinned.
+after the release build so the structured notice/error contract stays pinned.
 
 Usage:
 
     uv run python test/smoke/compat_warning_smoke.py
+
+Defaults to the release build, in line with the other smoke probes and the
+CI integration-smoke job. Override with `DUCKLAKE_CDC_BUILD=debug` if you
+have a local debug build.
 
 Exit codes:
 
@@ -58,8 +63,8 @@ Exit codes:
 
 Preconditions:
 
-The locally-built debug extension must exist at the repo's standard
-build path (`build/debug/duckdb`). Run `make debug` first if not.
+The locally-built duckdb CLI must exist at `build/${DUCKLAKE_CDC_BUILD}/duckdb`
+(default `build/release/duckdb`). Run `make release` first if not.
 """
 
 from __future__ import annotations
@@ -71,7 +76,8 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DUCKDB_CLI = REPO_ROOT / "build" / "debug" / "duckdb"
+BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
+DUCKDB_CLI = REPO_ROOT / "build" / BUILD / "duckdb"
 
 # Catalog format version we'll fake. Chosen to be wildly outside any
 # plausible real DuckLake version so it's obvious this is a test value
@@ -190,7 +196,7 @@ def assert_required_fields(catalog_name: str, notice: str) -> list[str]:
 
 def main() -> int:
     if not DUCKDB_CLI.exists():
-        sys.stderr.write(f"locally-built duckdb CLI not found at {DUCKDB_CLI}; run `make debug` first.\n")
+        sys.stderr.write(f"locally-built duckdb CLI not found at {DUCKDB_CLI}; run `make {BUILD}` first.\n")
         return 1
 
     catalog_name = "smokelake"
