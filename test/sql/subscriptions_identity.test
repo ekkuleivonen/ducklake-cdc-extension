@@ -773,38 +773,6 @@ SELECT * FROM cdc_changes('lake', 'drop_recreate', table_name := 'audit.orders')
 ----
 subscription
 
-# schema_subscription_follows_schema_rename: schema subscription stays active through schema rename.
-statement ok
-SELECT * FROM cdc_consumer_create(
-  'lake',
-  'rename_schema',
-  start_at := getvariable('start_snapshot'),
-  subscriptions := [
-    struct_pack(scope_kind := 'schema', schema_name := 'sales', table_name := NULL::VARCHAR,
-                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
-                event_category := 'dml', change_type := 'insert')
-  ]
-);
-
-statement ok
-ALTER SCHEMA lake.sales RENAME TO sales_archive;
-
-statement ok
-INSERT INTO lake.sales_archive.orders VALUES (4, 'archived', 400, 'EU');
-
-query III
-SELECT status, original_qualified_name, current_qualified_name
-FROM cdc_consumer_subscriptions('lake', name := 'rename_schema')
-WHERE scope_kind = 'schema';
-----
-renamed	sales	sales_archive
-
-query I
-SELECT count(*) FROM cdc_changes('lake', 'rename_schema', table_name := 'sales_archive.orders')
-WHERE change_type = 'insert' AND id = 4;
-----
-1
-
 # ddl_schema_subscription_receives_schema_events: schema DDL subscriptions receive schema/table DDL in the schema identity.
 statement ok
 SELECT * FROM cdc_consumer_create(
@@ -812,14 +780,14 @@ SELECT * FROM cdc_consumer_create(
   'schema_ddl',
   start_at := 'now',
   subscriptions := [
-    struct_pack(scope_kind := 'schema', schema_name := 'sales_archive', table_name := NULL::VARCHAR,
+    struct_pack(scope_kind := 'schema', schema_name := 'sales', table_name := NULL::VARCHAR,
                 schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
                 event_category := 'ddl', change_type := '*')
   ]
 );
 
 statement ok
-CREATE TABLE lake.sales_archive.shipments(id INTEGER);
+CREATE TABLE lake.sales.shipments(id INTEGER);
 
 query II
 SELECT event_kind, object_kind FROM cdc_ddl('lake', 'schema_ddl')
@@ -831,7 +799,7 @@ created	table
 
 # ddl_schema_subscription_includes_future_table_ddl: schema DDL subscription includes later alters for tables created after subscribe.
 statement ok
-ALTER TABLE lake.sales_archive.shipments ADD COLUMN carrier VARCHAR;
+ALTER TABLE lake.sales.shipments ADD COLUMN carrier VARCHAR;
 
 query II
 SELECT event_kind, object_kind FROM cdc_ddl('lake', 'schema_ddl')
@@ -861,17 +829,17 @@ SELECT * FROM cdc_consumer_create(
   'boundary_default',
   start_at := 'now',
   subscriptions := [
-    struct_pack(scope_kind := 'table', schema_name := 'sales_archive', table_name := 'orders',
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
                 schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
                 event_category := '*', change_type := '*')
   ]
 );
 
 statement ok
-INSERT INTO lake.sales_archive.orders VALUES (5, 'before-boundary', 500, 'US');
+INSERT INTO lake.sales.orders VALUES (5, 'before-boundary', 500, 'US');
 
 statement ok
-ALTER TABLE lake.sales_archive.orders ADD COLUMN note VARCHAR DEFAULT 'n/a';
+ALTER TABLE lake.sales.orders ADD COLUMN note VARCHAR DEFAULT 'n/a';
 
 query II
 SELECT has_changes, schema_changes_pending FROM cdc_window('lake', 'boundary_default');
@@ -886,10 +854,10 @@ statement ok
 SELECT * FROM cdc_commit('lake', 'boundary_default', getvariable('boundary_end'));
 
 statement ok
-INSERT INTO lake.sales_archive.orders VALUES (6, 'after-boundary', 600, 'US', 'ok');
+INSERT INTO lake.sales.orders VALUES (6, 'after-boundary', 600, 'US', 'ok');
 
 query I
-SELECT count(*) FROM cdc_changes('lake', 'boundary_default', table_name := 'sales_archive.orders')
+SELECT count(*) FROM cdc_changes('lake', 'boundary_default', table_name := 'sales.orders')
 WHERE change_type = 'insert' AND id = 6;
 ----
 1

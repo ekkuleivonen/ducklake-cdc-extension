@@ -1061,6 +1061,47 @@ void ExtractDdlRows(duckdb::Connection &conn, const std::string &catalog_name, i
 	flush_snapshot();
 }
 
+void ApplyDdlSubscriptionFilter(std::vector<std::vector<duckdb::Value>> &rows,
+                                const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	auto out_idx = duckdb::idx_t(0);
+	for (duckdb::idx_t i = 0; i < rows.size(); ++i) {
+		const auto &row = rows[i];
+		if (row.size() < 7) {
+			continue;
+		}
+		const auto schema_value = row[4];
+		const auto object_value = row[6];
+		const auto object_kind = row[3].IsNull() ? std::string() : row[3].ToString();
+		bool keep = false;
+		for (const auto &subscription : subscriptions) {
+			if (subscription.event_category != "ddl" || subscription.status == "dropped") {
+				continue;
+			}
+			if (subscription.scope_kind == "catalog") {
+				keep = true;
+			} else if (subscription.scope_kind == "schema" && !subscription.schema_id.IsNull() &&
+			           !schema_value.IsNull() &&
+			           subscription.schema_id.GetValue<int64_t>() == schema_value.GetValue<int64_t>()) {
+				keep = true;
+			} else if (subscription.scope_kind == "table" && object_kind == "table" && !subscription.table_id.IsNull() &&
+			           !object_value.IsNull() &&
+			           subscription.table_id.GetValue<int64_t>() == object_value.GetValue<int64_t>()) {
+				keep = true;
+			}
+			if (keep) {
+				break;
+			}
+		}
+		if (keep) {
+			if (out_idx != i) {
+				rows[out_idx] = rows[i];
+			}
+			out_idx++;
+		}
+	}
+	rows.resize(out_idx);
+}
+
 //===--------------------------------------------------------------------===//
 // cdc_ddl
 //===--------------------------------------------------------------------===//
@@ -1114,26 +1155,16 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	window_data.max_snapshots = data.max_snapshots;
 	auto window = ReadWindow(context, window_data);
 
-	// `cdc_window` already ran `CheckCatalogOrThrow` and acquired the
-	// lease, so the consumer is loaded safely now. Honor the consumer's
-	// `event_categories` filter: a DDL-only consumer (`['ddl']`) is the
-	// common case, but a DML-only consumer (`['dml']`) must see zero
-	// DDL rows. The cursor still advanced via cdc_window above; the
-	// filter is a *post hoc* projection, not a window-bounding
-	// decision.
 	duckdb::Connection conn_filter(*context.db);
-	const auto consumer_row = LoadConsumerOrThrow(conn_filter, data.catalog_name, data.consumer_name);
-	bool ddl_enabled = true;
-	if (!consumer_row.event_categories.IsNull()) {
-		ddl_enabled = false;
-		for (const auto &child : duckdb::ListValue::GetChildren(consumer_row.event_categories)) {
-			if (!child.IsNull() && child.ToString() == "ddl") {
-				ddl_enabled = true;
-				break;
-			}
+	const auto subscriptions = LoadConsumerSubscriptions(conn_filter, data.catalog_name, data.consumer_name);
+	bool has_ddl_subscription = false;
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category == "ddl") {
+			has_ddl_subscription = true;
+			break;
 		}
 	}
-	if (!ddl_enabled) {
+	if (!has_ddl_subscription) {
 		return std::move(result);
 	}
 	const auto start_snapshot = window[0].GetValue<int64_t>();
@@ -1147,7 +1178,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	}
 
 	duckdb::Connection conn(*context.db);
+	end_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	ExtractDdlRows(conn, data.catalog_name, start_snapshot, end_snapshot, std::string(), result->rows);
+	ApplyDdlSubscriptionFilter(result->rows, subscriptions);
 	return std::move(result);
 }
 

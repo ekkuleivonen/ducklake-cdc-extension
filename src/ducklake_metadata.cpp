@@ -28,6 +28,7 @@ namespace duckdb_cdc {
 //===--------------------------------------------------------------------===//
 
 const char *const CONSUMERS_TABLE = "__ducklake_cdc_consumers";
+const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_consumer_subscriptions";
 const char *const AUDIT_TABLE = "__ducklake_cdc_audit";
 const char *const DLQ_TABLE = "__ducklake_cdc_dlq";
 const char *const STATE_SCHEMA = "__ducklake_cdc";
@@ -543,6 +544,22 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	       ")";
 }
 
+std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema) {
+	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE, use_state_schema) +
+	       " ("
+	       "consumer_id BIGINT NOT NULL, "
+	       "subscription_id BIGINT NOT NULL, "
+	       "scope_kind VARCHAR NOT NULL, "
+	       "schema_id BIGINT, "
+	       "table_id BIGINT, "
+	       "event_category VARCHAR NOT NULL, "
+	       "change_type VARCHAR NOT NULL, "
+	       "original_qualified_name VARCHAR, "
+	       "created_at TIMESTAMP WITH TIME ZONE NOT NULL, "
+	       "metadata VARCHAR"
+	       ")";
+}
+
 std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
 	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, AUDIT_TABLE, use_state_schema) +
 	       " ("
@@ -582,6 +599,7 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 	                                QuoteIdentifier(STATE_SCHEMA));
 	const bool use_state_schema = create_schema && !create_schema->HasError();
 	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
+	ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, DlqDdl(catalog_name, use_state_schema));
 }

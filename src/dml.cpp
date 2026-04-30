@@ -58,6 +58,101 @@ struct CdcEventsData : public duckdb::TableFunctionData {
 	}
 };
 
+std::vector<std::string> SplitEventTokens(const std::string &changes_made) {
+	std::vector<std::string> tokens;
+	size_t start = 0;
+	while (start < changes_made.size()) {
+		const auto comma = changes_made.find(',', start);
+		tokens.push_back(changes_made.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+		if (comma == std::string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+	return tokens;
+}
+
+bool ParseTableIdToken(const std::string &token, const std::string &prefix, int64_t &table_id) {
+	if (token.rfind(prefix, 0) != 0) {
+		return false;
+	}
+	return TryParseInt64(token.substr(prefix.size()), table_id);
+}
+
+bool DmlTokenInfo(const std::string &token, int64_t &table_id, std::string &change_type) {
+	for (const auto &prefix : {"inserted_into_table:", "tables_inserted_into:", "inlined_insert:"}) {
+		if (ParseTableIdToken(token, prefix, table_id)) {
+			change_type = "insert";
+			return true;
+		}
+	}
+	for (const auto &prefix : {"deleted_from_table:", "tables_deleted_from:", "inlined_delete:"}) {
+		if (ParseTableIdToken(token, prefix, table_id)) {
+			change_type = "delete";
+			return true;
+		}
+	}
+	return false;
+}
+
+bool DdlTokenInfo(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
+                  const std::string &token, int64_t &schema_id, int64_t &table_id, bool &has_table) {
+	has_table = false;
+	if (token.rfind("created_schema:", 0) == 0 || token.rfind("dropped_schema:", 0) == 0) {
+		return false;
+	}
+	for (const auto &prefix : {"altered_table:", "dropped_table:"}) {
+		if (ParseTableIdToken(token, prefix, table_id)) {
+			const auto qualified = CurrentQualifiedTableName(conn, catalog_name, table_id, snapshot_id);
+			if (!qualified.empty()) {
+				int64_t ignored = 0;
+				ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, ignored);
+			}
+			has_table = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ChangesTouchSubscriptions(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
+                               const std::string &changes_made,
+                               const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	for (const auto &token : SplitEventTokens(changes_made)) {
+		int64_t table_id = 0;
+		std::string change_type;
+		if (DmlTokenInfo(token, table_id, change_type)) {
+			const auto qualified = CurrentQualifiedTableName(conn, catalog_name, table_id, snapshot_id);
+			if (qualified.empty()) {
+				continue;
+			}
+			int64_t schema_id = 0;
+			int64_t ignored_table = 0;
+			ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, ignored_table);
+			for (const auto &subscription : subscriptions) {
+				if (subscription.change_type == change_type &&
+				    SubscriptionCoversTable(subscription, schema_id, table_id, "dml")) {
+					return true;
+				}
+			}
+			continue;
+		}
+		int64_t schema_id = 0;
+		bool has_table = false;
+		if (DdlTokenInfo(conn, catalog_name, snapshot_id, token, schema_id, table_id, has_table)) {
+			for (const auto &subscription : subscriptions) {
+				if (has_table && SubscriptionCoversTable(subscription, schema_id, table_id, "ddl")) {
+					return true;
+				}
+				if (!has_table && subscription.event_category == "ddl" && subscription.scope_kind == "catalog") {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBind(duckdb::ClientContext &context,
                                                        duckdb::TableFunctionBindInput &input,
                                                        duckdb::vector<duckdb::LogicalType> &return_types,
@@ -99,8 +194,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::Clien
 	}
 
 	duckdb::Connection conn(*context.db);
-	auto consumer_row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-	const auto filter_tables = CollectFilterTables(consumer_row.tables);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 
 	// Project across the snapshot/changes join. `snapshots()` is the
 	// upstream-typed variant we'd switch to once it is exposed in a way
@@ -127,7 +221,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::Clien
 		const auto snapshot_id = snapshot_value.GetValue<int64_t>();
 		const auto changes_value = rows->GetValue(2, i);
 		const auto changes_str = changes_value.IsNull() ? std::string() : changes_value.ToString();
-		if (!ChangesTouchConsumerTables(conn, data.catalog_name, snapshot_id, changes_str, filter_tables)) {
+		if (!ChangesTouchSubscriptions(conn, data.catalog_name, snapshot_id, changes_str, subscriptions)) {
 			continue;
 		}
 		std::vector<duckdb::Value> row;
@@ -153,6 +247,8 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	std::string table_name;
+	int64_t table_id = -1;
+	int64_t schema_id = -1;
 	int64_t max_snapshots;
 	// Column names + types belonging to the underlying DuckLake table (the
 	// `<table cols>` segment of `table_changes(...)` output, after the
@@ -167,6 +263,8 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->table_name = table_name;
+		result->table_id = table_id;
+		result->schema_id = schema_id;
 		result->max_snapshots = max_snapshots;
 		result->table_column_names = table_column_names;
 		result->table_column_types = table_column_types;
@@ -178,17 +276,86 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 	}
 };
 
+bool ConsumerHasDmlSubscriptions(const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category == "dml") {
+			return true;
+		}
+	}
+	return false;
+}
+
+std::string DuckLakeTableChangesName(const std::string &catalog_name, const std::string &table_name) {
+	if (table_name.rfind(catalog_name + ".", 0) == 0) {
+		return table_name;
+	}
+	return catalog_name + "." + table_name;
+}
+
+std::pair<std::string, std::string> SplitQualifiedTableName(const std::string &table_name) {
+	const auto dot = table_name.find('.');
+	if (dot == std::string::npos) {
+		return {"main", table_name};
+	}
+	return {table_name.substr(0, dot), table_name.substr(dot + 1)};
+}
+
+std::string DuckLakeTableChangesCall(const std::string &catalog_name, const std::string &table_name,
+                                     int64_t start_snapshot, int64_t end_snapshot) {
+	const auto parts = SplitQualifiedTableName(table_name);
+	return "ducklake_table_changes(" + QuoteLiteral(catalog_name) + ", " + QuoteLiteral(parts.first) + ", " +
+	       QuoteLiteral(parts.second) + ", " + std::to_string(start_snapshot) + ", " + std::to_string(end_snapshot) +
+	       ")";
+}
+
+bool OriginalNameWasRenamed(const std::vector<ConsumerSubscriptionRow> &subscriptions, const std::string &table_name) {
+	for (const auto &subscription : subscriptions) {
+		if (subscription.scope_kind == "table" && subscription.status == "renamed" &&
+		    !subscription.original_qualified_name.IsNull() && subscription.original_qualified_name.ToString() == table_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ResolveSingleTableSubscription(const std::vector<ConsumerSubscriptionRow> &subscriptions, int64_t &schema_id,
+                                    int64_t &table_id, std::string &table_name) {
+	std::unordered_set<int64_t> table_ids;
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category == "dml" && subscription.scope_kind == "table" &&
+		    subscription.status != "dropped" && !subscription.table_id.IsNull()) {
+			table_ids.insert(subscription.table_id.GetValue<int64_t>());
+			if (!subscription.schema_id.IsNull()) {
+				schema_id = subscription.schema_id.GetValue<int64_t>();
+			}
+			if (!subscription.current_qualified_name.IsNull()) {
+				table_name = subscription.current_qualified_name.ToString();
+			}
+		}
+	}
+	if (table_ids.size() != 1) {
+		throw duckdb::InvalidInputException("cdc_changes requires table_id or table_name for multi-table consumers");
+	}
+	table_id = *table_ids.begin();
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &context,
                                                         duckdb::TableFunctionBindInput &input,
                                                         duckdb::vector<duckdb::LogicalType> &return_types,
                                                         duckdb::vector<duckdb::string> &names) {
-	if (input.inputs.size() != 3) {
-		throw duckdb::BinderException("cdc_changes requires catalog, consumer name, and table");
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException("cdc_changes requires catalog and consumer name");
 	}
 	auto result = duckdb::make_uniq<CdcChangesData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
-	result->table_name = GetStringArg(input.inputs[2], "table");
+	if (input.inputs.size() == 3) {
+		result->table_name = GetStringArg(input.inputs[2], "table");
+	}
+	auto table_name_entry = input.named_parameters.find("table_name");
+	if (table_name_entry != input.named_parameters.end() && !table_name_entry->second.IsNull()) {
+		result->table_name = table_name_entry->second.GetValue<std::string>();
+	}
 	result->max_snapshots = MaxSnapshotsParameter(input);
 
 	CheckCatalogOrThrow(context, result->catalog_name);
@@ -219,6 +386,39 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 	// single-reader lease keeps this as a strictly producer/consumer race;
 	// fixing it would require rebinding on every Init.
 	duckdb::Connection conn(*context.db);
+	const auto current_snapshot = CurrentSnapshot(conn, result->catalog_name);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, result->catalog_name, result->consumer_name);
+	auto table_id_entry = input.named_parameters.find("table_id");
+	if (table_id_entry != input.named_parameters.end() && !table_id_entry->second.IsNull()) {
+		result->table_id = table_id_entry->second.GetValue<int64_t>();
+		result->table_name = CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, current_snapshot);
+		if (result->table_name.empty()) {
+			throw duckdb::InvalidInputException("cdc_changes: table_id %lld is not active",
+			                                    static_cast<long long>(result->table_id));
+		}
+		int64_t ignored_table_id = 0;
+		ResolveCurrentTableName(conn, result->catalog_name, result->table_name, current_snapshot, result->schema_id,
+		                        ignored_table_id);
+	} else if (!result->table_name.empty()) {
+		if (result->table_name.find('.') == std::string::npos) {
+			result->table_name = std::string("main.") + result->table_name;
+		}
+		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, current_snapshot, result->schema_id,
+		                             result->table_id)) {
+			if (OriginalNameWasRenamed(subscriptions, result->table_name)) {
+				throw duckdb::InvalidInputException("cdc_changes: table '%s' was renamed; use the current name",
+				                                    result->table_name);
+			}
+			throw duckdb::InvalidInputException("cdc_changes failed to resolve table '%s'", result->table_name);
+		}
+	} else {
+		ResolveSingleTableSubscription(subscriptions, result->schema_id, result->table_id, result->table_name);
+	}
+	const auto matching_change_types = MatchingDmlChangeTypes(subscriptions, result->schema_id, result->table_id);
+	if (matching_change_types.empty() && ConsumerHasDmlSubscriptions(subscriptions)) {
+		throw duckdb::InvalidInputException("cdc_changes: table '%s' is not covered by consumer '%s' subscriptions",
+		                                    result->table_name, result->consumer_name);
+	}
 	int64_t probe_snapshot;
 	{
 		auto consumer_row = LoadConsumerOrThrow(conn, result->catalog_name, result->consumer_name);
@@ -250,9 +450,11 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 			probe_snapshot = end_snapshot >= start_snapshot ? end_snapshot : start_snapshot;
 		}
 	}
-	auto probe = conn.Query("SELECT * FROM " + QuoteIdentifier(result->catalog_name) + ".table_changes(" +
-	                        QuoteLiteral(result->table_name) + ", " + std::to_string(probe_snapshot) + ", " +
-	                        std::to_string(probe_snapshot) + ") LIMIT 0");
+	probe_snapshot = current_snapshot;
+	auto probe = conn.Query("SELECT * FROM " +
+	                        DuckLakeTableChangesCall(result->catalog_name, result->table_name, probe_snapshot,
+	                                                 probe_snapshot) +
+	                        " LIMIT 0");
 	if (!probe || probe->HasError()) {
 		throw duckdb::InvalidInputException(
 		    "cdc_changes failed to resolve table '%s' in catalog '%s': %s", result->table_name, result->catalog_name,
@@ -304,41 +506,15 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	}
 
 	duckdb::Connection conn(*context.db);
-	auto consumer_row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-
-	// Honor event_categories: a DDL-only consumer (`['ddl']`) sees zero
-	// DML rows. The cursor still advances through the window because
-	// cdc_window already ran above; this filter is the symmetric
-	// counterpart to the one in cdc_ddl.
-	if (!consumer_row.event_categories.IsNull()) {
-		bool dml_enabled = false;
-		for (const auto &child : duckdb::ListValue::GetChildren(consumer_row.event_categories)) {
-			if (!child.IsNull() && child.ToString() == "dml") {
-				dml_enabled = true;
-				break;
-			}
-		}
-		if (!dml_enabled) {
-			return std::move(result);
-		}
+	auto effective_end_snapshot = end_snapshot;
+	const auto table_name_at_end = CurrentQualifiedTableName(conn, data.catalog_name, data.table_id, effective_end_snapshot);
+	if (table_name_at_end.empty() || table_name_at_end != data.table_name) {
+		effective_end_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	}
-
-	// Reject calls that ask for a table the consumer was created to ignore.
-	// Better to fail loudly here than to silently return the empty result a
-	// post-hoc filter would produce.
-	const auto filter_tables = CollectFilterTables(consumer_row.tables);
-	if (!filter_tables.empty()) {
-		bool table_in_filter = false;
-		const auto qualified =
-		    data.table_name.find('.') == std::string::npos ? std::string("main.") + data.table_name : data.table_name;
-		if (filter_tables.find(qualified) != filter_tables.end() ||
-		    filter_tables.find(data.table_name) != filter_tables.end()) {
-			table_in_filter = true;
-		}
-		if (!table_in_filter) {
-			throw duckdb::InvalidInputException("cdc_changes: table '%s' is not in consumer '%s' tables filter",
-			                                    data.table_name, data.consumer_name);
-		}
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	const auto change_types = MatchingDmlChangeTypes(subscriptions, data.schema_id, data.table_id);
+	if (change_types.empty()) {
+		return std::move(result);
 	}
 
 	std::ostringstream column_list;
@@ -348,7 +524,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	}
 
 	std::ostringstream where_clause;
-	const auto change_types = CollectChangeTypes(consumer_row.change_types);
 	if (!change_types.empty()) {
 		where_clause << " WHERE tc.change_type IN (";
 		for (size_t i = 0; i < change_types.size(); ++i) {
@@ -362,10 +537,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 
 	auto query =
 	    std::string("SELECT ") + column_list.str() +
-	    ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info, " + std::to_string(end_snapshot) +
-	    " AS next_snapshot_id FROM " + QuoteIdentifier(data.catalog_name) + ".table_changes(" +
-	    QuoteLiteral(data.table_name) + ", " + std::to_string(start_snapshot) + ", " + std::to_string(end_snapshot) +
-	    ") tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
+	    ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info, " + std::to_string(effective_end_snapshot) +
+	    " AS next_snapshot_id FROM " +
+	    DuckLakeTableChangesCall(data.catalog_name, data.table_name, start_snapshot, effective_end_snapshot) +
+	    " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
 	    " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
 	    MetadataTable(data.catalog_name, "ducklake_snapshot_changes") + " c ON c.snapshot_id = tc.snapshot_id" +
 	    where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
@@ -516,11 +691,20 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 	}
 
 	for (const auto &name : {"cdc_changes", "ducklake_cdc_changes"}) {
+		duckdb::TableFunction changes_function_new(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+		    RowScanExecute, CdcChangesBind, CdcChangesInit);
+		changes_function_new.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
+		changes_function_new.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
+		changes_function_new.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
+		loader.RegisterFunction(changes_function_new);
 		duckdb::TableFunction changes_function(name,
 		                                       duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
 		                                                                            duckdb::LogicalType::VARCHAR,
 		                                                                            duckdb::LogicalType::VARCHAR},
 		                                       RowScanExecute, CdcChangesBind, CdcChangesInit);
+		changes_function.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
 		changes_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		loader.RegisterFunction(changes_function);
 	}

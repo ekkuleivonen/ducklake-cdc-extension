@@ -70,9 +70,10 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcConsumerStatsBind(duckdb::ClientCont
 	         "lag_seconds",
 	         "oldest_available_snapshot",
 	         "gap_distance",
-	         "tables",
-	         "tables_unresolved",
-	         "change_types",
+	         "subscription_count",
+	         "subscriptions_active",
+	         "subscriptions_renamed",
+	         "subscriptions_dropped",
 	         "owner_token",
 	         "owner_acquired_at",
 	         "owner_heartbeat_at",
@@ -86,9 +87,10 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcConsumerStatsBind(duckdb::ClientCont
 	                duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::BIGINT,
 	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR),
-	                duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR),
-	                duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR),
+	                duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,
 	                duckdb::LogicalType::UUID,
 	                duckdb::LogicalType::TIMESTAMP_TZ,
 	                duckdb::LogicalType::TIMESTAMP_TZ,
@@ -118,7 +120,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 	// Single big projection so the planner JOIN-and-aggregates against
 	// ducklake_snapshot in one pass per consumer.
 	auto query = std::string("SELECT c.consumer_name, c.consumer_id, c.last_committed_snapshot, "
-	                         "s.snapshot_time, c.tables, c.change_types, c.owner_token, c.owner_acquired_at, "
+	                         "s.snapshot_time, c.owner_token, c.owner_acquired_at, "
 	                         "c.owner_heartbeat_at, c.lease_interval_seconds FROM ") +
 	             consumers + " c LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
 	             " s ON s.snapshot_id = c.last_committed_snapshot" + where.str() + " ORDER BY c.consumer_name ASC";
@@ -133,12 +135,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 		const auto consumer_id = rows->GetValue(1, i).GetValue<int64_t>();
 		const auto last_committed_snapshot = rows->GetValue(2, i).GetValue<int64_t>();
 		const auto last_snapshot_time = rows->GetValue(3, i);
-		const auto tables_value = StringListValue(rows->GetValue(4, i));
-		const auto change_types_value = StringListValue(rows->GetValue(5, i));
-		const auto owner_token_value = rows->GetValue(6, i);
-		const auto owner_acquired_value = rows->GetValue(7, i);
-		const auto owner_heartbeat_value = rows->GetValue(8, i);
-		const auto lease_interval = rows->GetValue(9, i).GetValue<int64_t>();
+		const auto owner_token_value = rows->GetValue(4, i);
+		const auto owner_acquired_value = rows->GetValue(5, i);
+		const auto owner_heartbeat_value = rows->GetValue(6, i);
+		const auto lease_interval = rows->GetValue(7, i).GetValue<int64_t>();
 
 		const auto lag_snapshots = current_snapshot - last_committed_snapshot;
 		duckdb::Value lag_seconds_value;
@@ -153,32 +153,17 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 
 		const auto gap_distance = last_committed_snapshot - oldest_snapshot;
 
-		// tables_unresolved: every table in `c.tables` that does not exist
-		// at current_snapshot. Empty filter -> empty unresolved list (the
-		// consumer takes everything, so nothing is unresolved by definition).
-		const auto filter_tables = CollectFilterTables(tables_value);
-		duckdb::vector<duckdb::Value> unresolved;
-		if (!filter_tables.empty()) {
-			std::ostringstream existing_query;
-			existing_query << "SELECT s.schema_name || '.' || t.table_name FROM " +
-			                      MetadataTable(data.catalog_name, "ducklake_table") + " t JOIN " +
-			                      MetadataTable(data.catalog_name, "ducklake_schema") +
-			                      " s USING (schema_id) WHERE t.begin_snapshot <= "
-			               << current_snapshot << " AND (t.end_snapshot IS NULL OR t.end_snapshot > "
-			               << current_snapshot << ")";
-			auto existing = conn.Query(existing_query.str());
-			std::unordered_set<std::string> existing_set;
-			if (existing && !existing->HasError()) {
-				for (duckdb::idx_t j = 0; j < existing->RowCount(); ++j) {
-					if (!existing->GetValue(0, j).IsNull()) {
-						existing_set.insert(existing->GetValue(0, j).ToString());
-					}
-				}
-			}
-			for (const auto &name : filter_tables) {
-				if (existing_set.find(name) == existing_set.end()) {
-					unresolved.push_back(duckdb::Value(name));
-				}
+		const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, consumer_name_value.ToString());
+		int64_t active = 0;
+		int64_t renamed = 0;
+		int64_t dropped = 0;
+		for (const auto &subscription : subscriptions) {
+			if (subscription.status == "active") {
+				active++;
+			} else if (subscription.status == "renamed") {
+				renamed++;
+			} else if (subscription.status == "dropped") {
+				dropped++;
 			}
 		}
 
@@ -206,9 +191,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 		row.push_back(lag_seconds_value);
 		row.push_back(duckdb::Value::BIGINT(oldest_snapshot));
 		row.push_back(duckdb::Value::BIGINT(gap_distance));
-		row.push_back(tables_value);
-		row.push_back(duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, unresolved));
-		row.push_back(change_types_value);
+		row.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(subscriptions.size())));
+		row.push_back(duckdb::Value::BIGINT(active));
+		row.push_back(duckdb::Value::BIGINT(renamed));
+		row.push_back(duckdb::Value::BIGINT(dropped));
 		row.push_back(owner_token_value);
 		row.push_back(owner_acquired_value);
 		row.push_back(owner_heartbeat_value);
