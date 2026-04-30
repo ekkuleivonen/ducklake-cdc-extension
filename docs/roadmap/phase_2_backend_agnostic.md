@@ -18,11 +18,12 @@ These three items were deferred from Phase 1 with rationale captured in the Phas
 
 ### Catalog matrix
 
-- [ ] Run the Phase 1 test suite against each DuckLake-supported catalog backend:
+- [x] **Catalog matrix smoke wired into CI** (`test/catalog_matrix/catalog_matrix_smoke.py`, runs on every push / PR). Covers the Phase 1 cursor loop (`cdc_consumer_create` → DML → `cdc_window` → `cdc_changes` → `cdc_commit` → ALTER + new-schema DML → `cdc_ddl` → `cdc_changes` over the new schema → final commit) **and** the single-reader lease (`cdc_window` blocks the second reader with `CDC_BUSY`; `cdc_consumer_force_release` invalidates the holder's owner-token so its commit also fails with `CDC_BUSY`) on **DuckDB / SQLite / PostgreSQL** in one CI step. The Postgres leg uses the `test/catalog_matrix/docker-compose.yml` fixture (port 5434 to coexist with the upstream contract probe). The full SQLLogic suite still needs a backend-matrix runner; that's the next bullet.
+- [ ] Run the **full Phase 1 SQL test suite** against each DuckLake-supported catalog backend (the smoke is an early signal; the SQLLogic matrix is the actual exit criterion):
   - [ ] DuckDB (embedded)
   - [ ] SQLite
   - [ ] PostgreSQL
-- [ ] Containerised CI fixtures (`docker compose` for Postgres).
+- [x] Containerised CI fixtures (`docker compose` for Postgres) — `test/catalog_matrix/docker-compose.yml`.
 - [ ] Verify that `__ducklake_cdc_consumers`, `__ducklake_cdc_dlq`, and `__ducklake_cdc_audit` are stored using each backend's documented inlined-type encoding (per the spec's PostgreSQL and SQLite encoding tables) — no DuckDB-only assumptions leak through. Particular attention to `UUID` (`owner_token`) — store as native `uuid` on Postgres, `TEXT(36)` on SQLite where native UUID isn't available, with a portable extraction helper.
 - [ ] **Re-run the Phase 1 TOCTOU race test on each backend.** Phase 1's deterministic-interleaving test infrastructure already supports per-backend barriers (Postgres advisory lock, SQLite serial assertion, DuckDB single-writer assertion). Postgres needs `SERIALIZABLE` or `REPEATABLE READ + SELECT FOR SHARE`; SQLite is serial; DuckDB embedded is single-writer. Document the per-backend isolation requirement in `docs/operational/isolation.md`. **No new race-test code in Phase 2** — same code, three backend configs.
 - [ ] **Re-run the Phase 1 lease test suite on each backend.** Lease lifetime semantics are now portable (single conditional UPDATE, no per-backend lock primitive). The matrix verifies portability empirically: lease timeout, force release, heartbeat extension, stolen-lease commit-fail. If a backend exposes anomalies (e.g. SQLite's text-encoded TIMESTAMPTZ comparison interacting with the heartbeat predicate), document and adjust the lease comparison precision (always use `>=` with a known floor, never `=`).

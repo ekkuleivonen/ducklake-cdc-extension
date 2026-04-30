@@ -2692,34 +2692,64 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 
 	// Probe the underlying `<lake>.table_changes(...)` schema with a `LIMIT 0`
 	// query so the planner sees the table's actual columns. `table_changes`
-	// returns the schema as of its END snapshot; the consumer's next window
-	// is bounded by `stop_at_schema_change` so its END snapshot lives in the
-	// same `schema_version` as `last_committed_snapshot + 1`. Probing there
-	// matches the runtime schema for the typical default-bounded consumer
-	// (the `stop_at_schema_change=false` opt-out is documented as informational
-	// — that path can mix schemas and bind sees only one of them). When
-	// `last_committed_snapshot + 1` does not exist yet (the consumer has
-	// caught up to head), fall back to `current_snapshot()` so brand-new
-	// consumers still bind cleanly.
+	// projects the schema as of the END snapshot of the range, so the probe
+	// snapshot must match the END snapshot the runtime scan will use.
+	//
+	// We replicate `ReadWindow`'s window-end computation read-only here
+	// (no lease acquisition, no metadata writes). Two simpler strategies that
+	// don't work:
+	//
+	//   * `last_committed_snapshot + 1` (the historical strategy): often
+	//     lands on a CDC self-write snapshot — a lease UPDATE or an audit
+	//     row. Those never carry a schema change for the user's table, so
+	//     the probe returns the old column set even when the next external
+	//     snapshot is the ALTER itself. This was the catalog-matrix smoke
+	//     regression: post-commit, then ALTER + new-schema INSERT, then
+	//     `cdc_changes` bound the OLD schema while the runtime range
+	//     started at the ALTER and projected the NEW schema.
+	//
+	//   * `current_snapshot()` (intermediate fix): correct when the runtime
+	//     range extends to the latest snapshot, wrong when the window is
+	//     bounded BEFORE a pending schema change (the default
+	//     `stop_at_schema_change=true` path). The runtime range projects the
+	//     OLD schema; bind would over-project NEW columns and the runtime
+	//     query would fail to bind `tc.<new column>`.
+	//
+	// Trade-off that remains: a producer ALTER landing between Bind and Init
+	// can still drift the runtime schema past the bind columns. The
+	// single-reader lease keeps this as a strictly producer/consumer race;
+	// fixing it would require rebinding on every Init.
 	duckdb::Connection conn(*context.db);
-	const auto current = CurrentSnapshot(conn, result->catalog_name);
-	int64_t probe_snapshot = current;
+	int64_t probe_snapshot;
 	{
-		auto consumer_lookup =
-		    conn.Query("SELECT last_committed_snapshot FROM " + MainTable(result->catalog_name, CONSUMERS_TABLE) +
-		               " WHERE consumer_name = " + QuoteLiteral(result->consumer_name) + " LIMIT 1");
-		if (consumer_lookup && !consumer_lookup->HasError() && consumer_lookup->RowCount() > 0) {
-			const auto cursor_value = consumer_lookup->GetValue(0, 0);
-			if (!cursor_value.IsNull()) {
-				const auto candidate = cursor_value.GetValue<int64_t>() + 1;
-				const auto exists =
-				    conn.Query("SELECT count(*) FROM " + MetadataTable(result->catalog_name, "ducklake_snapshot") +
-				               " WHERE snapshot_id = " + std::to_string(candidate));
-				if (exists && !exists->HasError() && exists->RowCount() > 0 && !exists->GetValue(0, 0).IsNull() &&
-				    exists->GetValue(0, 0).GetValue<int64_t>() > 0) {
-					probe_snapshot = candidate;
+		auto consumer_row = LoadConsumerOrThrow(conn, result->catalog_name, result->consumer_name);
+		const auto last_snapshot = consumer_row.last_committed_snapshot;
+		const auto current_snapshot = CurrentExternalSnapshot(conn, result->catalog_name, last_snapshot);
+		const auto first_external_snapshot =
+		    FirstExternalSnapshotAfter(conn, result->catalog_name, last_snapshot, current_snapshot);
+		if (first_external_snapshot == -1) {
+			// Consumer is caught up to head (or to the last external snap):
+			// the next runtime range will be empty. Bind to the latest
+			// known schema so a brand-new consumer or a fully-drained
+			// consumer can still resolve columns.
+			probe_snapshot = current_snapshot > 0 ? current_snapshot : CurrentSnapshot(conn, result->catalog_name);
+		} else {
+			const auto start_snapshot = first_external_snapshot;
+			int64_t end_snapshot = std::min(current_snapshot, start_snapshot + result->max_snapshots - 1);
+			if (start_snapshot <= current_snapshot && consumer_row.stop_at_schema_change) {
+				const auto base_schema_version = ResolveSchemaVersion(conn, result->catalog_name, last_snapshot);
+				const auto next_schema_change = NextExternalSchemaChangeSnapshot(
+				    conn, result->catalog_name, start_snapshot, current_snapshot, base_schema_version);
+				if (next_schema_change != -1 && next_schema_change <= end_snapshot) {
+					end_snapshot = next_schema_change - 1;
 				}
 			}
+			// `end_snapshot < start_snapshot` is the boundary-collapse case
+			// (start IS the schema change AND stop_at_schema_change=true).
+			// The runtime range will be empty; probe at `start` so bind
+			// resolves under the schema that the *next* non-empty window
+			// will see (the schema starting at the ALTER).
+			probe_snapshot = end_snapshot >= start_snapshot ? end_snapshot : start_snapshot;
 		}
 	}
 	auto probe = conn.Query("SELECT * FROM " + QuoteIdentifier(result->catalog_name) + ".table_changes(" +
