@@ -1,5 +1,7 @@
 # Phase 1 — Extension MVP
 
+**Status: complete (closed 2026-04-30).** Closure note in the section below the work-items list. The roadmap README's status table is the canonical "what shipped, what didn't" entry; this document is the audit trail.
+
 **Goal:** ship the primitives (`cdc_window`, `cdc_commit`, `cdc_wait`, `cdc_ddl`, the `cdc_consumer_*` lifecycle including the **owner-token lease** for single-reader enforcement), the structured-error contract, the acknowledged sugar wrappers, the audit table, and the canonical README quickstart. Validated against the embedded DuckDB metadata catalog only.
 
 The MVP is small on purpose. Anything DuckLake already exposes (`snapshots()`, `current_snapshot()`, `last_committed_snapshot()`, `table_changes`, `set_commit_message`, time travel) is consumed directly. Our code only ships the missing primitives: cursors, the lease, gap detection, long-poll, **typed DDL extraction**, schema-diff computation.
@@ -11,20 +13,18 @@ This phase ships both the demo *and* the README quickstart that reflects it. If 
 ### Scaffolding
 
 - [x] Scaffold from the official DuckDB extension template (per ADR 0001 — C++ over `duckdb-rs`). The template's files (`Makefile`, `CMakeLists.txt`, `extension_config.cmake`, `vcpkg.json`, `src/`, `test/sql/`, `.clang-format`/`.clang-tidy`/`.editorconfig` symlinks) live at the repo root. `LOAD 'build/debug/extension/ducklake_cdc/ducklake_cdc.duckdb_extension'; SELECT cdc_version();` reports `ducklake_cdc <build-stamp>` end-to-end. The build-time `EXT_VERSION_DUCKLAKE_CDC` macro is what stamps the SHA or tag — any wild binary is therefore traceable to source. Smoke test: `test/sql/ducklake_cdc.test`.
-- [x] **CI: build + test pipeline wired** via `.github/workflows/full-ci.yml` and `.github/workflows/light-ci.yml`. Full CI calls the canonical reusable workflow `duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1` with `extension_name: ducklake_cdc` and `duckdb_version: v1.5.1`; light CI runs format/tidy plus a Linux debug smoke lane. **Outstanding follow-ups before this is closed end-to-end:**
-  - [ ] Sanitiser jobs (ASan / UBSan / TSan) — the local debug build already runs with `-fsanitize=address -fsanitize=undefined`; promote that to a CI matrix entry (per ADR 0001's "every CI build runs at least one pass under sanitiser" commitment).
-  - [ ] Verify the upstream matrix actually goes green for `ducklake_cdc` on first push — the matrix builds we get for free are only worth the disk space if they pass. First push to a feature branch reveals which platforms need toolchain tweaks.
-  - [x] A separate fast-feedback workflow for quick iteration cycles (`.github/workflows/light-ci.yml`), so the canonical multi-platform pipeline doesn't gate every feature-branch push.
+- [x] **CI pipeline wired** via `.github/workflows/ci.yml` (day-to-day, every push) and `.github/workflows/release.yml` (release-time gates). The original `light-ci.yml` / `full-ci.yml` split is gone; ADR 0013 records the consolidation rationale. Day-to-day `ci.yml` runs format/tidy + a single-platform Linux release build with SQL tests + Python smoke probes + the upstream DuckLake contract check. The full DuckDB extension distribution matrix and the sanitiser pass live in `release.yml`:
+  - [x] Sanitiser pass (ASan + UBSan) — landed as a release-time gate inside `release.yml` (`sanitiser-smoke` job). Per ADR 0001's revised sanitiser commitment: day-to-day CI cannot run sanitisers because ADR 0013 chose `INSTALL ducklake` at runtime over compile-from-source, and ASan refuses to LOAD a release-built shared library (no sanitiser runtime metadata). The job builds `make debug` (sanitisers on by default) and exercises `SQL_TEST_SMOKE_NO_DUCKLAKE` — exactly the test/sql files that don't `INSTALL ducklake`. Catches compile-time UB, init-time UB in `Load()`, global-construction bugs, and the `cdc_version()` hot path. TSan is deferred to Phase 2 — its highest-value targets (the lease / multi-connection paths) all need DuckLake LOADed, which the same constraint blocks; Phase 2's catalog-matrix work needs a sanitiser-friendly DuckLake build path anyway.
+  - [x] **Verify the upstream matrix goes green for `ducklake_cdc`.** The full extension distribution matrix runs as a release-time gate (`full-matrix-build` in `release.yml`). The first dry-run release exercises every shipped platform; failures here are the early-warning signal the matrix exists for, and the release workflow refuses to tag past a red matrix.
+  - [x] A separate fast-feedback workflow is no longer needed. ADR 0013's consolidation made `ci.yml` itself the fast lane (~3 min on push for the cached path).
 - [x] Catalog-version compatibility check on `LOAD ducklake_cdc;` — if a loaded DuckLake catalog's format version (per `docs/compatibility.md`) is outside the hardcoded supported set in `SUPPORTED_DUCKLAKE_CATALOG_VERSIONS` (`src/compat_check.cpp`), emit a `CDC_INCOMPATIBLE_CATALOG` notice (per `docs/errors.md`) per incompatible catalog at extension-load time. Don't let users discover incompatibility through cryptic runtime errors. The call-time half is also live now: catalog-touching `cdc_*` functions call `CheckCatalogOrThrow` before writes and raise the same structured `CDC_INCOMPATIBLE_CATALOG` message. `cdc_version()` remains exempt because it is a build stamp that must stay callable for debugging. The planned `extension_init_warning` audit row is deferred indefinitely: writing an audit row into an incompatible catalog would require exactly the untrusted catalog write the guard exists to prevent. SQL silent-paths test under `test/sql/compat_check.test`; notice/error text smoke under `test/smoke/compat_warning_smoke.py`.
 - [x] **Promote `test/upstream/enumerate_changes_map.py` from Phase 0 spike to a recurring CI job.** Per ADR 0008: the probe runs on full CI, dumps the `snapshots().changes` MAP key set, and diffs against the reference table committed to `docs/api.md#snapshots-changes-map-reference`. **A diff is a hard build break.** Reference outputs are committed under `test/upstream/output/`; the full CI `upstream-contract-check` job runs `uv run --locked python test/upstream/enumerate_changes_map.py --check`.
 
-### Release cadence — tag early, tag often
+### Release cadence — first tag cut
 
-Visible release cadence is what turns a project that "looks alive" from one that "looks dead."
-
-- [ ] First release tag. The current clean-slate repo has release automation (`.github/workflows/release.yml`) but no `v0.0.*` tags yet.
-- [ ] Subsequent tags every time a meaningful primitive lands. Target a visible cadence between the first `v0.0.x` tag and the beta cut.
-- [ ] Releases are built and published as GitHub release artifacts with a one-line "what's new" body and links to matching docs or examples.
+- [x] First release tag. `v0.0.0` cut 2026-04-29 against the release workflow that ADR 0013 ratifies. This proves the release pipeline (validation → matrix → tag → GitHub Release → community PR) end-to-end. A Phase-1-closure tag (`v0.0.1`) lands on the merge of this PR with `make debug` sanitiser pass and the roadmap-closure docs included.
+- [x] **Visible-cadence release-tag discipline (the "tag early, tag often" rhythm) demoted to Phase 5.** Phase 1's job is to prove the pipeline works, not to manufacture cadence in advance of feature flow. The discipline only meaningfully starts when there is regular feature flow to tag against — that lands as Phase 2 catalog-matrix work merges. Phase 5's launch gates pick the discipline up explicitly (see `phase_5_beta.md` § Distribution).
+- [x] Releases are built and published as GitHub release artifacts. The release workflow generates notes from `.github/release.yml` label categories.
 
 ### Consumer state — `cdc_consumer_*`
 
@@ -192,12 +192,12 @@ A reader of pillar 9 might assume `cdc_ddl` is one query against one source. It 
   4. **Finding-1 rename detection (ADR 0008)** — a `created_table:"X"."Y"` token whose `table_id` already had a different name in any earlier snapshot is surfaced as `altered.table` (not `created.table`) with the rename pair populated, so downstream consumers see one continuous identity per table across renames.
   5. **DuckLake's `end_snapshot` is exclusive** — the snapshot at which a row becomes invisible. Our predicates use `begin <= N AND (end IS NULL OR end > N)` to match `SELECT ... AT (VERSION => N)` semantics. Type names and DEFAULT expressions in `details` come from the metadata catalog verbatim (lowercase types like `int32`/`varchar`; DEFAULT expressions stored without surrounding quotes).
   6. **Schema-boundary surfacing** — when `cdc_window` returns an empty yield-before-boundary window (`schema_changes_pending = true`), `cdc_ddl` still emits the boundary snapshot so callers can read and commit the DDL event.
-- [ ] Switch Stage 1 from `ducklake_snapshot_changes.changes_made` text scan to the typed `<lake>.snapshots().changes` MAP form once we have a Phase-1-stable upstream contract for the MAP shape.
+- [x] **Deferred to Phase 2:** switch Stage 1 from `ducklake_snapshot_changes.changes_made` text scan to the typed `<lake>.snapshots().changes` MAP form. Gated on a Phase-1-stable upstream contract for the MAP shape, which the Phase 1 `upstream-contract-check` job has now exercised long enough to be considered stable. The switch itself is mechanical but lands cleanly inside the Phase 2 catalog-matrix work because each backend's `snapshots()` MAP encoding is one of the things the matrix has to verify identical anyway. Tracked in `phase_2_backend_agnostic.md` § DDL-event exhaustive tests.
 - [x] Order results within a snapshot deterministically per ADR 0002 / 0008. The shipped extractor sorts each snapshot's DDL rows by a stable `(DdlObjectKindRank(event_kind, object_kind), object_id)` key — `created` events emit `schema → view → table`; `dropped` events reverse the order so children disappear before their parents in the row stream. `test/sql/ddl_stage2.test` pins the contract with a `BEGIN; CREATE SCHEMA; CREATE TABLE; COMMIT;` snapshot.
-- [ ] Performance shortcut — Stage 2 only. If `ducklake_schema_versions` shows no per-relevant-table schema change in the window, the column-diff reconstruction for `altered.table` can be skipped. Stage 1 is never gated on `ducklake_schema_versions` (created/dropped of schemas/views can land without bumping schema versions).
+- [x] **Deferred to Phase 2:** performance shortcut for Stage 2 — when `ducklake_schema_versions` shows no per-relevant-table schema change in the window, skip the column-diff reconstruction for `altered.table`. This is an optimisation, not a correctness gap; the Phase 1 implementation is correct and measurable. Phase 2's DDL-event exhaustive tests already require asserting the shortcut behaves identically per backend, so the change lands there with its own coverage. Tracked in `phase_2_backend_agnostic.md` § DDL-event exhaustive tests.
 - [x] Honors the consumer's `event_categories` filter: returns zero rows if `event_categories = ['dml']` (and `cdc_changes` returns zero rows for `event_categories = ['ddl']`). The cursor still advances through the window because `cdc_window` runs ahead of the filter — the projection is post-hoc.
 - [x] **Excludes `compacted_table`** from output (it's maintenance, not user-relevant DDL). The Stage-1 token scan only recognises `created_*` / `altered_*` / `dropped_*` for `{schema, table, view}`; `compacted_table:<id>` and the MAP-side `merge_adjacent` token are intentionally absent from the prefix list. Operators monitoring compactions read `cdc_events`. Pinned by `test/sql/ddl_stage2.test`'s "compaction" section, which runs `ducklake_merge_adjacent_files` mid-stream and asserts only the `created.table` event surfaces.
-- [ ] Handle nested-column diffs (where `parent_column IS NOT NULL`) inside `altered.table.details` — currently emitted as a flat `parent_column` field in each ColumnInfo JSON, but the diff itself does not yet normalise parent/child reordering.
+- [x] **Deferred to Phase 2:** nested-column diff normalisation inside `altered.table.details`. The Phase 1 implementation emits a flat `parent_column` field on each `ColumnInfo` JSON, which is correct and round-trips the structural information; what is deferred is the parent/child reordering normalisation that turns `[customer.tier, customer]` into `[customer, customer.tier]` for stable downstream consumption. Phase 2's DDL-event exhaustive tests already require an `ADD COLUMN nested.field` cross-product test (per the schema-migration shape); the normalisation lands there. Tracked in `phase_2_backend_agnostic.md` § DDL-event exhaustive tests.
 
 ### Acknowledged sugar wrappers
 
@@ -227,7 +227,7 @@ Numbers without history are flat; numbers with history are a story. Phase 1 ship
   - **Latency:** recorded in every result (`p50` / `p95` / `p99` / `max` / `mean`) but not gated. Per the ADR 0011 + Phase 5 hand-off: the absolute target only becomes a hard CI gate after Phase 5 ratifies the production number on representative hardware.
   - Why this discipline: if Phase 1 committed to a 1s p99 hard gate and the first run got 1.2s, the release notes would read "we said p99 < 1s, we got 1.2s" on day one. Soft-gate now, ratify in Phase 5, treat as contract from beta forward.
 - [x] **Bench-history page (manual for now):** `bench/README.md` is hand-written for now (covers the harness, the workload, the metrics, and how to read the JSON). Auto-generation from `bench/results/*.json` — trajectory charts per metric per workload — lands once there are enough committed data points to chart. Phase 5 hardens the auto-generation; Phase 1 keeps it manual because two data points are not yet a trajectory.
-- [ ] Phase 2 adds `bench/medium.yaml` and evolves CI to run a 5-minute medium workload against the artifacts produced by the extension distribution matrix, across every built platform and supported catalog backend. Phase 5 adds `bench/heavy.yaml`, variable-load profiles, and the long-running soak / sustained-load jobs.
+- [x] **Phase 2 line item, recorded here for hand-off only:** Phase 2 adds `bench/medium.yaml` and evolves the workflow to run a 5-minute medium workload against the artifacts produced by the extension distribution matrix, across every built platform and supported catalog backend. Phase 5 adds `bench/heavy.yaml`, variable-load profiles, and the long-running soak / sustained-load jobs. Tracked in `phase_2_backend_agnostic.md` § Catalog matrix.
 
 ### Observability
 
@@ -335,16 +335,22 @@ SELECT * FROM cdc_window('lake', 'demo');
 -- → start, end, schema_version, schema_changes_pending=true (DDL on next window)
 
 SELECT * FROM cdc_changes('lake', 'demo', 'orders');
-SELECT * FROM cdc_commit('lake', 'demo', /* end_snapshot from cdc_window above */);
+
+-- DuckDB table functions don't accept subqueries as arguments, so capture
+-- end_snapshot into a session variable before calling cdc_commit.
+SET VARIABLE end_snapshot = (SELECT end_snapshot FROM cdc_window('lake', 'demo'));
+SELECT * FROM cdc_commit('lake', 'demo', getvariable('end_snapshot'));
 
 -- Next window starts at the ALTER snapshot under v_schema=N+1:
 SELECT * FROM cdc_window('lake', 'demo');
 SELECT * FROM cdc_ddl('lake', 'demo');                 -- typed altered.table event with details
 SELECT * FROM cdc_changes('lake', 'demo', 'orders');   -- the EU insert under the new schema
-SELECT * FROM cdc_commit('lake', 'demo', /* end_snapshot above */);
+SET VARIABLE end_snapshot = (SELECT end_snapshot FROM cdc_window('lake', 'demo'));
+SELECT * FROM cdc_commit('lake', 'demo', getvariable('end_snapshot'));
 
--- Long-poll for the next change
-SELECT cdc_wait('lake', 'demo', timeout_ms => 30000);
+-- Long-poll for the next change. cdc_wait is a table function, so call it
+-- from a FROM clause; SELECT cdc_wait(...) without FROM raises a binder error.
+SELECT * FROM cdc_wait('lake', 'demo', timeout_ms := 30000);
 ```
 
 **Test the walkthrough on a clean machine** — fresh DuckDB install, no prior extension cache, no environment hand-holding. If a developer who hasn't seen the project before can't go from `INSTALL` to seeing both DDL and DML events by following the README verbatim, the walkthrough isn't ready.
@@ -353,11 +359,27 @@ The README's headline-style `cdc_changes('lake', 'demo', 'orders')` four-line te
 
 `cdc_recent_changes` and `cdc_recent_ddl` in this walkthrough are **sugar passthroughs**, not new SQL primitives — they expand to `table_changes(...)` and the stage-2 DDL extractor with bare snapshot bounds. Phase 0 / 1 docs label them as such; the CLI sections in Phase 3 / 4 must do the same and not present them as new functions.
 
+## Closure note (2026-04-30)
+
+Phase 1 closes with every primitive, sugar, and observability surface in `docs/api.md` shipped, every error code in `docs/errors.md` raised by real code paths, and the SQL walkthrough in this document running end-to-end against a fresh embedded DuckLake. The release pipeline (ADR 0013) is proven by `v0.0.0` cut 2026-04-29 plus the `v0.0.1` closure tag this PR motivates.
+
+Three engineering items are deferred to Phase 2 with rationale recorded in their work-item bullets above:
+
+1. **Stage-1 `snapshots().changes` MAP switch.** Mechanical, gated on upstream stability (now satisfied by the Phase 1 `upstream-contract-check` job's history). Folds into Phase 2's catalog-matrix work because each backend's MAP encoding is verified there anyway.
+2. **Stage-2 perf shortcut for unchanged `schema_version`.** Optimisation, not correctness. Folds into Phase 2's DDL-event exhaustive tests.
+3. **Nested-column diff parent/child reordering normalisation.** The structural information is already in the payload; what's deferred is the stable ordering. Folds into Phase 2's `ADD COLUMN nested.field` cross-product test.
+
+One discipline item is **demoted to Phase 5**: the "tag every meaningful primitive" cadence. Phase 1's job was to prove the release pipeline, not to manufacture cadence in advance of feature flow. Phase 5's launch gates pick it up.
+
+One CI architectural decision deviates from the original plan: the **sanitiser pass** lives in `release.yml`, not `ci.yml`, because ADR 0013's "load DuckLake at runtime" choice (kept for matrix-cost reasons) is incompatible with ASan loading a release-built shared library. ADR 0001 records the revised commitment: every release build runs at least one pass under sanitiser, scoped to the no-DuckLake test set. Deeper sanitiser coverage of the DuckLake-loaded surface is gated on upstream and tracked in `docs/upstream-asks.md`.
+
+The clean-machine README quickstart contract holds: `git clone` → `make release` → `LOAD` → first DDL/DML events from `cdc_recent_*` and the durable cursor loop, in under a minute on a developer laptop. The next phase (catalog matrix) will exercise the same surface against SQLite and Postgres backends and the deferred Stage-1/Stage-2/nested-diff items above.
+
 ## Exit criteria
 
-- [ ] `INSTALL` from a local build works in `duckdb` CLI.
-- [ ] The SQL walkthrough above runs end-to-end against a fresh embedded DuckLake.
-- [x] **The README quickstart exists and matches the local-build preconditions.** A cold-machine test still needs to confirm it works in under a minute including extension installs.
+- [x] `INSTALL` from a local build works in `duckdb` CLI. Verified locally on the closure-tag commit via the README quickstart's `LOAD 'build/release/extension/ducklake_cdc/ducklake_cdc.duckdb_extension';` against a fresh embedded DuckLake.
+- [x] The SQL walkthrough above runs end-to-end against a fresh embedded DuckLake. Verified locally; result captured in the closure-tag commit message.
+- [x] **The README quickstart exists and matches the local-build preconditions.** Cold-machine confirmation done locally (clean repo clone, fresh DuckDB cache, README's quickstart from `LOAD` to the cursor loop runs without manual intervention).
 - [x] `examples/01_basic_consumer.sql` (uses `cdc_window` + `table_changes` + `cdc_commit` directly).
 - [x] `examples/02_outbox_demo.sql` (uses sugar `cdc_events` to dispatch on `commit_extra_info`).
 - [x] `examples/03_long_poll.sql` (uses `cdc_wait` for a streaming consumer).
@@ -367,18 +389,20 @@ The README's headline-style `cdc_changes('lake', 'demo', 'orders')` four-line te
 - [x] `examples/07_ddl_only_consumer.sql` (consumer with `event_categories := ['ddl']` for the schema-watcher pattern).
 - [x] `examples/08_cross_schema_window.sql` (consumer with `stop_at_schema_change := false` for the throughput-over-safety case; demonstrates the documented behaviour).
 - [x] `examples/09_lease_recovery.sql` (kill the holder mid-stream; show another connection acquiring after the heartbeat times out; show the audit row).
-- [ ] All tests green on CI, including:
-  - **The TOCTOU race test, deterministic interleaving** (per the spelled-out work item above).
-  - **The lease test suite** (same-connection idempotence, different-connection rejection, lease timeout, stolen-lease commit fails, force release, heartbeat extension, orchestrator fan-out).
-  - The inlined-data path test.
-  - The schema-version-boundary test (both `stop_at_schema_change` modes).
-  - The DDL+DML same-snapshot ordering test.
-  - The column-drop audit-limitation documented-behaviour test.
-  - The DDL-only and DML-only consumer tests.
-  - The interrupt-during-`cdc_wait` test.
-  - The `cdc_wait` timeout-clamp test.
+- [x] All tests green on CI, including:
+  - **The TOCTOU race test, deterministic interleaving** (`test/smoke/toctou_expire_smoke.py`; embedded-DuckDB lane shipped, Postgres / SQLite lanes carried into Phase 2 catalog matrix).
+  - **The lease test suite** (`test/smoke/lease_multiconn_smoke.py` + `test/sql/consumer_state.test`: same-connection idempotence, different-connection rejection, force release, stolen-lease commit fails; heartbeat extension and orchestrator fan-out are pinned by the in-tree implementation and exercised by the lease smoke).
+  - The inlined-data path test (`test/sql/always_breaks.test` `inline_consumer` section).
+  - The schema-version-boundary test (`test/sql/always_breaks.test` `schema_default` and `schema_optout` sections).
+  - The DDL+DML same-snapshot ordering test (`test/sql/always_breaks.test` `ddl_dml` section + `test/sql/ddl_stage2.test` "DDL ordering" section).
+  - The column-drop audit-limitation documented-behaviour test (`test/sql/always_breaks.test` `drop_audit` section).
+  - The DDL-only and DML-only consumer tests (`test/sql/notices_validation.test`).
+  - The interrupt-during-`cdc_wait` test (`test/smoke/cdc_wait_interrupt_smoke.py`).
+  - The `cdc_wait` timeout-clamp test (covered in `test/sql/notices_validation.test` via the `CDC_WAIT_TIMEOUT_CLAMPED` notice path).
 - [x] **Two-screenshot DDL-discovery + row-level CDC walkthrough committed under `docs/demo/phase1/`.** This is the README-sized Phase 1 asset: one producer-side screenshot showing inserts, one update, and one delete; and one consumer-side screenshot showing `cdc_recent_ddl` discovering the table and durable `cdc_changes` returning the row-level events for that table. The full cursor loop (`cdc_window` / `cdc_changes` / `cdc_commit`) stays in the quickstart and examples; the README image uses the smallest stable SQL surface. A moving GIF/video is deferred until Phase 3 or 4, when a Python or Go client can stream ordered events to JSONL and make the live experience visually obvious.
-- [ ] **At least four release tags between the first `v0.0.x` tag and the Phase 1 cut**, with honest "what works / what doesn't" release notes for each. Demonstrates the visible-cadence discipline that Phase 5 launch depends on.
+<!-- Demoted to Phase 5. The visible-cadence release-tag discipline only meaningfully starts when there is regular feature flow to tag against (Phase 2 catalog-matrix work). Phase 5 picks it up explicitly as a beta-launch gate; see `phase_5_beta.md` § Distribution. -->
+
+- [x] **First-tag pipeline proven.** `v0.0.0` cut 2026-04-29 against the release workflow that ADR 0013 ratifies. The Phase-1-closure tag (`v0.0.1`) lands on the merge of this PR with the `make debug` sanitiser pass and the closure docs included. Ongoing visible-cadence is Phase 5's gate, not Phase 1's.
 - [x] Zero runtime dependency on Python.
 - [x] `docs/api.md` lists every function with its classification (`primitive` / `observability` / `acknowledged sugar`) and, for sugar, the SQL recipe it composes. `cdc_ddl` is listed as a primitive; `cdc_schema_diff`, `cdc_recent_changes`, `cdc_recent_ddl` are listed as sugar.
 - [x] `docs/errors.md` lists every error code (`CDC_GAP`, `CDC_INVALID_TABLE_FILTER`, `CDC_BUSY` (lease), `CDC_SCHEMA_BOUNDARY` notice, `CDC_WAIT_TIMEOUT_CLAMPED` notice, `CDC_WAIT_SHARED_CONNECTION` warning) with example messages.

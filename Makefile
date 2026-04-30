@@ -14,6 +14,15 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 ENABLE_EXTENSION_AUTOLOADING=1
 ENABLE_EXTENSION_AUTOINSTALL=1
 
+# `_NO_DUCKLAKE` set is the subset that does not `INSTALL ducklake; LOAD ducklake;`
+# at runtime. It exists so the sanitiser CI lane (`make debug` + ASan/UBSan
+# default flags) has something to run: the official prebuilt
+# `ducklake.duckdb_extension` is a release build with no sanitiser runtime,
+# and ASan refuses to LOAD a shared library that wasn't built with the
+# matching runtime. Tests in the broader smoke / default sets that do
+# `INSTALL ducklake` therefore can't run on the sanitiser binary; this
+# subset is what does.
+SQL_TEST_SMOKE_NO_DUCKLAKE=test/sql/ducklake_cdc.test
 SQL_TEST_SMOKE=test/sql/ducklake_cdc.test, test/sql/compat_check.test
 SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test
 
@@ -39,7 +48,7 @@ export OVERRIDE_GIT_DESCRIBE
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-.PHONY: prepare_tests test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+.PHONY: prepare_tests test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
 
 # Pre-fetch the official ducklake binary for our DuckDB target into the local
 # extension cache so the `INSTALL ducklake` statement in SQL tests resolves
@@ -54,6 +63,11 @@ prepare_tests:
 			| gunzip > "$(EXT_CACHE_DIR)/ducklake.duckdb_extension.tmp"; \
 		mv "$(EXT_CACHE_DIR)/ducklake.duckdb_extension.tmp" "$(EXT_CACHE_DIR)/ducklake.duckdb_extension"; \
 	fi
+
+# Sanitiser-friendly smoke: no DuckLake LOAD, no `prepare_tests` cache fetch
+# (we don't need the prebuilt). Used by the release-time sanitiser job.
+test_debug_smoke_no_ducklake:
+	./build/debug/$(TEST_PATH) "$(SQL_TEST_SMOKE_NO_DUCKLAKE)"
 
 test_debug_smoke: prepare_tests
 	./build/debug/$(TEST_PATH) "$(SQL_TEST_SMOKE)"

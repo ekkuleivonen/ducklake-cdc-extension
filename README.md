@@ -87,10 +87,16 @@ INSERT INTO lake.orders VALUES (1, 'new');
 SELECT * FROM cdc_consumer_create('lake', 'demo');
 INSERT INTO lake.orders VALUES (2, 'paid');
 
--- The cursor loop in three primitives:
+-- The cursor loop in three primitives. cdc_window and cdc_commit are
+-- table functions, and DuckDB table functions do not accept subqueries
+-- as arguments, so capture end_snapshot into a session variable first.
 SELECT * FROM cdc_window('lake', 'demo');                         -- acquire single-reader window
 SELECT * FROM cdc_changes('lake', 'demo', 'orders');              -- typed DML rows for the window
-SELECT * FROM cdc_commit('lake', 'demo', /* end_snapshot */);     -- advance the cursor
+
+SET VARIABLE end_snapshot = (
+  SELECT end_snapshot FROM cdc_window('lake', 'demo')
+);
+SELECT * FROM cdc_commit('lake', 'demo', getvariable('end_snapshot'));
 ```
 
 That is the durable cursor loop: create a named consumer, acquire a
@@ -102,15 +108,17 @@ returned `end_snapshot`. Consumers that care about schema also call
 For ad-hoc exploration without a cursor, the stateless sugar:
 
 ```sql
-SELECT * FROM cdc_recent_changes('lake', 'orders', since_seconds = 3600);
-SELECT * FROM cdc_recent_ddl('lake', since_seconds = 86400);
+SELECT * FROM cdc_recent_changes('lake', 'orders', since_seconds := 3600);
+SELECT * FROM cdc_recent_ddl('lake', since_seconds := 86400);
 SELECT * FROM cdc_schema_diff('lake', 'orders', /* from */ 0, /* to */ 5);
 ```
 
-Long-poll consumers wrap the loop with `cdc_wait`:
+Long-poll consumers wrap the loop with `cdc_wait`. It is a table
+function returning one BIGINT row (the new snapshot id, or NULL on
+timeout), so always read it from a `FROM` clause:
 
 ```sql
-SELECT cdc_wait('lake', 'demo', timeout_ms = 30000);  -- BIGINT new_snap | NULL on timeout
+SELECT * FROM cdc_wait('lake', 'demo', timeout_ms := 30000);
 ```
 
 Operational dashboards read from `cdc_consumer_stats('lake')` (cursor /

@@ -369,7 +369,9 @@ ADR(s): 0007, 0009.
 ### `cdc_wait`
 
 ```sql
-SELECT cdc_wait(
+-- Table function returning one BIGINT row. Always read it from a FROM
+-- clause; SELECT cdc_wait(...) without FROM raises a binder error.
+SELECT * FROM cdc_wait(
     catalog     VARCHAR,
     consumer    VARCHAR,
     timeout_ms  := 30000   -- BIGINT, hard-capped at 5 min per ADR 0011

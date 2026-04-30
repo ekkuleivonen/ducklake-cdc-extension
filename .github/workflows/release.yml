@@ -99,14 +99,81 @@ jobs:
       ci_tools_version: v1.5.1
       extension_name: ducklake_cdc
 
+  sanitiser-smoke:
+    # Per ADR 0001's sanitiser commitment (revised in the same ADR):
+    # "every release build runs at least one pass under sanitiser." Day-to-day
+    # CI cannot run this — `make debug` enables ASan + UBSan by default
+    # (DuckDB CMake adds -fsanitize=address,undefined when CMAKE_BUILD_TYPE=Debug),
+    # but the official prebuilt `ducklake.duckdb_extension` is a release
+    # binary with no sanitiser runtime, and ASan refuses to LOAD a shared
+    # library whose runtime metadata it doesn't recognise. We therefore
+    # gate the sanitiser pass on release time and run only the no-DuckLake
+    # smoke set (`SQL_TEST_SMOKE_NO_DUCKLAKE` in the Makefile) — exactly
+    # the test/sql files that don't `INSTALL ducklake`. Catches compile-time
+    # UB, init-time UB in the extension's `Load()` path, global-construction
+    # bugs, and the `cdc_version()` hot path. Deeper coverage is gated on
+    # upstream DuckLake building under sanitisers, tracked in
+    # docs/upstream-asks.md.
+    name: Sanitiser smoke (ASan + UBSan, no-DuckLake set)
+    needs: resolve-duckdb-version
+    if: ${{ !inputs.community_pr_only }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-${{ github.ref }}
+          restore-keys: |
+            ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-
+            ci-ccache-sanitiser-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.5
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build (debug, sanitisers on by default)
+        run: |
+          export CCACHE_DIR=~/.ccache
+          ccache -M 2G
+          make debug
+          ccache -s
+
+      - name: Run no-DuckLake SQL smoke under sanitiser
+        env:
+          # Surface ASan / UBSan diagnostics as test failures rather than
+          # silent process aborts. `print_stacktrace=1` makes the report
+          # actually useful when a regression lands.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: make test_debug_smoke_no_ducklake
+
   release:
     name: Tag, release, maintenance branch
-    needs: full-matrix-build
+    needs:
+      - full-matrix-build
+      - sanitiser-smoke
     # Run when either:
-    #   * the matrix gate succeeded (normal release / dry run), OR
-    #   * we're in community_pr_only mode and the matrix was intentionally
-    #     skipped (its result is "skipped", not "success").
-    if: ${{ always() && (needs.full-matrix-build.result == 'success' || (inputs.community_pr_only && needs.full-matrix-build.result == 'skipped')) }}
+    #   * both the matrix and sanitiser gates succeeded (normal release / dry run), OR
+    #   * we're in community_pr_only mode and both gates were intentionally
+    #     skipped (their result is "skipped", not "success").
+    if: ${{ always() && ((needs.full-matrix-build.result == 'success' && needs.sanitiser-smoke.result == 'success') || (inputs.community_pr_only && needs.full-matrix-build.result == 'skipped' && needs.sanitiser-smoke.result == 'skipped')) }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ inputs.version }}

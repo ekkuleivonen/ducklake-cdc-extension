@@ -8,6 +8,14 @@ This phase is deliberately not about reimplementing schema evolution, encryption
 
 ## Work items
 
+### Phase 1 deferrals folded in
+
+These three items were deferred from Phase 1 with rationale captured in the Phase 1 closure note. They are tracked here so the next-phase reviewer doesn't have to cross-reference Phase 1 to find them — each one is reinforced by an existing Phase 2 work item below, but having the deferrals listed up front prevents them from being silently lost.
+
+- [ ] **Stage-1 `snapshots().changes` MAP switch.** Replace the `ducklake_snapshot_changes.changes_made` text scan in `cdc_ddl` Stage 1 with the typed `<lake>.snapshots().changes` MAP form. Lands cleanly inside the catalog matrix work because each backend's MAP encoding is verified there anyway. Reinforced by the matrix-coverage bullets and by `### DDL-event exhaustive tests` below.
+- [ ] **Stage-2 perf shortcut.** When `ducklake_schema_versions` shows no per-relevant-table schema change in the window, skip the column-diff reconstruction for `altered.table`. Reinforced by the bullet at `### DDL-event exhaustive tests` that explicitly tests this skip behaviour per backend.
+- [ ] **Nested-column diff parent/child reordering normalisation.** The Phase 1 `altered.table.details` payload already carries the `parent_column` field on each `ColumnInfo`; what's missing is the stable parent-before-child ordering for downstream consumption. Reinforced by the `ADD COLUMN nested.field` and the cross-product stress test under `### DDL-event exhaustive tests`.
+
 ### Catalog matrix
 
 - [ ] Run the Phase 1 test suite against each DuckLake-supported catalog backend:
