@@ -91,16 +91,19 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Client libraries should hide this by using dedicated wait
   connections.
 
-### H-007: DLQ Semantics
+### H-007: Sink Failure Semantics
 
 - Risk: Failed sink writes, especially failed DDL, need a durable operator flow;
   otherwise a single bad event can either halt work or create a flood of bad
   downstream writes.
-- Status: not handled.
-- Handling: The `__ducklake_cdc_dlq` table schema exists, but helper APIs and
-  DDL-blocks-DML semantics are not shipped.
-- Next action: Do not build a large DLQ system until there is a real sink/client
-  path that needs it.
+- Status: intentionally client-owned.
+- Handling: The extension exposes at-least-once windows and only advances a
+  cursor when `cdc_commit` succeeds. It does not persist a generic DLQ because
+  only the client/sink can classify whether a failure belongs to a window,
+  snapshot, table, DDL event, row, or user callback.
+- Next action: Let the Python client and reference sinks prove retry,
+  idempotency, validation, and quarantine/dead-letter patterns before adding
+  any shared failure persistence.
 
 ### H-008: No Client Libraries or Reference Sinks
 
@@ -238,17 +241,15 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: CDC-owned metadata tables are no longer DuckLake-managed data, so
   DuckLake cleanup, compaction, and snapshot expiration will not prune them.
-  `__ducklake_cdc_audit` can grow without bound, and future DLQ writes would
-  create the same risk for `__ducklake_cdc_dlq`.
+  `__ducklake_cdc_audit` can grow without bound.
 - Status: partially handled.
 - Handling: `__ducklake_cdc_consumers` is bounded by the number of named
-  consumers, and `__ducklake_cdc_dlq` is schema-only in the shipped surface.
-  The current unbounded table is `__ducklake_cdc_audit`, which appends lifecycle
-  and lease-recovery events.
+  consumers. The current unbounded table is `__ducklake_cdc_audit`, which
+  appends lifecycle and lease-recovery events.
 - Notes: Heartbeats and commits should remain updates to
   `__ducklake_cdc_consumers`, not append-only audit events, unless there is a
-  retention policy in place. Any future DLQ write path must ship with
-  acknowledge/replay/prune semantics.
+  retention policy in place. Any future shared failure-persistence path must
+  ship with acknowledge/replay/prune semantics.
 - Next action: Add an explicit maintenance surface, such as audit pruning by
   age and observability for CDC metadata table row counts, before treating
   long-lived catalogs as production-ready.

@@ -29,35 +29,52 @@ What is still intentionally thin:
 
 - No Python client package.
 - No reference sinks.
-- No DLQ helper API beyond the schema created by the extension.
+- No extension-owned DLQ or validation framework. Sink retries, failure
+  classification, quarantine/dead-letter policy, and exactly-once-ish
+  semantics belong in clients and sinks.
 - Backend coverage is smoke-level, not exhaustive certification.
 - Performance numbers are early signal, not production contracts.
 
 ## Direction
 
-### Just Finished: Clean Up the Docs
+### Just Finished: Verify the Extension Surface
 
-The docs have been reduced to the pieces a single weekend maintainer should be
-able to keep current.
+The SQL surface has been checked against the main use cases that motivate the
+project: ad-hoc SQL inspection, managed subscribers, streaming pipeline
+consumers, catalog/schema replication, replay/backfill, and operational
+diagnostics.
 
-What remains:
+Decisions from this pass:
 
-- Keep the README, API reference, examples, roadmap, and hazard log.
-- Keep focused operational docs that explain current behavior.
-- Keep design notes short and tied to shipped metadata/catalog behavior.
-- Keep `INSTALL ducklake_cdc FROM community` working.
+- Keep `cdc_changes`, `cdc_ddl`, and `cdc_events` focused on the current
+  leased consumer window.
+- Add explicit stateless range helpers for bounded replay/export/debug work:
+  `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes`.
+- Add `cdc_doctor` as the common health-check surface for SQL users, support
+  requests, and the future Python client.
+- Treat operational replay as a named-consumer workflow: use a separate
+  backfill consumer when live processing must continue independently.
+- Do not impose a JSON envelope on DuckLake `commit_extra_info`; producers and
+  clients own those conventions.
+- Do not expose an extension-owned DLQ. The extension provides at-least-once
+  replay mechanics; clients and sinks own idempotency, retries, validation,
+  quarantine/dead-letter policy, and external side-effect semantics.
 
-### Now: Verify the Extension Surface
+### Now: TDD the Verified Surface
 
-The next chapter is a couple focused passes on the extension itself.
+The next chapter is implementing the small SQL additions and removals that fell
+out of the surface pass.
 
 Likely work:
 
-- Check that the SQL API covers the use cases that motivated the project.
-- Add targeted tests for hazards that are real and reproducible.
-- Look for simple performance wins in the hot paths.
-- Keep the catalog-matrix smoke small and meaningful.
-- Improve examples where the SQL surface feels awkward.
+- Remove the no-op DLQ table/schema path and any docs that imply extension-owned
+  DLQ semantics.
+- Add tests for `cdc_doctor` diagnostics before implementing the table
+  function.
+- Add tests for stateless range helpers, including gap handling and
+  `to_snapshot := NULL` as current-head sugar.
+- Keep the existing consumer-window semantics crisp: range reads must not
+  acquire leases, apply subscription filters, or move cursors.
 
 ### Next: Python Client
 
@@ -69,8 +86,12 @@ Likely work:
 
 - Explicit iterator + commit API first.
 - A small `tail()` helper once the explicit API feels right.
+- A replay/backfill helper that can create or use a separate consumer for
+  bounded historical work.
 - Stdout/file/webhook-style examples before heavier sinks.
 - Client-side handling for dedicated wait connections and heartbeats.
+- Client-owned retry/idempotency/failure handling. Do not push sink-specific
+  dead-letter semantics back into the extension.
 
 ### Later: Only If Demand Appears
 
@@ -78,7 +99,7 @@ These are not near-term plans:
 
 - Other language clients.
 - Kafka, Redis Streams, or Postgres mirror sinks.
-- Large DLQ machinery.
+- Large validation, quarantine, or DLQ machinery.
 - Long soak-test programs.
 - A full docs site.
 
