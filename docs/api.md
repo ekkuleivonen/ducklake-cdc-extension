@@ -790,8 +790,8 @@ There are two replay modes:
 
 The extension provides at-least-once replay mechanics, not exactly-once
 sink semantics. Clients and sinks own idempotency, retries, validation,
-quarantine/dead-letter policy, and any decision to skip or reprocess
-external side effects.
+quarantine policy, and any decision to skip or reprocess external side
+effects.
 
 ## Storage tables
 

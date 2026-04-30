@@ -98,12 +98,12 @@ go; this file says what can hurt users or maintainers on the way there.
   downstream writes.
 - Status: intentionally client-owned.
 - Handling: The extension exposes at-least-once windows and only advances a
-  cursor when `cdc_commit` succeeds. It does not persist a generic DLQ because
-  only the client/sink can classify whether a failure belongs to a window,
-  snapshot, table, DDL event, row, or user callback.
+  cursor when `cdc_commit` succeeds. It does not persist a generic failure
+  queue because only the client/sink can classify whether a failure belongs to
+  a window, snapshot, table, DDL event, row, or user callback.
 - Next action: Let the Python client and reference sinks prove retry,
-  idempotency, validation, and quarantine/dead-letter patterns before adding
-  any shared failure persistence.
+  idempotency, validation, and quarantine patterns before adding any shared
+  failure persistence.
 
 ### H-008: No Client Libraries or Reference Sinks
 

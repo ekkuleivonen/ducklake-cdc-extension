@@ -42,7 +42,6 @@ namespace duckdb_cdc {
 extern const char *const CONSUMERS_TABLE;
 extern const char *const CONSUMER_SUBSCRIPTIONS_TABLE;
 extern const char *const AUDIT_TABLE;
-extern const char *const DLQ_TABLE;
 extern const char *const STATE_SCHEMA;
 
 extern const int64_t DEFAULT_MAX_SNAPSHOTS;

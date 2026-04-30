@@ -58,9 +58,9 @@ schema renames, and drop + recreate with the same name is a new object that
 does not match the old subscription.
 
 `__ducklake_cdc_audit` records lifecycle actions for operational visibility.
-Sink retries, idempotency, validation, quarantine/dead-letter handling, and
-external side-effect semantics belong in clients and sinks, not in the SQL
-extension state schema.
+Sink retries, idempotency, validation, quarantine handling, and external
+side-effect semantics belong in clients and sinks, not in the SQL extension
+state schema.
 
 ## Read and Commit Stay Separate
 

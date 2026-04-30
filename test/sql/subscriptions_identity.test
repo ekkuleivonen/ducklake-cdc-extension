@@ -96,9 +96,9 @@ SELECT count(*) FROM duckdb_tables()
 WHERE database_name = '__ducklake_metadata_lake'
   AND schema_name = '__ducklake_cdc'
   AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
-                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+                     '__ducklake_cdc_audit');
 ----
-4
+3
 
 query I
 SELECT count(*) FROM duckdb_columns()

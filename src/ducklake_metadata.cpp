@@ -30,7 +30,6 @@ namespace duckdb_cdc {
 const char *const CONSUMERS_TABLE = "__ducklake_cdc_consumers";
 const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_consumer_subscriptions";
 const char *const AUDIT_TABLE = "__ducklake_cdc_audit";
-const char *const DLQ_TABLE = "__ducklake_cdc_dlq";
 const char *const STATE_SCHEMA = "__ducklake_cdc";
 
 const int64_t DEFAULT_MAX_SNAPSHOTS = 100;
@@ -427,7 +426,6 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	       "consumer_name VARCHAR, "
 	       "consumer_id BIGINT NOT NULL, "
 	       "stop_at_schema_change BOOLEAN NOT NULL, "
-	       "dml_blocked_by_failed_ddl BOOLEAN NOT NULL, "
 	       "last_committed_snapshot BIGINT, "
 	       "last_committed_schema_version BIGINT, "
 	       "owner_token UUID, "
@@ -470,25 +468,6 @@ std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
 	       ")";
 }
 
-std::string DlqDdl(const std::string &catalog_name, bool use_state_schema) {
-	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, DLQ_TABLE, use_state_schema) +
-	       " ("
-	       "consumer_name VARCHAR, "
-	       "consumer_id BIGINT, "
-	       "snapshot_id BIGINT, "
-	       "event_kind VARCHAR, "
-	       "table_name VARCHAR, "
-	       "object_kind VARCHAR, "
-	       "object_id BIGINT, "
-	       "rowid BIGINT, "
-	       "change_type VARCHAR, "
-	       "failed_at TIMESTAMP WITH TIME ZONE, "
-	       "attempts INTEGER, "
-	       "last_error VARCHAR, "
-	       "payload VARCHAR"
-	       ")";
-}
-
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
 	CheckCatalogOrThrow(context, catalog_name);
 	duckdb::Connection conn(*context.db);
@@ -498,7 +477,6 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
-	ExecuteChecked(conn, DlqDdl(catalog_name, use_state_schema));
 }
 
 //===--------------------------------------------------------------------===//

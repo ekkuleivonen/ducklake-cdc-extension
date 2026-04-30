@@ -39,8 +39,8 @@ of [DuckLake](https://ducklake.select).
   and Postgres-mirror sinks are not shipped.
 - **Backend coverage is smoke-level.** DuckDB, SQLite, and PostgreSQL
   catalog paths are exercised in CI, but not exhaustively certified.
-- **No extension-owned DLQ.** Sink retries, idempotency, validation,
-  quarantine/dead-letter handling, and exactly-once-ish semantics belong
+- **No extension-owned sink failure queue.** Sink retries, idempotency,
+  validation, quarantine handling, and exactly-once-ish semantics belong
   in clients and sinks.
 - **No `doctor` command.** Operational diagnostics are still manual SQL
   via `cdc_consumer_stats` and `cdc_audit_recent`.

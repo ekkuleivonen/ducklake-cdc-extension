@@ -27,7 +27,7 @@ SELECT count(*) FROM duckdb_tables()
 WHERE database_name = '__ducklake_metadata_lake'
   AND schema_name = '__ducklake_cdc'
   AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
-                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+                     '__ducklake_cdc_audit');
 ----
 0
 
@@ -56,15 +56,15 @@ FROM __ducklake_metadata_lake.ducklake_snapshot;
 ----
 true
 
-# All four catalog-resident state tables now exist.
+# All three catalog-resident state tables now exist.
 query I
 SELECT count(*) FROM duckdb_tables()
 WHERE database_name = '__ducklake_metadata_lake'
   AND schema_name = '__ducklake_cdc'
   AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
-                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+                     '__ducklake_cdc_audit');
 ----
-4
+3
 
 # Listing returns rows in creation order.
 query II

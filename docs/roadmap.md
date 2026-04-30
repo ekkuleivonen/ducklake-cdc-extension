@@ -29,9 +29,9 @@ What is still intentionally thin:
 
 - No Python client package.
 - No reference sinks.
-- No extension-owned DLQ or validation framework. Sink retries, failure
-  classification, quarantine/dead-letter policy, and exactly-once-ish
-  semantics belong in clients and sinks.
+- No extension-owned sink failure queue or validation framework. Sink retries,
+  failure classification, quarantine policy, and exactly-once-ish semantics
+  belong in clients and sinks.
 - Backend coverage is smoke-level, not exhaustive certification.
 - Performance numbers are early signal, not production contracts.
 
@@ -56,9 +56,9 @@ Decisions from this pass:
   backfill consumer when live processing must continue independently.
 - Do not impose a JSON envelope on DuckLake `commit_extra_info`; producers and
   clients own those conventions.
-- Do not expose an extension-owned DLQ. The extension provides at-least-once
-  replay mechanics; clients and sinks own idempotency, retries, validation,
-  quarantine/dead-letter policy, and external side-effect semantics.
+- Do not expose an extension-owned sink failure queue. The extension provides
+  at-least-once replay mechanics; clients and sinks own idempotency, retries,
+  validation, quarantine policy, and external side-effect semantics.
 
 ### Now: TDD the Verified Surface
 
@@ -67,8 +67,8 @@ out of the surface pass.
 
 Likely work:
 
-- Remove the no-op DLQ table/schema path and any docs that imply extension-owned
-  DLQ semantics.
+- Remove the no-op sink-failure table/schema path and any docs that imply
+  extension-owned failure semantics.
 - Add tests for `cdc_doctor` diagnostics before implementing the table
   function.
 - Add tests for stateless range helpers, including gap handling and
@@ -91,7 +91,7 @@ Likely work:
 - Stdout/file/webhook-style examples before heavier sinks.
 - Client-side handling for dedicated wait connections and heartbeats.
 - Client-owned retry/idempotency/failure handling. Do not push sink-specific
-  dead-letter semantics back into the extension.
+  quarantine semantics back into the extension.
 
 ### Later: Only If Demand Appears
 
@@ -99,7 +99,7 @@ These are not near-term plans:
 
 - Other language clients.
 - Kafka, Redis Streams, or Postgres mirror sinks.
-- Large validation, quarantine, or DLQ machinery.
+- Large validation or quarantine machinery.
 - Long soak-test programs.
 - A full docs site.
 
