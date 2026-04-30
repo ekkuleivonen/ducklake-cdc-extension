@@ -8,26 +8,16 @@ This directory contains the test surfaces for `ducklake_cdc`.
 - `upstream/` holds DuckDB/DuckLake contract probes that do not load this extension.
 - `client_py/` is reserved for a future Python client.
 
-The root makefile contains targets for the SQLLogicTests. To run them:
+The root makefile contains local targets for the two useful loops:
 ```bash
-make test
-```
-or 
-```bash
-make test_debug
+make test_local_full       # full SQLLogicTest coverage, release build
+make test_local_sanitizer  # ASan/UBSan smoke, no DuckLake LOAD
 ```
 
-Local debug loops can use narrower targets:
-
-```bash
-make test_debug_smoke    # extension load + DuckLake catalog compatibility
-make test_debug_default  # skips the three slowest integration files
-make test_debug_full     # alias for the full debug SQL suite
-```
-
-The slowest debug files are the broad DuckLake integration fixtures
-(`sql/always_breaks.test`, `sql/consumer_state.test`, and
-`sql/sugar.test`), not intentional sleep/timeout assertions.
+The default/release SQL set intentionally includes every `test/sql/*.test` file
+so PR release CI exercises the full extension surface. Debug builds enable
+ASan/UBSan; they can run only the no-DuckLake smoke because the official
+prebuilt `ducklake.duckdb_extension` is not sanitizer-compatible.
 
 Run Python smoke probes after `make debug`:
 

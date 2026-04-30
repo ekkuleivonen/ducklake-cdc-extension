@@ -24,7 +24,7 @@ ENABLE_EXTENSION_AUTOINSTALL=1
 # subset is what does.
 SQL_TEST_SMOKE_NO_DUCKLAKE=test/sql/ducklake_cdc.test
 SQL_TEST_SMOKE=test/sql/ducklake_cdc.test, test/sql/compat_check.test
-SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test
+SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test, test/sql/subscriptions_identity.test, test/sql/verified_surface_tdd.test, test/sql/consumer_state.test, test/sql/sugar.test, test/sql/always_breaks.test
 
 # DuckLake binary cache layout: ~/.duckdb/extensions/<version>/<platform>/
 # Pre-staging the binary here lets sqllogictest's `INSTALL ducklake` resolve
@@ -48,7 +48,7 @@ export OVERRIDE_GIT_DESCRIBE
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-.PHONY: prepare_tests install-git-hooks test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+.PHONY: prepare_tests install-git-hooks test_local_sanitizer test_local_full test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
 
 install-git-hooks:
 	git config core.hooksPath .githooks
@@ -73,13 +73,28 @@ prepare_tests:
 test_debug_smoke_no_ducklake:
 	./build/debug/$(TEST_PATH) "$(SQL_TEST_SMOKE_NO_DUCKLAKE)"
 
-test_debug_smoke: prepare_tests
-	./build/debug/$(TEST_PATH) "$(SQL_TEST_SMOKE)"
+test_local_sanitizer:
+	$(MAKE) debug
+	$(MAKE) test_debug_smoke_no_ducklake
 
-test_debug_default: prepare_tests
-	./build/debug/$(TEST_PATH) "$(SQL_TEST_DEFAULT)"
+test_local_full:
+	$(MAKE) release
+	$(MAKE) test_release_default
 
-test_debug_full: prepare_tests test_debug
+test_debug_smoke:
+	@echo "test_debug_smoke loads the prebuilt DuckLake extension, which is not sanitizer-compatible."
+	@echo "Run 'make test_local_sanitizer' for ASan/UBSan coverage or 'make test_local_full' for full SQL coverage."
+	@exit 2
+
+test_debug_default:
+	@echo "test_debug_default loads the prebuilt DuckLake extension, which is not sanitizer-compatible."
+	@echo "Run 'make test_local_sanitizer' for ASan/UBSan coverage or 'make test_local_full' for full SQL coverage."
+	@exit 2
+
+test_debug_full:
+	@echo "test_debug_full loads the prebuilt DuckLake extension, which is not sanitizer-compatible."
+	@echo "Run 'make test_local_sanitizer' for ASan/UBSan coverage or 'make test_local_full' for full SQL coverage."
+	@exit 2
 
 test_release_smoke: prepare_tests
 	./build/release/$(TEST_PATH) "$(SQL_TEST_SMOKE)"
