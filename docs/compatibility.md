@@ -134,7 +134,7 @@ next `cdc_*` function.
 The matrix above is per-DuckLake-catalog-schema-version, but the
 project also commits to a backend matrix (DuckDB / SQLite /
 Postgres — DuckLake's three supported metadata backends, see
-`README.md` § "Backend agnostic by construction"). Full CI runs
+`README.md` § "Backend agnostic by construction"). CI runs
 the default DuckDB + SQLite upstream probe from
 `test/upstream/enumerate_changes_map.py`; run the Postgres leg locally
 before changing the committed reference.

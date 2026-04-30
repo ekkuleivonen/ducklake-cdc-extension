@@ -1265,7 +1265,7 @@ All 3 backends (duckdb, postgres, sqlite) emit the same MAP key set for every op
   accordingly.
 - **Backend coverage is explicit.** DuckLake supports three catalog
   backends — DuckDB, SQLite, Postgres — and the upstream probe can run
-  against all three. Full CI runs the DuckDB + SQLite check; run the
+  against all three. CI runs the DuckDB + SQLite check; run the
   Postgres leg before changing the committed reference.
 
 ## Special-type serialization conventions

@@ -164,16 +164,18 @@ DuckDB version pinned in `.github/duckdb-version`.
 | File | Trigger | Purpose |
 | --- | --- | --- |
 | `.github/duckdb-version` | (config, not a workflow) | Single source of truth for the DuckDB target version. Bump this file to move release lines. |
-| `.github/workflows/ci.yml` | `pull_request`, `push` to `main` and `release/**`, `tag v*`, `merge_group`, `workflow_dispatch` | Full DuckDB extension matrix via `extension-ci-tools` reusable workflows, plus `format`/`tidy`, an integration smoke job (Linux debug + SQL tests + Python probes + catalog matrix), and the upstream DuckLake contract check. Aggregator job `CI Pass` is the single status check branch protection requires. |
+| `.github/workflows/ci.yml` | `pull_request`, `push` to `main` and `release/**`, `tag v*`, `merge_group`, `workflow_dispatch` | Day-to-day CI: `format`/`tidy`, a single-platform Linux release build with SQL tests + Python smoke probes, and the upstream DuckLake contract check. Aggregator job `CI Pass` is the single status check branch protection requires. The full DuckDB extension distribution matrix is intentionally not here — it's a release-time gate inside `release.yml`. |
 | `.github/workflows/benchmark.yml` | `workflow_dispatch` only | Manual benchmark run. Downloads the `linux_amd64` extension artifact from a successful CI run and executes the light benchmark workload against the supported official DuckDB release. |
-| `.github/workflows/release.yml` | `workflow_dispatch` only | The release contract above. |
+| `.github/workflows/release.yml` | `workflow_dispatch` only | The release contract above, including the full DuckDB extension distribution matrix as a release gate before tagging. |
 | `.github/release.yml` | (config, not a workflow) | Maps PR labels to changelog sections for auto-generated release notes. |
 
 The previous `light-ci.yml` / `full-ci.yml` split is gone. With DuckLake
 loaded at runtime via `INSTALL ducklake` instead of compiled from source,
-the canonical extension-matrix build is fast enough that there is no
-reason to keep a separate "private" feature-branch tier. A green
-`CI Pass` on every push is the only signal we need.
+day-to-day CI is fast enough on a single platform that there is no
+reason to keep a separate "private" feature-branch tier. The full
+extension distribution matrix only runs at release time, which is the
+only time we actually ship binaries to every platform. A green
+`CI Pass` on every push is the only signal we need day-to-day.
 
 ## Consequences
 

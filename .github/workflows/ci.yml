@@ -1,22 +1,14 @@
 #
-# Single CI pipeline for ducklake_cdc, modelled after duckdb/ducklake's
-# MainDistributionPipeline. Replaces the older light/full split.
+# Day-to-day CI for ducklake_cdc. Runs on every push and PR. Stays cheap on
+# purpose — single-platform Linux release build, format/tidy, smoke probes,
+# and the upstream DuckLake contract check.
 #
-# Runs on every push, every PR, and via manual dispatch:
-#
-#   1. Resolve the DuckDB target version from .github/duckdb-version (one
-#      file to bump when we move release lines).
-#   2. Call duckdb/extension-ci-tools/_extension_distribution.yml — the
-#      same matrix the community-extensions builder uses, so a green run
-#      here matches the community build shape.
-#   3. Call duckdb/extension-ci-tools/_extension_code_quality.yml for
-#      format + tidy.
-#   4. Run our integration smoke job (Linux debug build + SQL tests +
-#      Python smoke probes + catalog matrix). DuckLake/ICU are NOT
-#      compiled here; the test binary auto-installs them at runtime.
-#   5. Run the upstream DuckLake contract check.
-#   6. An aggregator job named `CI Pass` keeps a single status check
-#      name for branch protection.
+# The full DuckDB extension distribution matrix (every OS / arch / Wasm
+# triplet) is intentionally NOT here: it's a release gate inside
+# `release.yml`, since that is the only time we actually ship binaries to
+# every platform. Running the matrix on every PR was ~30 minutes of
+# Actions time per push for no day-to-day signal we don't already get
+# from a Linux build.
 #
 
 name: CI
@@ -48,15 +40,6 @@ jobs:
           sparse-checkout: .github
       - id: read
         run: echo "duckdb_version=$(cat .github/duckdb-version)" >> "$GITHUB_OUTPUT"
-
-  distribution-build:
-    name: Build extension binaries
-    needs: resolve-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1
-    with:
-      duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: v1.5.1
-      extension_name: ducklake_cdc
 
   code-quality-check:
     name: Code Quality Check
@@ -109,10 +92,10 @@ jobs:
           vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
 
       - name: Build (release)
-        # Release build matches DuckLake's CI: no ASAN, so the unittest binary
-        # can LOAD the official prebuilt DuckLake extension at runtime without
-        # the sanitizer-runtime mismatch you get when loading non-ASAN shared
-        # libraries into an ASAN-built host binary.
+        # Release build matches DuckLake's own CI: no ASAN, so the unittest
+        # binary can LOAD the official prebuilt DuckLake extension at runtime
+        # without the sanitizer-runtime mismatch you get when loading
+        # non-ASAN shared libraries into an ASAN-built host binary.
         run: |
           export CCACHE_DIR=~/.ccache
           ccache -M 2G
@@ -120,13 +103,15 @@ jobs:
           ccache -s
 
       - name: SQL tests (smoke + default)
-        run: |
-          # `make prepare_tests` curl-fetches the official ducklake binary into
-          # the local extension cache so sqllogictest's `require ducklake`
-          # passes; we don't go through INSTALL because some debug paths abort
-          # under ASAN. The release build doesn't need that path anyway, but
-          # keeping the same target keeps local + CI flows identical.
-          make test_release_default
+        # `make prepare_tests` (a prerequisite of test_release_*) curls the
+        # official `ducklake.duckdb_extension` for the pinned DuckDB version
+        # into ~/.duckdb/extensions/<version>/<platform>/ so the
+        # `INSTALL ducklake; LOAD ducklake;` in our SQL tests resolves from
+        # disk instead of going over HTTP. Going over HTTP at test time
+        # silently turns failing tests into green-skipped ones via
+        # sqllogictest's default "skip on error_message matching 'HTTP'"
+        # rule, which is the worst kind of CI lie.
+        run: make test_release_default
 
       - name: Python smoke probes
         run: |
@@ -134,6 +119,18 @@ jobs:
           uv run --locked python test/smoke/lease_multiconn_smoke.py
           uv run --locked python test/smoke/cdc_wait_interrupt_smoke.py
           uv run --locked python test/smoke/toctou_expire_smoke.py
+
+      # Republish the built ducklake_cdc.duckdb_extension under the same
+      # name the full distribution matrix used to produce, so benchmark.yml
+      # (and any other workflow that wants a binary from a successful CI
+      # run) keeps working without rebuilding from source.
+      - name: Upload linux_amd64 extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ducklake_cdc-${{ needs.resolve-duckdb-version.outputs.duckdb_version }}-extension-linux_amd64
+          path: build/release/extension/ducklake_cdc/ducklake_cdc.duckdb_extension
+          if-no-files-found: error
+          retention-days: 14
 
       # NOTE: catalog_matrix_smoke is currently flagged for follow-up — its
       # post-DDL `cdc_changes` assertion needs the schema-evolution path to
@@ -166,7 +163,6 @@ jobs:
     name: CI Pass
     runs-on: ubuntu-latest
     needs:
-      - distribution-build
       - code-quality-check
       - integration-smoke
       - upstream-contract-check
@@ -174,17 +170,14 @@ jobs:
     steps:
       - name: Verify all required jobs succeeded
         env:
-          BUILD_RESULT: ${{ needs.distribution-build.result }}
           QUALITY_RESULT: ${{ needs.code-quality-check.result }}
           INTEGRATION_RESULT: ${{ needs.integration-smoke.result }}
           UPSTREAM_RESULT: ${{ needs.upstream-contract-check.result }}
         run: |
-          echo "distribution-build:      $BUILD_RESULT"
           echo "code-quality-check:      $QUALITY_RESULT"
           echo "integration-smoke:       $INTEGRATION_RESULT"
           echo "upstream-contract-check: $UPSTREAM_RESULT"
-          if [[ "$BUILD_RESULT" != "success" \
-              || "$QUALITY_RESULT" != "success" \
+          if [[ "$QUALITY_RESULT" != "success" \
               || "$INTEGRATION_RESULT" != "success" \
               || "$UPSTREAM_RESULT" != "success" ]]; then
             echo "::error::CI did not pass."
