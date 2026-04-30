@@ -6,7 +6,7 @@
 // Implementation of the observability surface: cdc_consumer_stats and
 // cdc_audit_recent. These functions are read-only views over the same
 // state tables `consumer.cpp` writes to: the consumer-state row for
-// stats (cursor / lag / lease / unresolved tables) and the audit log
+// stats (cursor / lag / lease / subscription health) and the audit log
 // for cdc_audit_recent.
 //===----------------------------------------------------------------------===//
 

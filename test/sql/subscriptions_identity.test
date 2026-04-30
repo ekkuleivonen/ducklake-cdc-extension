@@ -100,6 +100,15 @@ WHERE database_name = '__ducklake_metadata_lake'
 ----
 4
 
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE database_name = '__ducklake_metadata_lake'
+  AND schema_name = '__ducklake_cdc'
+  AND table_name = '__ducklake_cdc_consumers'
+  AND column_name IN ('tables', 'change_types', 'event_categories');
+----
+0
+
 # create_requires_subscriptions: omitted subscriptions is rejected.
 statement error
 SELECT * FROM cdc_consumer_create('lake', 'missing_subs', start_at := getvariable('start_snapshot'));
@@ -118,24 +127,6 @@ SELECT * FROM cdc_consumer_create(
 );
 ----
 subscriptions
-
-# create_rejects_legacy_tables_arg: legacy table-name filter arguments are removed from the create API.
-statement error
-SELECT * FROM cdc_consumer_create('lake', 'legacy_tables', start_at := getvariable('start_snapshot'), tables := ['sales.orders']);
-----
-tables
-
-# create_rejects_legacy_change_types_arg: legacy change_types argument is removed from the create API.
-statement error
-SELECT * FROM cdc_consumer_create('lake', 'legacy_change_types', start_at := getvariable('start_snapshot'), change_types := ['insert']);
-----
-change_types
-
-# create_rejects_legacy_event_categories_arg: legacy event_categories argument is removed from the create API.
-statement error
-SELECT * FROM cdc_consumer_create('lake', 'legacy_events', start_at := getvariable('start_snapshot'), event_categories := ['dml']);
-----
-event_categories
 
 # create_table_by_name_resolves_identity: table name sugar resolves to stable schema_id/table_id.
 query I

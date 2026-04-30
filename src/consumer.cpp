@@ -179,8 +179,7 @@ void MaybeEmitWaitSharedConnectionWarning(duckdb::ClientContext &context, int64_
 	out << "CDC_WAIT_SHARED_CONNECTION: cdc_wait holds this DuckDB connection for up to " << timeout_ms
 	    << "ms. Calling it from a connection that also serves other queries (a pool handle, a "
 	       "shared notebook session, an HTTP request handler) can starve them. Hold a dedicated "
-	       "connection for cdc_wait. The Python and Go clients open one for you internally; "
-	       "SQL-CLI users must do this themselves. See docs/operational/wait.md.";
+	       "connection for cdc_wait. SQL-CLI users must do this themselves. See docs/api.md#cdc_wait.";
 	duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, out.str());
 }
 
@@ -280,29 +279,6 @@ duckdb::Value StructChild(const duckdb::Value &value, const std::string &field_n
 	return duckdb::Value();
 }
 
-std::vector<RawSubscriptionInput> SubscriptionParameter(duckdb::TableFunctionBindInput &input, bool &specified) {
-	const auto value = NamedParameterValue(input, "subscriptions", specified);
-	std::vector<RawSubscriptionInput> subscriptions;
-	if (!specified) {
-		return subscriptions;
-	}
-	for (const auto &child : duckdb::ListValue::GetChildren(value)) {
-		if (child.IsNull()) {
-			throw duckdb::InvalidInputException("cdc_consumer_create subscriptions entries must be non-NULL structs");
-		}
-		RawSubscriptionInput sub;
-		sub.scope_kind = ValueStringOrEmpty(StructChild(child, "scope_kind"));
-		sub.schema_name = StructChild(child, "schema_name");
-		sub.table_name = StructChild(child, "table_name");
-		sub.schema_id = StructChild(child, "schema_id");
-		sub.table_id = StructChild(child, "table_id");
-		sub.event_category = StructChild(child, "event_category");
-		sub.change_type = StructChild(child, "change_type");
-		subscriptions.push_back(std::move(sub));
-	}
-	return subscriptions;
-}
-
 duckdb::unique_ptr<duckdb::FunctionData> ConsumerCreateBind(duckdb::ClientContext &context,
                                                             duckdb::TableFunctionBindInput &input,
                                                             duckdb::vector<duckdb::LogicalType> &return_types,
@@ -336,116 +312,6 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerCreateBind(duckdb::ClientContex
 	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
 	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 	return std::move(result);
-}
-
-//! Build a SQL literal for the portable on-disk representation of a
-//! per-consumer filter list. The sibling metadata-state tables store
-//! repeated strings as JSON text because SQLite metadata catalogs do not
-//! preserve DuckDB LIST columns through the scanner layer.
-std::string BuildVarcharListLiteral(const std::vector<std::string> &values, bool specified) {
-	if (!specified || values.empty()) {
-		return "NULL";
-	}
-	return QuoteLiteral(JsonStringArray(values));
-}
-
-void ValidateTablesFilterOrThrow(duckdb::Connection &conn, const std::string &catalog_name,
-                                 const std::string &consumer_name, const std::vector<std::string> &tables,
-                                 int64_t resolved_snapshot) {
-	if (tables.empty()) {
-		throw duckdb::InvalidInputException(
-		    "CDC_INVALID_TABLE_FILTER: consumer '%s' was created with an empty tables list. Either omit tables "
-		    "to take everything, or supply at least one fully-qualified <schema>.<table> name.",
-		    consumer_name);
-	}
-	auto existing =
-	    conn.Query("SELECT s.schema_name || '.' || t.table_name FROM " + MetadataTable(catalog_name, "ducklake_table") +
-	               " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") + " s USING (schema_id) " +
-	               " WHERE t.begin_snapshot <= " + std::to_string(resolved_snapshot) +
-	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(resolved_snapshot) + ")");
-	std::unordered_set<std::string> existing_set;
-	if (existing && !existing->HasError()) {
-		for (duckdb::idx_t i = 0; i < existing->RowCount(); ++i) {
-			if (!existing->GetValue(0, i).IsNull()) {
-				existing_set.insert(existing->GetValue(0, i).ToString());
-			}
-		}
-	}
-	std::vector<std::string> missing;
-	for (const auto &name : tables) {
-		if (existing_set.find(name) == existing_set.end()) {
-			missing.push_back(name);
-		}
-	}
-	if (missing.empty()) {
-		return;
-	}
-	std::ostringstream supplied;
-	for (size_t i = 0; i < tables.size(); ++i) {
-		if (i > 0) {
-			supplied << ", ";
-		}
-		supplied << "'" << tables[i] << "'";
-	}
-	std::ostringstream missing_list;
-	for (size_t i = 0; i < missing.size(); ++i) {
-		if (i > 0) {
-			missing_list << ", ";
-		}
-		missing_list << "'" << missing[i] << "'";
-	}
-	std::ostringstream message;
-	message << "CDC_INVALID_TABLE_FILTER: consumer '" << consumer_name << "' was created with tables := ["
-	        << supplied.str() << "] but " << missing_list.str() << " do not exist in the catalog at snapshot "
-	        << resolved_snapshot << ". Either: correct the table name and retry cdc_consumer_create, or omit "
-	        << "the missing table; if it is created later, recreate the consumer with start_at => "
-	        << "<its-creation-snapshot>. Tables in the lake at snapshot " << resolved_snapshot << ": "
-	        << ListTablesAtSnapshot(conn, catalog_name, resolved_snapshot);
-	throw duckdb::InvalidInputException(message.str());
-}
-
-void ValidateChangeTypesOrThrow(const std::string &consumer_name, const std::vector<std::string> &change_types) {
-	// DuckLake's `table_changes()` emits `update_postimage` /
-	// `update_preimage` rather than `update_image`. The allowed set
-	// here mirrors the literal `change_type` values DuckLake produces,
-	// so a consumer's filter can be passed straight through to the
-	// downstream `WHERE change_type IN (...)` clause without a
-	// translation layer.
-	static const std::unordered_set<std::string> ALLOWED = {"insert", "update_postimage", "update_preimage", "delete"};
-	if (change_types.empty()) {
-		throw duckdb::InvalidInputException(
-		    "cdc_consumer_create: consumer '%s' was created with an empty change_types list. Omit "
-		    "change_types to take all four (insert / update_postimage / update_preimage / delete), or supply "
-		    "a non-empty subset.",
-		    consumer_name);
-	}
-	for (const auto &kind : change_types) {
-		if (ALLOWED.find(kind) == ALLOWED.end()) {
-			throw duckdb::InvalidInputException(
-			    "cdc_consumer_create: consumer '%s' has invalid change_types entry '%s'. Allowed values: "
-			    "insert, update_postimage, update_preimage, delete.",
-			    consumer_name, kind);
-		}
-	}
-}
-
-void ValidateEventCategoriesOrThrow(const std::string &consumer_name,
-                                    const std::vector<std::string> &event_categories) {
-	static const std::unordered_set<std::string> ALLOWED = {"dml", "ddl"};
-	if (event_categories.empty()) {
-		throw duckdb::InvalidInputException(
-		    "cdc_consumer_create: consumer '%s' was created with an empty event_categories list. Omit "
-		    "event_categories to take both (dml + ddl), or supply a non-empty subset.",
-		    consumer_name);
-	}
-	for (const auto &category : event_categories) {
-		if (ALLOWED.find(category) == ALLOWED.end()) {
-			throw duckdb::InvalidInputException(
-			    "cdc_consumer_create: consumer '%s' has invalid event_categories entry '%s'. Allowed values: "
-			    "dml, ddl.",
-			    consumer_name, category);
-		}
-	}
 }
 
 std::string QualifyTableInput(const std::string &table_name, const duckdb::Value &schema_name) {
@@ -727,12 +593,11 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		ExecuteChecked(conn, "INSERT INTO " + consumers +
 		                         " (consumer_name, consumer_id, last_committed_snapshot, "
 		                         "last_committed_schema_version, created_at, created_by, updated_at, "
-		                         "lease_interval_seconds, stop_at_schema_change, dml_blocked_by_failed_ddl, "
-		                         "tables, change_types, event_categories) VALUES (" +
+		                         "lease_interval_seconds, stop_at_schema_change, dml_blocked_by_failed_ddl) VALUES (" +
 		                         quoted_name + ", " + std::to_string(consumer_id) + ", " +
 		                         std::to_string(resolved_snapshot) + ", " + std::to_string(schema_version) +
 		                         ", now(), " + actor_sql + ", now(), 60, " +
-		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", TRUE, NULL, NULL, NULL)");
+		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", TRUE)");
 		for (size_t i = 0; i < subscriptions.size(); ++i) {
 			const auto &sub = subscriptions[i];
 			ExecuteChecked(conn, "INSERT INTO " + subscriptions_table +
@@ -1542,8 +1407,7 @@ ConsumerRow LoadConsumerOrThrow(duckdb::Connection &conn, const std::string &cat
 	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
 	auto result = conn.Query("SELECT consumer_name, consumer_id, last_committed_snapshot, "
 	                         "last_committed_schema_version, owner_token, owner_acquired_at, owner_heartbeat_at, "
-	                         "lease_interval_seconds, tables, change_types, event_categories, "
-	                         "stop_at_schema_change FROM " +
+	                         "lease_interval_seconds, stop_at_schema_change FROM " +
 	                         consumers + " WHERE consumer_name = " + QuoteLiteral(consumer_name) + " LIMIT 1");
 	if (!result || result->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, result ? result->GetError() : "consumer lookup failed");
@@ -1562,42 +1426,9 @@ ConsumerRow LoadConsumerOrThrow(duckdb::Connection &conn, const std::string &cat
 	row.owner_acquired_at = result->GetValue(5, 0);
 	row.owner_heartbeat_at = result->GetValue(6, 0);
 	row.lease_interval_seconds = result->GetValue(7, 0).GetValue<int64_t>();
-	row.tables = StringListValue(result->GetValue(8, 0));
-	row.change_types = StringListValue(result->GetValue(9, 0));
-	row.event_categories = StringListValue(result->GetValue(10, 0));
-	const auto stop_value = result->GetValue(11, 0);
+	const auto stop_value = result->GetValue(8, 0);
 	row.stop_at_schema_change = stop_value.IsNull() ? true : stop_value.GetValue<bool>();
 	return row;
-}
-
-std::unordered_set<std::string> CollectFilterTables(const duckdb::Value &tables_value) {
-	std::unordered_set<std::string> filter_tables;
-	if (tables_value.IsNull()) {
-		return filter_tables;
-	}
-	const auto normalized = StringListValue(tables_value);
-	for (const auto &child : duckdb::ListValue::GetChildren(normalized)) {
-		if (child.IsNull()) {
-			continue;
-		}
-		filter_tables.insert(child.ToString());
-	}
-	return filter_tables;
-}
-
-std::vector<std::string> CollectChangeTypes(const duckdb::Value &change_types_value) {
-	std::vector<std::string> change_types;
-	if (change_types_value.IsNull()) {
-		return change_types;
-	}
-	const auto normalized = StringListValue(change_types_value);
-	for (const auto &child : duckdb::ListValue::GetChildren(normalized)) {
-		if (child.IsNull()) {
-			continue;
-		}
-		change_types.push_back(child.ToString());
-	}
-	return change_types;
 }
 
 std::string CurrentQualifiedTableName(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,

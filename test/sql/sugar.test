@@ -143,7 +143,7 @@ SELECT count(*) FROM cdc_events('lake', 'orders_events');
 
 # cdc_changes: dynamic schema discovered from <lake>.table_changes(...).
 # Returns one row per row-level change (insert / update_preimage /
-# update_postimage / delete) with the consumer's change_types filter
+# update_postimage / delete) with the consumer's subscription change_type
 # applied as a WHERE clause.
 statement ok
 SELECT * FROM cdc_consumer_create(
@@ -181,7 +181,7 @@ SELECT count(DISTINCT next_snapshot_id) FROM cdc_changes('lake', 'orders_consume
 ----
 1
 
-# Setting change_types narrows the stream. No implicit update_preimage
+# Setting subscription change_type narrows the stream. No implicit update_preimage
 # filtering - if the consumer asked for it, it gets it; otherwise it
 # doesn't.
 statement ok

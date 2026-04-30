@@ -51,6 +51,15 @@ def quote_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def catalog_all_subscription_arg() -> str:
+    return (
+        "subscriptions := ["
+        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
+        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
+        "]"
+    )
+
+
 def require_rows(conn: duckdb.DuckDBPyConnection, sql: str) -> list[Any]:
     try:
         return conn.execute(sql).fetchall()
@@ -148,7 +157,10 @@ def scalar(conn: duckdb.DuckDBPyConnection, sql: str) -> Any:
 def run_demo_flow(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
     consumer = f"matrix_demo_{backend}"
     require_ok(conn, "CREATE TABLE lake.orders(id INTEGER, amount INTEGER)")
-    require_ok(conn, f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)})")
+    require_ok(
+        conn,
+        f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)}, {catalog_all_subscription_arg()})",
+    )
     require_ok(conn, "INSERT INTO lake.orders VALUES (1, 100), (2, 200)")
 
     window = require_rows(conn, f"SELECT end_snapshot, has_changes FROM cdc_window('lake', {quote_string(consumer)})")
@@ -220,7 +232,10 @@ def run_lease_flow(config: BackendConfig, cdc_extension: Path) -> None:
         a = conn.cursor()
         b = conn.cursor()
         require_ok(a, "CREATE TABLE lake.lease_probe(id INTEGER)")
-        require_ok(a, f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)})")
+        require_ok(
+            a,
+            f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)}, {catalog_all_subscription_arg()})",
+        )
         require_ok(a, "INSERT INTO lake.lease_probe VALUES (1)")
         end_snapshot = scalar(a, f"SELECT end_snapshot FROM cdc_window('lake', {quote_string(consumer)})")
         require_error(b, f"SELECT * FROM cdc_window('lake', {quote_string(consumer)})", "CDC_BUSY")

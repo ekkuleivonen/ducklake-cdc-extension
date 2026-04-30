@@ -96,7 +96,7 @@ bool ParseQualifiedNameToken(const std::string &token, const std::string &prefix
 //! name as of `snapshot_id`. Returns the empty string for tokens that do
 //! not name a single user table (schema-level DDL, view changes, anything
 //! we can't or shouldn't resolve to a table). Used by `cdc_events` to
-//! filter snapshots against the consumer's `tables` filter.
+//! filter snapshots against subscribed table identities.
 std::string TableQualifiedNameForToken(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                                        const std::string &token) {
 	std::string schema_name;

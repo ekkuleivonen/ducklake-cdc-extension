@@ -78,7 +78,7 @@ SELECT count(*) FROM cdc_changes('lake_inline', 'inline_consumer', 'orders');
 
 # -----------------------------------------------------------------------------
 # All four change types pass through unfiltered. Insert / update / delete a
-# row; the default consumer (change_types := NULL) sees four events:
+# row; a wildcard DML subscription sees four events:
 # insert, update_preimage, update_postimage, delete. No implicit
 # update_preimage filtering — that's the project's contract.
 # -----------------------------------------------------------------------------
@@ -332,7 +332,7 @@ true
 # Column-drop audit limitation, documented behaviour. ALTER TABLE DROP
 # COLUMN + DELETE in one snapshot. cdc_changes returns the deletes WITHOUT
 # the dropped column's value. We assert this is what happens (so we don't
-# silently regress) and link to docs/operational/audit-limitations.md.
+# silently regress).
 # -----------------------------------------------------------------------------
 
 statement ok

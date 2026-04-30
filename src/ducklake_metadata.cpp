@@ -86,82 +86,6 @@ std::string TrimCopy(const std::string &value) {
 	return value.substr(start, end - start);
 }
 
-std::string JsonStringArray(const std::vector<std::string> &values) {
-	std::ostringstream out;
-	out << "[";
-	for (size_t i = 0; i < values.size(); ++i) {
-		if (i > 0) {
-			out << ",";
-		}
-		out << "\"" << JsonEscape(values[i]) << "\"";
-	}
-	out << "]";
-	return out.str();
-}
-
-std::vector<std::string> ParseStringArray(const std::string &input) {
-	std::vector<std::string> values;
-	const auto text = TrimCopy(input);
-	if (text.empty() || text == "NULL") {
-		return values;
-	}
-	if (text.front() != '[' || text.back() != ']') {
-		values.push_back(text);
-		return values;
-	}
-	size_t i = 1;
-	while (i + 1 < text.size()) {
-		while (i + 1 < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',')) {
-			i++;
-		}
-		if (i + 1 >= text.size()) {
-			break;
-		}
-		if (text[i] == '"') {
-			i++;
-			std::ostringstream value;
-			while (i < text.size()) {
-				const auto c = text[i++];
-				if (c == '\\' && i < text.size()) {
-					value << text[i++];
-					continue;
-				}
-				if (c == '"') {
-					break;
-				}
-				value << c;
-			}
-			values.push_back(value.str());
-			continue;
-		}
-		const auto comma = text.find(',', i);
-		const auto end = comma == std::string::npos ? text.size() - 1 : comma;
-		const auto value = TrimCopy(text.substr(i, end - i));
-		if (!value.empty()) {
-			values.push_back(value);
-		}
-		if (comma == std::string::npos) {
-			break;
-		}
-		i = comma + 1;
-	}
-	return values;
-}
-
-duckdb::Value StringListValue(const duckdb::Value &value) {
-	if (value.IsNull()) {
-		return duckdb::Value();
-	}
-	if (value.type().id() == duckdb::LogicalTypeId::LIST) {
-		return value;
-	}
-	duckdb::vector<duckdb::Value> children;
-	for (const auto &entry : ParseStringArray(value.ToString())) {
-		children.push_back(duckdb::Value(entry));
-	}
-	return duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, children);
-}
-
 bool StartsWith(const std::string &value, const std::string &prefix) {
 	return value.rfind(prefix, 0) == 0;
 }
@@ -379,30 +303,6 @@ void EnsureSnapshotExistsOrGap(duckdb::Connection &conn, const std::string &cata
 	    consumer_name);
 }
 
-//! Build the human-readable list of qualified table names that exist at
-//! `snapshot_id`, used to fill out the `CDC_INVALID_TABLE_FILTER`
-//! reference message per docs/errors.md ("Tables in the lake at
-//! snapshot N: ..."). Empty list ⇒ "(no tables)".
-std::string ListTablesAtSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
-	auto result =
-	    conn.Query("SELECT s.schema_name || '.' || t.table_name FROM " + MetadataTable(catalog_name, "ducklake_table") +
-	               " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-	               " s USING (schema_id) WHERE t.begin_snapshot <= " + std::to_string(snapshot_id) +
-	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) + ") ORDER BY 1");
-	if (!result || result->HasError()) {
-		return "(unable to enumerate tables)";
-	}
-	std::ostringstream out;
-	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
-		if (i > 0) {
-			out << ", ";
-		}
-		out << result->GetValue(0, i).ToString();
-	}
-	const auto rendered = out.str();
-	return rendered.empty() ? "(no tables)" : rendered;
-}
-
 //===--------------------------------------------------------------------===//
 // Structural schema-change predicates
 //===--------------------------------------------------------------------===//
@@ -526,9 +426,6 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	       " ("
 	       "consumer_name VARCHAR, "
 	       "consumer_id BIGINT NOT NULL, "
-	       "tables VARCHAR, "
-	       "change_types VARCHAR, "
-	       "event_categories VARCHAR, "
 	       "stop_at_schema_change BOOLEAN NOT NULL, "
 	       "dml_blocked_by_failed_ddl BOOLEAN NOT NULL, "
 	       "last_committed_snapshot BIGINT, "

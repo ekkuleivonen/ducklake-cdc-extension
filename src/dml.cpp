@@ -285,13 +285,6 @@ bool ConsumerHasDmlSubscriptions(const std::vector<ConsumerSubscriptionRow> &sub
 	return false;
 }
 
-std::string DuckLakeTableChangesName(const std::string &catalog_name, const std::string &table_name) {
-	if (table_name.rfind(catalog_name + ".", 0) == 0) {
-		return table_name;
-	}
-	return catalog_name + "." + table_name;
-}
-
 std::pair<std::string, std::string> SplitQualifiedTableName(const std::string &table_name) {
 	const auto dot = table_name.find('.');
 	if (dot == std::string::npos) {

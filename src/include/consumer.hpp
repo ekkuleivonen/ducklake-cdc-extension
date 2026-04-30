@@ -20,15 +20,13 @@
 #include "duckdb.hpp"
 
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace duckdb_cdc {
 
 //! Single row from the `__ducklake_cdc_consumers` state table, normalised
-//! into typed fields. List-typed columns (`tables`, `change_types`,
-//! `event_categories`) are eagerly materialised into LIST values via
-//! `StringListValue` so callers do not need to re-parse the on-disk JSON.
+//! into typed fields. Routing intent lives in
+//! `__ducklake_cdc_consumer_subscriptions`, not on this row.
 struct ConsumerRow {
 	std::string consumer_name;
 	int64_t consumer_id;
@@ -38,9 +36,6 @@ struct ConsumerRow {
 	duckdb::Value owner_acquired_at;
 	duckdb::Value owner_heartbeat_at;
 	int64_t lease_interval_seconds;
-	duckdb::Value tables;
-	duckdb::Value change_types;
-	duckdb::Value event_categories;
 	bool stop_at_schema_change = true;
 };
 
@@ -76,15 +71,6 @@ struct CdcWindowData : public duckdb::TableFunctionData {
 //! consumer does not exist in the catalog's state table.
 ConsumerRow LoadConsumerOrThrow(duckdb::Connection &conn, const std::string &catalog_name,
                                 const std::string &consumer_name);
-
-//! Normalise the consumer's `tables` list value into a hash set for
-//! per-snapshot membership checks. NULL / empty list -> empty set, which
-//! every caller interprets as "no filter; take everything".
-std::unordered_set<std::string> CollectFilterTables(const duckdb::Value &tables_value);
-
-//! Normalise the consumer's `change_types` list into a vector. NULL -> empty
-//! vector, which callers interpret as "no filter; take all DML kinds".
-std::vector<std::string> CollectChangeTypes(const duckdb::Value &change_types_value);
 
 //! Load normalized subscription rows with current-name and status decoration.
 std::vector<ConsumerSubscriptionRow> LoadConsumerSubscriptions(duckdb::Connection &conn,

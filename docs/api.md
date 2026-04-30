@@ -695,6 +695,6 @@ not shipped yet.
 
 - [Design notes](./design.md)
 - [Errors](./errors.md)
-- [Lease operations](./operational/lease.md)
-- [Wait operations](./operational/wait.md)
+- [`cdc_wait`](#cdc_wait)
+- [`cdc_consumer_stats`](#cdc_consumer_stats)
 - [Hazard log](./hazard-log.md)

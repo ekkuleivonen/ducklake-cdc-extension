@@ -64,12 +64,9 @@ std::string QuoteLiteral(const std::string &value);
 //===--------------------------------------------------------------------===//
 
 std::string JsonEscape(const std::string &value);
-std::string JsonStringArray(const std::vector<std::string> &values);
 std::string JsonValue(const duckdb::Value &value);
 std::string JsonOptionalString(const duckdb::Value &v);
 std::string TrimCopy(const std::string &value);
-std::vector<std::string> ParseStringArray(const std::string &input);
-duckdb::Value StringListValue(const duckdb::Value &value);
 bool StartsWith(const std::string &value, const std::string &prefix);
 bool TryParseInt64(const std::string &input, int64_t &out);
 
@@ -108,7 +105,6 @@ int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_
                            int64_t current_snapshot);
 void EnsureSnapshotExistsOrGap(duckdb::Connection &conn, const std::string &catalog_name,
                                const std::string &consumer_name, int64_t snapshot_id);
-std::string ListTablesAtSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id);
 
 //===--------------------------------------------------------------------===//
 // Structural schema-change predicates
