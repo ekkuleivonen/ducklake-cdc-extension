@@ -3,7 +3,10 @@
 #include "ducklake_cdc_extension.hpp"
 
 #include "compat_check.hpp"
-#include "consumer_state.hpp"
+#include "consumer.hpp"
+#include "ddl.hpp"
+#include "dml.hpp"
+#include "stats.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -33,7 +36,16 @@ inline void CdcVersionScalarFun(DataChunk &args, ExpressionState &state, Vector 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto cdc_version_function = ScalarFunction("cdc_version", {}, LogicalType::VARCHAR, CdcVersionScalarFun);
 	loader.RegisterFunction(cdc_version_function);
-	duckdb_cdc::RegisterConsumerStateFunctions(loader);
+	// Function registration is split across the four CDC domains:
+	//   - consumer: lifecycle (create/reset/drop/list/force_release/
+	//     heartbeat) + cursor primitives (window/commit/wait).
+	//   - ddl: schema-change reads (cdc_ddl, cdc_recent_ddl, cdc_schema_diff).
+	//   - dml: row-level reads (cdc_events, cdc_changes, cdc_recent_changes).
+	//   - stats: observability (cdc_consumer_stats, cdc_audit_recent).
+	duckdb_cdc::RegisterConsumerFunctions(loader);
+	duckdb_cdc::RegisterDdlFunctions(loader);
+	duckdb_cdc::RegisterDmlFunctions(loader);
+	duckdb_cdc::RegisterStatsFunctions(loader);
 
 	// Best-effort catalog-version compatibility probe. If a DuckLake
 	// catalog is already attached at LOAD time, every incompatible one

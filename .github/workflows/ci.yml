@@ -141,7 +141,7 @@ jobs:
         # instead of mirroring `ReadWindow`'s actual end-snapshot computation,
         # so the bind could pick the wrong column set when schema boundaries
         # truncated the runtime range. The probe now mirrors `ReadWindow`
-        # read-only; see `CdcChangesBind` in `src/consumer_state.cpp`.
+        # read-only; see `CdcChangesBind` in `src/dml.cpp`.
         run: |
           docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
           trap 'docker compose -f test/catalog_matrix/docker-compose.yml down -v' EXIT

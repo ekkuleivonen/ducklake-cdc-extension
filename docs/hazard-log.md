@@ -233,3 +233,22 @@ go; this file says what can hurt users or maintainers on the way there.
   catalogs.
 - Next action: Add an upgrade test that starts from the old DuckLake-table
   layout.
+
+### H-018: Metadata State Retention
+
+- Risk: CDC-owned metadata tables are no longer DuckLake-managed data, so
+  DuckLake cleanup, compaction, and snapshot expiration will not prune them.
+  `__ducklake_cdc_audit` can grow without bound, and future DLQ writes would
+  create the same risk for `__ducklake_cdc_dlq`.
+- Status: partially handled.
+- Handling: `__ducklake_cdc_consumers` is bounded by the number of named
+  consumers, and `__ducklake_cdc_dlq` is schema-only in the shipped surface.
+  The current unbounded table is `__ducklake_cdc_audit`, which appends lifecycle
+  and lease-recovery events.
+- Notes: Heartbeats and commits should remain updates to
+  `__ducklake_cdc_consumers`, not append-only audit events, unless there is a
+  retention policy in place. Any future DLQ write path must ship with
+  acknowledge/replay/prune semantics.
+- Next action: Add an explicit maintenance surface, such as audit pruning by
+  age and observability for CDC metadata table row counts, before treating
+  long-lived catalogs as production-ready.
