@@ -1936,6 +1936,12 @@ struct ColumnInfo {
 };
 
 //! Difference between two ColumnInfo lists (one at snapshot S-1 vs S).
+//! `parent_column_id` is the struct-parent's column_id; valid only when
+//! `has_parent` is true (i.e. the diffed column is a nested-struct field
+//! per `ducklake_column.parent_column`). Phase 2 deferral 3: the field
+//! is populated for ADDED and DROPPED kinds so downstream consumers can
+//! reconstruct the parent/child relationship without re-querying the
+//! catalog.
 struct ColumnDiff {
 	enum class Kind { ADDED, DROPPED, RENAMED, TYPE_CHANGED, DEFAULT_CHANGED, NULLABLE_CHANGED };
 	Kind kind;
@@ -1948,6 +1954,8 @@ struct ColumnDiff {
 	duckdb::Value new_default;
 	bool old_nullable;
 	bool new_nullable;
+	int64_t parent_column_id = 0;
+	bool has_parent = false;
 };
 
 //! Read every column of `table_id` that is live at `snapshot_id` (i.e.
@@ -2019,6 +2027,10 @@ std::vector<ColumnDiff> DiffColumns(const std::vector<ColumnInfo> &old_columns,
 			d.new_type = c.column_type;
 			d.new_default = c.default_value;
 			d.new_nullable = c.nullable;
+			if (!c.parent_column.IsNull()) {
+				d.parent_column_id = c.parent_column.GetValue<int64_t>();
+				d.has_parent = true;
+			}
 			diffs.push_back(std::move(d));
 			continue;
 		}
@@ -2075,10 +2087,69 @@ std::vector<ColumnDiff> DiffColumns(const std::vector<ColumnInfo> &old_columns,
 			d.old_type = c.column_type;
 			d.old_default = c.default_value;
 			d.old_nullable = c.nullable;
+			if (!c.parent_column.IsNull()) {
+				d.parent_column_id = c.parent_column.GetValue<int64_t>();
+				d.has_parent = true;
+			}
 			diffs.push_back(std::move(d));
 		}
 	}
 	return diffs;
+}
+
+//! Phase 2 deferral 3: stable-sort ADDED diffs so a struct parent appears
+//! before any of its nested-field children, and DROPPED diffs so children
+//! appear before their parent. Mirrors the cross-snapshot ordering rule
+//! cdc_ddl already uses for `(event_kind, object_kind)` (ADR 0008): a
+//! consumer building / tearing down typed schemas observes the parent
+//! struct exists before its fields are added, and observes a struct's
+//! fields disappear before the struct itself is dropped.
+//!
+//! The sort is *stable* so the natural column_order ordering is preserved
+//! among siblings; we only reorder when a parent/child pair is out of
+//! position. Within ADDED, the predicate is "parents before children"
+//! (top-level columns get rank 0; child columns get rank = depth from
+//! root); within DROPPED, the rank is negated so the deepest leaves go
+//! first.
+void NormaliseDiffParentChildOrdering(std::vector<ColumnDiff> &diffs) {
+	std::unordered_map<int64_t, int64_t> parent_of;
+	for (const auto &d : diffs) {
+		if ((d.kind == ColumnDiff::Kind::ADDED || d.kind == ColumnDiff::Kind::DROPPED) && d.has_parent) {
+			parent_of[d.column_id] = d.parent_column_id;
+		}
+	}
+	auto depth_of = [&](int64_t column_id) {
+		int depth = 0;
+		auto cursor = column_id;
+		while (true) {
+			auto it = parent_of.find(cursor);
+			if (it == parent_of.end()) {
+				return depth;
+			}
+			++depth;
+			cursor = it->second;
+			if (depth > 64) {
+				// Defensive: cycles in parent_column would be a DuckLake
+				// catalog corruption; cap traversal so we don't spin.
+				return depth;
+			}
+		}
+	};
+	std::stable_sort(diffs.begin(), diffs.end(), [&](const ColumnDiff &a, const ColumnDiff &b) {
+		if (a.kind != b.kind) {
+			// Preserve grouping by kind — the JSON serializer sweeps each
+			// kind independently anyway, but a stable order across kinds
+			// keeps debug dumps deterministic.
+			return false;
+		}
+		if (a.kind == ColumnDiff::Kind::ADDED) {
+			return depth_of(a.column_id) < depth_of(b.column_id);
+		}
+		if (a.kind == ColumnDiff::Kind::DROPPED) {
+			return depth_of(a.column_id) > depth_of(b.column_id);
+		}
+		return false;
+	});
 }
 
 const char *DiffKindToString(ColumnDiff::Kind kind) {
@@ -2112,7 +2183,12 @@ std::string ColumnInfoToJson(const ColumnInfo &c) {
 		out << "\"" << JsonEscape(c.default_value.ToString()) << "\"";
 	}
 	if (!c.parent_column.IsNull()) {
-		out << ",\"parent_column\":" << c.parent_column.ToString();
+		// Field name aligned with ADR 0008 / Phase 2 deferral 3: the
+		// nested-struct parent reference is `parent_column_id` (the
+		// referenced column_id is itself a column_id, not the column's
+		// name). Phase 1 emitted this as `parent_column` which conflicted
+		// with the ADR text and with the cdc_schema_diff column name.
+		out << ",\"parent_column_id\":" << c.parent_column.ToString();
 	}
 	out << "}";
 	return out.str();
@@ -2128,8 +2204,13 @@ std::string JsonOptionalString(const duckdb::Value &v) {
 //! Serialize the diff list as a JSON object grouped by diff kind. Empty
 //! groups are omitted so the payload stays compact for the common case
 //! (most ALTER TABLE commits change exactly one column in exactly one
-//! way).
-std::string DiffsToJson(const std::vector<ColumnDiff> &diffs) {
+//! way). Phase 2 deferral 3: ADDED / DROPPED entries gain a
+//! `parent_column_id` field for nested-struct children so consumers can
+//! reconstruct the parent/child relationship without re-querying the
+//! catalog; the diff list is also normalised so parents precede children
+//! on ADDED and children precede parents on DROPPED.
+std::string DiffsToJson(std::vector<ColumnDiff> diffs) {
+	NormaliseDiffParentChildOrdering(diffs);
 	auto kind_filter = [&diffs](ColumnDiff::Kind kind, std::ostringstream &out) {
 		bool first = true;
 		for (const auto &d : diffs) {
@@ -2146,11 +2227,17 @@ std::string DiffsToJson(const std::vector<ColumnDiff> &diffs) {
 				out << ",\"name\":\"" << JsonEscape(d.new_name) << "\",\"type\":\"" << JsonEscape(d.new_type)
 				    << "\",\"nullable\":" << (d.new_nullable ? "true" : "false")
 				    << ",\"default\":" << JsonOptionalString(d.new_default);
+				if (d.has_parent) {
+					out << ",\"parent_column_id\":" << d.parent_column_id;
+				}
 				break;
 			case ColumnDiff::Kind::DROPPED:
 				out << ",\"name\":\"" << JsonEscape(d.old_name) << "\",\"type\":\"" << JsonEscape(d.old_type)
 				    << "\",\"nullable\":" << (d.old_nullable ? "true" : "false")
 				    << ",\"default\":" << JsonOptionalString(d.old_default);
+				if (d.has_parent) {
+					out << ",\"parent_column_id\":" << d.parent_column_id;
+				}
 				break;
 			case ColumnDiff::Kind::RENAMED:
 				out << ",\"old_name\":\"" << JsonEscape(d.old_name) << "\",\"new_name\":\"" << JsonEscape(d.new_name)
@@ -3069,12 +3156,14 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcSchemaDiffBind(duckdb::ClientContext
 	}
 	CheckCatalogOrThrow(context, result->catalog_name);
 
-	names = {"snapshot_id", "snapshot_time", "change_kind", "column_id",   "old_name",     "new_name",
-	         "old_type",    "new_type",      "old_default", "new_default", "old_nullable", "new_nullable"};
+	names = {"snapshot_id", "snapshot_time", "change_kind",  "column_id",    "old_name",    "new_name",
+	         "old_type",    "new_type",      "old_default",  "new_default",  "old_nullable", "new_nullable",
+	         "parent_column_id"};
 	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
 	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
 	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BOOLEAN};
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BOOLEAN,
+	                duckdb::LogicalType::BIGINT};
 	return std::move(result);
 }
 
@@ -3178,13 +3267,46 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 
 			if (is_pure_create) {
 				const auto new_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id);
+				// Stable order: parents before children, by depth in the
+				// nested-struct tree. LookupTableColumnsAt already returns
+				// in column_order which puts the parent struct ahead of
+				// its fields naturally; the explicit sort makes the
+				// guarantee independent of catalog ordering.
+				std::unordered_map<int64_t, int64_t> create_parent_of;
 				for (const auto &c : new_cols) {
+					if (!c.parent_column.IsNull()) {
+						create_parent_of[c.column_id] = c.parent_column.GetValue<int64_t>();
+					}
+				}
+				auto create_depth = [&](int64_t column_id) {
+					int depth = 0;
+					auto cursor = column_id;
+					while (true) {
+						auto it = create_parent_of.find(cursor);
+						if (it == create_parent_of.end()) {
+							return depth;
+						}
+						++depth;
+						cursor = it->second;
+						if (depth > 64) {
+							return depth;
+						}
+					}
+				};
+				std::vector<ColumnInfo> ordered = new_cols;
+				std::stable_sort(ordered.begin(), ordered.end(),
+				                 [&](const ColumnInfo &a, const ColumnInfo &b) {
+					                 return create_depth(a.column_id) < create_depth(b.column_id);
+				                 });
+				for (const auto &c : ordered) {
+					duckdb::Value parent_value =
+					    c.parent_column.IsNull() ? duckdb::Value() : duckdb::Value::BIGINT(c.parent_column.GetValue<int64_t>());
 					result->rows.push_back(
 					    {duckdb::Value::BIGINT(snapshot_id), snapshot_time, duckdb::Value("added"),
 					     duckdb::Value::BIGINT(c.column_id), duckdb::Value(), duckdb::Value(c.column_name),
 					     duckdb::Value(), duckdb::Value(c.column_type), duckdb::Value(),
 					     c.default_value.IsNull() ? duckdb::Value() : duckdb::Value(c.default_value.ToString()),
-					     duckdb::Value(), duckdb::Value::BOOLEAN(c.nullable)});
+					     duckdb::Value(), duckdb::Value::BOOLEAN(c.nullable), parent_value});
 				}
 				continue;
 			}
@@ -3193,12 +3315,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 				result->rows.push_back({duckdb::Value::BIGINT(snapshot_id), snapshot_time,
 				                        duckdb::Value("table_rename"), duckdb::Value(), duckdb::Value(old_table_name),
 				                        duckdb::Value(new_table_name), duckdb::Value(), duckdb::Value(),
-				                        duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value()});
+				                        duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value(),
+				                        duckdb::Value()});
 			}
 
 			const auto old_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id - 1);
 			const auto new_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id);
-			const auto diffs = DiffColumns(old_cols, new_cols);
+			auto diffs = DiffColumns(old_cols, new_cols);
+			NormaliseDiffParentChildOrdering(diffs);
 			for (const auto &d : diffs) {
 				duckdb::Value old_default =
 				    d.old_default.IsNull() ? duckdb::Value() : duckdb::Value(d.old_default.ToString());
@@ -3216,10 +3340,12 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 				    (d.kind == ColumnDiff::Kind::ADDED || d.kind == ColumnDiff::Kind::NULLABLE_CHANGED)
 				        ? duckdb::Value::BOOLEAN(d.new_nullable)
 				        : duckdb::Value();
+				duckdb::Value parent_value =
+				    d.has_parent ? duckdb::Value::BIGINT(d.parent_column_id) : duckdb::Value();
 				result->rows.push_back({duckdb::Value::BIGINT(snapshot_id), snapshot_time,
 				                        duckdb::Value(DiffKindToString(d.kind)), duckdb::Value::BIGINT(d.column_id),
 				                        old_name, new_name, old_type, new_type, old_default, new_default, old_nullable,
-				                        new_nullable});
+				                        new_nullable, parent_value});
 			}
 		}
 	}

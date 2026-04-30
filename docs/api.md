@@ -443,7 +443,7 @@ Stage-2 `details` JSON payload shapes (v0.0.5+):
 
 | event | payload shape |
 | --- | --- |
-| `created.table` | `{"columns":[{"id":N,"order":N,"name":"...","type":"...","nullable":bool,"default":...,"parent_column":N?},...]}` |
+| `created.table` | `{"columns":[{"id":N,"order":N,"name":"...","type":"...","nullable":bool,"default":...,"parent_column_id":N?},...]}` |
 | `altered.table` | `{"old_table_name":"...","new_table_name":"...","added":[...],"dropped":[...],"renamed":[{"id":N,"old_name":"...","new_name":"..."}],"type_changed":[{"id":N,"name":"...","old_type":"...","new_type":"..."}],"default_changed":[{"id":N,"name":"...","old_default":...,"new_default":...}],"nullable_changed":[{"id":N,"name":"...","old_nullable":bool,"new_nullable":bool}]}`. Empty groups are omitted, so the typical single-column ALTER produces a small payload. The rename-pair fields appear only when the table itself was renamed (Finding-1). |
 | `created.view` | `{"definition":"...","dialect":"duckdb","column_aliases":"..."}` |
 | `dropped.schema` / `dropped.table` / `dropped.view` | `{}` (objects are gone; consumers know what was dropped from the row's `object_id` / `object_name` columns) |

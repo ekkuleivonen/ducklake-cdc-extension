@@ -225,3 +225,115 @@ WHERE event_kind = 'created' AND object_kind IN ('schema', 'table')
 ----
 created	schema
 created	table
+
+# -----------------------------------------------------------------------------
+# Phase 2 deferral 3: nested-column diff parent/child reordering.
+# DuckLake stores nested struct fields as separate `ducklake_column` rows
+# whose `parent_column` references the struct's column_id. The Phase 1
+# implementation lost this relationship in the `altered.table.details`
+# payload and in `cdc_schema_diff` rows. Phase 2 surfaces the parent
+# reference as `parent_column_id` on every nested-field row and stable-
+# sorts the diff so parents precede children on ADD and children precede
+# parents on DROP — the same depth-ordering rule cdc_ddl already uses
+# for top-level (object_kind, object_id) within a snapshot.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_nested.ducklake' AS lake_n (DATA_PATH '__TEST_DIR__/ddl_nested_data');
+
+statement ok
+CREATE TABLE lake_n.orders(id INTEGER, customer STRUCT(name VARCHAR, tier VARCHAR), amount INTEGER);
+
+# `created.table.details.columns` includes `parent_column_id` for nested
+# fields and emits parents ahead of children. Naming is `parent_column_id`
+# (not `parent_column`) per ADR 0008, aligning the JSON key with both the
+# `cdc_schema_diff` column name and the doc reference.
+query I
+SELECT details FROM cdc_recent_ddl('lake_n', for_table => 'orders')
+WHERE event_kind = 'created' AND object_kind = 'table';
+----
+{"columns":[{"id":1,"order":1,"name":"id","type":"int32","nullable":true,"default":"NULL"},{"id":2,"order":2,"name":"customer","type":"struct","nullable":true,"default":"NULL"},{"id":3,"order":3,"name":"name","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":4,"order":4,"name":"tier","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":5,"order":5,"name":"amount","type":"int32","nullable":true,"default":"NULL"}]}
+
+# `cdc_schema_diff` exposes parent_column_id as a typed column rather than
+# embedding it inside a JSON blob. Pure-create surfaces emit one `added`
+# row per column; the parent column appears before its children (depth
+# ascending) and children carry the parent id.
+query III
+SELECT change_kind, column_id, parent_column_id FROM cdc_schema_diff('lake_n', 'orders', 0, 99999)
+ORDER BY snapshot_id, column_id;
+----
+added	1	NULL
+added	2	NULL
+added	3	2
+added	4	2
+added	5	NULL
+
+# ALTER TABLE ADD COLUMN nested.field — DuckDB syntax for adding a
+# struct field. The field shows up in `details.added` with
+# `parent_column_id` set to the struct's column_id (here 2).
+statement ok
+ALTER TABLE lake_n.orders ADD COLUMN customer.region VARCHAR;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders')
+WHERE event_kind = 'altered'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	{"added":[{"id":6,"name":"region","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2}]}
+
+# Cross-product stress test: rename, type-change, and nested-field add
+# in one transaction. Phase 2 § 'DDL-event exhaustive tests' requires
+# the single `altered.table` payload to populate all three of
+# `{old_table_name,new_table_name}`, `type_changed`, and `added` (with
+# correct `parent_column_id`) simultaneously. Migrations doing this
+# combination are common; getting any one of the three wrong silently is
+# the failure mode this test exists to prevent.
+#
+# Note: at the rename snapshot (3) Stage-1 emits two altered events
+# under DIFFERENT object_names — one via the Finding-1 rename path
+# (object_name = new name, carries `{old_table_name, new_table_name,
+# ...}`) and one via the `altered_table:<id>` ID-resolved path (object
+# name = old name, carries `{added, type_changed}` only). The dual
+# emission is a pre-existing extraction artefact that is not what
+# Phase 2 deferral 3 is trying to fix; we pin the assertion to the
+# Finding-1 row that carries the full cross-product payload, which is
+# the contract Phase 2 actually promises.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE lake_n.orders RENAME TO orders_v2;
+
+statement ok
+ALTER TABLE lake_n.orders_v2 ALTER COLUMN amount SET DATA TYPE BIGINT;
+
+statement ok
+ALTER TABLE lake_n.orders_v2 ADD COLUMN customer.country VARCHAR;
+
+statement ok
+COMMIT;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders_v2')
+WHERE event_kind = 'altered' AND object_name = 'orders_v2'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	{"old_table_name":"orders","new_table_name":"orders_v2","added":[{"id":7,"name":"country","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2}],"type_changed":[{"id":5,"name":"amount","old_type":"int32","new_type":"int64"}]}
+
+# DROPPED ordering: when a struct column is dropped, its child fields
+# disappear with it. The diff JSON emits children before the parent
+# (depth descending) so a downstream consumer tearing down a typed
+# schema sees the leaves vanish before the root. The DROP event
+# resolves the table by id (not by Finding-1's qualified-name path), so
+# the post-rename object_name surfaces as the original `orders` — that
+# is the same `LookupTableById`-after-rename quirk noted on the cross-
+# product event above and is unrelated to Phase 2 deferral 3.
+statement ok
+ALTER TABLE lake_n.orders_v2 DROP COLUMN customer;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders')
+WHERE event_kind = 'altered' AND object_name = 'orders'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	{"dropped":[{"id":3,"name":"name","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":4,"name":"tier","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":6,"name":"region","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":7,"name":"country","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":2,"name":"customer","type":"struct","nullable":true,"default":"NULL"}]}
