@@ -1,0 +1,895 @@
+# name: test/sql/subscriptions_identity.test
+# description: identity-first normalized consumer subscriptions
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+# DuckLake is loaded at runtime from the official extension repository
+# instead of being compiled from source. `require ducklake` cannot be used
+# because sqllogictest's `require <ext>` only checks for statically-loaded
+# extensions, which DuckLake is not in this build.
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/subscriptions_identity.ducklake' AS lake (DATA_PATH '__TEST_DIR__/subscriptions_identity_data');
+
+statement ok
+CREATE SCHEMA lake.sales;
+
+statement ok
+CREATE SCHEMA lake.audit;
+
+statement ok
+CREATE TABLE lake.sales.orders(id INTEGER, status VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE lake.sales.customers(id INTEGER, tier VARCHAR);
+
+statement ok
+CREATE TABLE lake.audit.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.sales.orders VALUES (1, 'new', 100);
+
+statement ok
+SET VARIABLE start_snapshot = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok
+SET VARIABLE sales_schema_id = (
+  SELECT schema_id FROM __ducklake_metadata_lake.ducklake_schema
+  WHERE schema_name = 'sales'
+    AND begin_snapshot <= getvariable('start_snapshot')
+    AND (end_snapshot IS NULL OR end_snapshot > getvariable('start_snapshot'))
+);
+
+statement ok
+SET VARIABLE audit_schema_id = (
+  SELECT schema_id FROM __ducklake_metadata_lake.ducklake_schema
+  WHERE schema_name = 'audit'
+    AND begin_snapshot <= getvariable('start_snapshot')
+    AND (end_snapshot IS NULL OR end_snapshot > getvariable('start_snapshot'))
+);
+
+statement ok
+SET VARIABLE orders_table_id = (
+  SELECT t.table_id FROM __ducklake_metadata_lake.ducklake_table t
+  JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+  WHERE s.schema_name = 'sales'
+    AND t.table_name = 'orders'
+    AND t.begin_snapshot <= getvariable('start_snapshot')
+    AND (t.end_snapshot IS NULL OR t.end_snapshot > getvariable('start_snapshot'))
+);
+
+statement ok
+SET VARIABLE customers_table_id = (
+  SELECT t.table_id FROM __ducklake_metadata_lake.ducklake_table t
+  JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+  WHERE s.schema_name = 'sales'
+    AND t.table_name = 'customers'
+    AND t.begin_snapshot <= getvariable('start_snapshot')
+    AND (t.end_snapshot IS NULL OR t.end_snapshot > getvariable('start_snapshot'))
+);
+
+# subscription_bootstrap_creates_state_tables: first identity create creates the consumers and subscriptions tables.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bootstrap',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = '__ducklake_metadata_lake'
+  AND schema_name = '__ducklake_cdc'
+  AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
+                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+----
+4
+
+# create_requires_subscriptions: omitted subscriptions is rejected.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'missing_subs', start_at := getvariable('start_snapshot'));
+----
+subscriptions
+
+# create_rejects_empty_subscriptions: an empty subscriptions list is rejected.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'empty_subs',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := []::STRUCT(scope_kind VARCHAR, schema_name VARCHAR, table_name VARCHAR,
+                              schema_id BIGINT, table_id BIGINT,
+                              event_category VARCHAR, change_type VARCHAR)[]
+);
+----
+subscriptions
+
+# create_rejects_legacy_tables_arg: legacy table-name filter arguments are removed from the create API.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'legacy_tables', start_at := getvariable('start_snapshot'), tables := ['sales.orders']);
+----
+tables
+
+# create_rejects_legacy_change_types_arg: legacy change_types argument is removed from the create API.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'legacy_change_types', start_at := getvariable('start_snapshot'), change_types := ['insert']);
+----
+change_types
+
+# create_rejects_legacy_event_categories_arg: legacy event_categories argument is removed from the create API.
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'legacy_events', start_at := getvariable('start_snapshot'), event_categories := ['dml']);
+----
+event_categories
+
+# create_table_by_name_resolves_identity: table name sugar resolves to stable schema_id/table_id.
+query I
+SELECT consumer_name = 'table_by_name'
+   AND scope_kind = 'table'
+   AND schema_id = getvariable('sales_schema_id')::BIGINT
+   AND table_id = getvariable('orders_table_id')::BIGINT
+   AND event_category = 'dml'
+   AND change_type = 'insert'
+FROM cdc_consumer_create(
+  'lake',
+  'table_by_name',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+----
+true
+
+# create_schema_by_name_resolves_identity: schema name sugar resolves to stable schema_id.
+query I
+SELECT consumer_name = 'schema_by_name'
+   AND scope_kind = 'schema'
+   AND schema_id = getvariable('sales_schema_id')::BIGINT
+   AND event_category = 'dml'
+   AND change_type = 'insert'
+FROM cdc_consumer_create(
+  'lake',
+  'schema_by_name',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := 'sales', table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+----
+true
+
+# create_table_by_id_validates_identity: table_id input is accepted when live at start_at.
+query I
+SELECT consumer_name = 'table_by_id'
+   AND scope_kind = 'table'
+   AND schema_id = getvariable('sales_schema_id')::BIGINT
+   AND table_id = getvariable('orders_table_id')::BIGINT
+   AND event_category = 'dml'
+   AND change_type = 'delete'
+FROM cdc_consumer_create(
+  'lake',
+  'table_by_id',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := getvariable('orders_table_id')::BIGINT,
+                event_category := 'dml', change_type := 'delete')
+  ]
+);
+----
+true
+
+# create_schema_by_id_validates_identity: schema_id input is accepted when live at start_at.
+query I
+SELECT consumer_name = 'schema_by_id'
+   AND scope_kind = 'schema'
+   AND schema_id = getvariable('sales_schema_id')::BIGINT
+   AND event_category = 'ddl'
+   AND change_type = '*'
+FROM cdc_consumer_create(
+  'lake',
+  'schema_by_id',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := getvariable('sales_schema_id')::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+----
+true
+
+# create_catalog_subscription_accepts_no_identity: catalog scope accepts no schema/table identity.
+query III
+SELECT consumer_name, scope_kind, event_category
+FROM cdc_consumer_create(
+  'lake',
+  'catalog_ddl',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+----
+catalog_ddl	catalog	ddl
+
+# create_rejects_name_and_id_for_same_scope: one subscription cannot specify both name and id identity.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'both_name_and_id',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := getvariable('orders_table_id')::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+----
+identity
+
+# create_rejects_missing_table_identity: table scope requires table_name or table_id.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'missing_table_identity',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+----
+identity
+
+# create_rejects_missing_schema_identity: schema scope requires schema_name or schema_id.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'missing_schema_identity',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+----
+identity
+
+# create_rejects_catalog_identity: catalog scope rejects schema/table identity.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'catalog_with_identity',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := 'sales', table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+----
+identity
+
+# create_rejects_invalid_scope_kind: scope_kind enum is validated.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bad_scope',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'database', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+----
+scope_kind
+
+# create_rejects_invalid_event_category: event_category enum is validated.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bad_event',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'snapshot', change_type := '*')
+  ]
+);
+----
+event_category
+
+# create_rejects_invalid_change_type: change_type enum is validated.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bad_change',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'upsert')
+  ]
+);
+----
+change_type
+
+# create_rejects_null_event_category: NULL is not a wildcard for event_category.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'null_event',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := NULL::VARCHAR, change_type := '*')
+  ]
+);
+----
+event_category
+
+# create_rejects_null_change_type: NULL is not a wildcard for change_type.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'null_change',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := NULL::VARCHAR)
+  ]
+);
+----
+change_type
+
+# create_rejects_ddl_specific_change_type: DDL subscriptions must use change_type '*'.
+statement error
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'ddl_with_insert',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := 'insert')
+  ]
+);
+----
+change_type
+
+# create_expands_dml_wildcard: dml + '*' creates one subscription row per DML change type.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'dml_wildcard',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
+
+query II
+SELECT change_type, count(*) FROM cdc_consumer_subscriptions('lake', name := 'dml_wildcard')
+GROUP BY change_type ORDER BY change_type;
+----
+delete	1
+insert	1
+update_postimage	1
+update_preimage	1
+
+# create_expands_event_category_wildcard: '*' + '*' creates DML rows and one DDL row for the same identity.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'event_wildcard',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
+
+query II
+SELECT event_category, count(*) FROM cdc_consumer_subscriptions('lake', name := 'event_wildcard')
+GROUP BY event_category ORDER BY event_category;
+----
+ddl	1
+dml	4
+
+# consumer_subscriptions_lists_all_consumers: subscription inspection can list every consumer.
+query I
+SELECT count(*) >= 8 FROM cdc_consumer_subscriptions('lake');
+----
+true
+
+# consumer_subscriptions_filters_by_consumer: subscription inspection filters by consumer name.
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'table_by_name');
+----
+1
+
+# consumer_subscriptions_reports_active_status: live unchanged identities report active.
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'table_by_name')
+WHERE status = 'active'
+  AND original_qualified_name = 'sales.orders'
+  AND current_qualified_name = 'sales.orders';
+----
+1
+
+# audit_create_records_subscription_details: create audit includes resolved subscription identities.
+query I
+SELECT details LIKE '%"subscriptions"%'
+   AND details LIKE '%"table_id":' || getvariable('orders_table_id') || '%'
+FROM __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_audit
+WHERE action = 'consumer_create' AND consumer_name = 'table_by_name';
+----
+true
+
+# table_subscription_reads_inserts: table-scope dml+insert returns inserts for that table.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'table_inserts',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+statement ok
+INSERT INTO lake.sales.orders VALUES (2, 'paid', 200);
+
+statement ok
+UPDATE lake.sales.orders SET status = 'shipped' WHERE id = 1;
+
+statement ok
+DELETE FROM lake.sales.orders WHERE id = 2;
+
+query II
+SELECT count(*), count(DISTINCT change_type) FROM cdc_changes('lake', 'table_inserts', table_id := getvariable('orders_table_id')::BIGINT);
+----
+1	1
+
+# table_subscription_filters_change_types: table-scope insert subscription excludes update/delete changes.
+query I
+SELECT count(*) FROM cdc_changes('lake', 'table_inserts', table_id := getvariable('orders_table_id')::BIGINT)
+WHERE change_type <> 'insert';
+----
+0
+
+# cdc_changes_by_current_name: name-form resolves the current name to a subscribed table id.
+query I
+SELECT count(*) FROM cdc_changes('lake', 'table_inserts', table_name := 'sales.orders')
+WHERE change_type = 'insert';
+----
+1
+
+# cdc_changes_omits_table_for_single_subscription: single active table DML subscription can omit table selector.
+query I
+SELECT count(*) FROM cdc_changes('lake', 'table_inserts')
+WHERE change_type = 'insert';
+----
+1
+
+# cdc_changes_rejects_unsubscribed_table_id: an unsubscribed table id fails loudly.
+statement error
+SELECT * FROM cdc_changes('lake', 'table_inserts', table_id := getvariable('customers_table_id')::BIGINT);
+----
+subscription
+
+# cdc_changes_rejects_unsubscribed_table_name: an unsubscribed table name fails loudly.
+statement error
+SELECT * FROM cdc_changes('lake', 'table_inserts', table_name := 'sales.customers');
+----
+subscription
+
+# schema_subscription_reads_all_tables: schema-scope DML reads matching rows from multiple tables in the schema.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'schema_inserts',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := 'sales', table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+statement ok
+INSERT INTO lake.sales.orders VALUES (3, 'new', 300);
+
+statement ok
+INSERT INTO lake.sales.customers VALUES (1, 'gold');
+
+statement ok
+INSERT INTO lake.audit.orders VALUES (1, 'ignored');
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'schema_inserts', table_name := 'sales.orders') WHERE change_type = 'insert';
+----
+2
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'schema_inserts', table_name := 'sales.customers') WHERE change_type = 'insert';
+----
+1
+
+# schema_subscription_excludes_other_schemas: same table name in another schema is not covered.
+statement error
+SELECT * FROM cdc_changes('lake', 'schema_inserts', table_name := 'audit.orders');
+----
+subscription
+
+# schema_subscription_includes_future_tables: schema-scope DML includes tables created after consumer creation.
+statement ok
+CREATE TABLE lake.sales.invoices(id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO lake.sales.invoices VALUES (1, 500);
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'schema_inserts', table_name := 'sales.invoices') WHERE change_type = 'insert';
+----
+1
+
+# catalog_subscription_reads_all_tables: catalog-scope DML covers all schemas.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'catalog_inserts',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'catalog_inserts', table_name := 'audit.orders') WHERE change_type = 'insert';
+----
+1
+
+# cdc_changes_rejects_omitted_table_for_multi_subscription: multi-table/schema consumers must specify table identity.
+statement error
+SELECT * FROM cdc_changes('lake', 'schema_inserts');
+----
+table
+
+# dml_only_subscription_suppresses_ddl: DML-only subscriptions do not surface rows in cdc_ddl.
+query I
+SELECT count(*) FROM cdc_ddl('lake', 'schema_inserts');
+----
+0
+
+# ddl_only_subscription_suppresses_dml: DDL-only subscriptions do not surface rows in cdc_changes.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'ddl_only_orders',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'ddl_only_orders', table_name := 'sales.orders');
+----
+0
+
+# ddl_table_subscription_receives_table_alter: table DDL subscriptions receive alter events for that table id.
+statement ok
+ALTER TABLE lake.sales.orders ADD COLUMN region VARCHAR DEFAULT 'NA';
+
+query I
+SELECT event_kind = 'altered'
+   AND object_kind = 'table'
+   AND object_id = getvariable('orders_table_id')::BIGINT
+   AND object_name = 'orders'
+FROM cdc_ddl('lake', 'ddl_only_orders')
+WHERE object_kind = 'table'
+ORDER BY snapshot_id;
+----
+true
+
+# cdc_events_filters_by_subscription_identity: events appear only for snapshots touching subscribed identities.
+query I
+SELECT count(*) >= 1 FROM cdc_events('lake', 'table_inserts')
+WHERE changes_made IS NOT NULL;
+----
+true
+
+# cdc_events_filters_by_change_type: event stream respects DML change-type subscriptions.
+query I
+SELECT count(*) FROM cdc_events('lake', 'table_inserts')
+WHERE changes_made LIKE '%deleted%';
+----
+0
+
+# commit_preserves_subscription_rows: commit advances the cursor without mutating subscriptions.
+statement ok
+SET VARIABLE table_inserts_end = (SELECT end_snapshot FROM cdc_window('lake', 'table_inserts'));
+
+statement ok
+SELECT * FROM cdc_commit('lake', 'table_inserts', getvariable('table_inserts_end'));
+
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'table_inserts');
+----
+1
+
+# reset_preserves_subscription_rows: reset repositions the cursor without mutating subscriptions.
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'table_inserts', to_snapshot := getvariable('start_snapshot')::VARCHAR);
+
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'table_inserts');
+----
+1
+
+# drop_deletes_subscription_rows: dropping a consumer removes its subscription rows.
+statement ok
+SELECT * FROM cdc_consumer_drop('lake', 'table_inserts');
+
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'table_inserts');
+----
+0
+
+# consumer_list_reports_subscription_counts: list output includes subscription health counts.
+query IIII
+SELECT subscription_count, subscriptions_active, subscriptions_renamed, subscriptions_dropped
+FROM cdc_consumer_list('lake')
+WHERE consumer_name = 'event_wildcard';
+----
+5	5	0	0
+
+# consumer_stats_reports_subscription_health: stats output includes subscription health counts.
+query IIII
+SELECT subscription_count, subscriptions_active, subscriptions_renamed, subscriptions_dropped
+FROM cdc_consumer_stats('lake', consumer := 'event_wildcard');
+----
+5	5	0	0
+
+# table_subscription_follows_table_rename: table subscription stays active through table rename.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'rename_table',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales', table_name := 'customers',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
+
+statement ok
+ALTER TABLE lake.sales.customers RENAME TO customers_v2;
+
+statement ok
+INSERT INTO lake.sales.customers_v2 VALUES (2, 'silver');
+
+query III
+SELECT status, original_qualified_name, current_qualified_name
+FROM cdc_consumer_subscriptions('lake', name := 'rename_table')
+WHERE event_category = 'dml' AND change_type = 'insert';
+----
+renamed	sales.customers	sales.customers_v2
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'rename_table', table_name := 'sales.customers_v2')
+WHERE change_type = 'insert' AND id = 2;
+----
+1
+
+# cdc_changes_rejects_old_renamed_name: stale pre-rename table name fails with a helpful rename error.
+statement error
+SELECT * FROM cdc_changes('lake', 'rename_table', table_name := 'sales.customers');
+----
+renamed
+
+# ddl_table_subscription_receives_table_rename: table rename emits altered table with the same object_id.
+query I
+SELECT event_kind = 'altered'
+   AND object_kind = 'table'
+   AND object_id = getvariable('customers_table_id')::BIGINT
+   AND details LIKE '%"old_table_name":"customers"%'
+FROM cdc_ddl('lake', 'rename_table')
+WHERE object_kind = 'table' AND event_kind = 'altered'
+ORDER BY snapshot_id DESC
+LIMIT 1;
+----
+true
+
+# table_subscription_does_not_follow_drop_recreate: drop + recreate same name leaves the old table identity dropped.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'drop_recreate',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'audit', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+statement ok
+DROP TABLE lake.audit.orders;
+
+statement ok
+CREATE TABLE lake.audit.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.audit.orders VALUES (2, 'new-identity');
+
+query I
+SELECT count(*) FROM cdc_consumer_subscriptions('lake', name := 'drop_recreate')
+WHERE status = 'dropped';
+----
+1
+
+statement error
+SELECT * FROM cdc_changes('lake', 'drop_recreate', table_name := 'audit.orders');
+----
+subscription
+
+# schema_subscription_follows_schema_rename: schema subscription stays active through schema rename.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'rename_schema',
+  start_at := getvariable('start_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := 'sales', table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+statement ok
+ALTER SCHEMA lake.sales RENAME TO sales_archive;
+
+statement ok
+INSERT INTO lake.sales_archive.orders VALUES (4, 'archived', 400, 'EU');
+
+query III
+SELECT status, original_qualified_name, current_qualified_name
+FROM cdc_consumer_subscriptions('lake', name := 'rename_schema')
+WHERE scope_kind = 'schema';
+----
+renamed	sales	sales_archive
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'rename_schema', table_name := 'sales_archive.orders')
+WHERE change_type = 'insert' AND id = 4;
+----
+1
+
+# ddl_schema_subscription_receives_schema_events: schema DDL subscriptions receive schema/table DDL in the schema identity.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'schema_ddl',
+  start_at := 'now',
+  subscriptions := [
+    struct_pack(scope_kind := 'schema', schema_name := 'sales_archive', table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
+
+statement ok
+CREATE TABLE lake.sales_archive.shipments(id INTEGER);
+
+query II
+SELECT event_kind, object_kind FROM cdc_ddl('lake', 'schema_ddl')
+WHERE object_kind = 'table'
+ORDER BY snapshot_id DESC
+LIMIT 1;
+----
+created	table
+
+# ddl_schema_subscription_includes_future_table_ddl: schema DDL subscription includes later alters for tables created after subscribe.
+statement ok
+ALTER TABLE lake.sales_archive.shipments ADD COLUMN carrier VARCHAR;
+
+query II
+SELECT event_kind, object_kind FROM cdc_ddl('lake', 'schema_ddl')
+WHERE object_kind = 'table' AND event_kind = 'altered'
+ORDER BY snapshot_id DESC
+LIMIT 1;
+----
+altered	table
+
+# ddl_subscription_excludes_unsubscribed_identities: unrelated DDL does not appear.
+statement ok
+CREATE SCHEMA lake.misc;
+
+statement ok
+CREATE TABLE lake.misc.noise(id INTEGER);
+
+query I
+SELECT count(*) FROM cdc_ddl('lake', 'schema_ddl')
+WHERE schema_name = 'misc';
+----
+0
+
+# schema_boundary_still_stops_before_ddl: default stop_at_schema_change still stops before a schema boundary.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'boundary_default',
+  start_at := 'now',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'sales_archive', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
+
+statement ok
+INSERT INTO lake.sales_archive.orders VALUES (5, 'before-boundary', 500, 'US');
+
+statement ok
+ALTER TABLE lake.sales_archive.orders ADD COLUMN note VARCHAR DEFAULT 'n/a';
+
+query II
+SELECT has_changes, schema_changes_pending FROM cdc_window('lake', 'boundary_default');
+----
+true	true
+
+# schema_boundary_with_identity_subscription: post-boundary DML continues under the same table identity.
+statement ok
+SET VARIABLE boundary_end = (SELECT end_snapshot FROM cdc_window('lake', 'boundary_default'));
+
+statement ok
+SELECT * FROM cdc_commit('lake', 'boundary_default', getvariable('boundary_end'));
+
+statement ok
+INSERT INTO lake.sales_archive.orders VALUES (6, 'after-boundary', 600, 'US', 'ok');
+
+query I
+SELECT count(*) FROM cdc_changes('lake', 'boundary_default', table_name := 'sales_archive.orders')
+WHERE change_type = 'insert' AND id = 6;
+----
+1
