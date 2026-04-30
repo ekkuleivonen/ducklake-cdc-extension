@@ -1522,8 +1522,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 //===--------------------------------------------------------------------===//
 
 bool ChangesTouchConsumerTables(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
-                                const std::string &changes_made,
-                                const std::unordered_set<std::string> &filter_tables) {
+                                const std::string &changes_made, const std::unordered_set<std::string> &filter_tables) {
 	if (filter_tables.empty()) {
 		return true;
 	}

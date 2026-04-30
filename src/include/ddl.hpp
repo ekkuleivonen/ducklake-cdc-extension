@@ -27,8 +27,7 @@ namespace duckdb_cdc {
 //! snapshot rows before emitting them - the predicate intentionally lives
 //! in ddl.cpp because it walks DuckLake-emitted change tokens.
 bool ChangesTouchConsumerTables(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
-                                const std::string &changes_made,
-                                const std::unordered_set<std::string> &filter_tables);
+                                const std::string &changes_made, const std::unordered_set<std::string> &filter_tables);
 
 //! Register the schema-change table functions: cdc_ddl, cdc_recent_ddl,
 //! cdc_schema_diff. Called once at extension load.

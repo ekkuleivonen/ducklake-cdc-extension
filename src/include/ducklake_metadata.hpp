@@ -99,8 +99,7 @@ std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name
 int64_t ResolveSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &literal,
                         const std::string &argument_name, const std::string &feature_name, bool null_means_oldest);
 int64_t ResolveCreateSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &start_at);
-int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
-                             const std::string &to_snapshot);
+int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &to_snapshot);
 int64_t ResolveSchemaVersion(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id);
 int64_t CurrentSnapshot(duckdb::Connection &conn, const std::string &catalog_name);
 duckdb::Value SnapshotTime(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id);
@@ -124,8 +123,7 @@ std::string ListTablesAtSnapshot(duckdb::Connection &conn, const std::string &ca
 bool SnapshotHasSchemaChange(const std::string &changes_made);
 bool SnapshotIsExternalSchemaChange(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id);
 int64_t NextExternalSchemaChangeSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
-                                         int64_t start_snapshot, int64_t current_snapshot,
-                                         int64_t base_schema_version);
+                                         int64_t start_snapshot, int64_t current_snapshot, int64_t base_schema_version);
 
 //===--------------------------------------------------------------------===//
 // `since_seconds` lookback helpers (shared by stateless sugar)

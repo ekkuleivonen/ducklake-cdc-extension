@@ -1278,9 +1278,8 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
 		const auto first_snapshot = FirstSnapshotAfter(conn, data.catalog_name, last_snapshot, current_snapshot);
 		const auto start_snapshot = first_snapshot == -1 ? last_snapshot + 1 : first_snapshot;
-		int64_t end_snapshot = first_snapshot == -1
-		                           ? last_snapshot
-		                           : std::min(current_snapshot, start_snapshot + data.max_snapshots - 1);
+		int64_t end_snapshot =
+		    first_snapshot == -1 ? last_snapshot : std::min(current_snapshot, start_snapshot + data.max_snapshots - 1);
 		bool schema_changes_pending = false;
 		int64_t boundary_next_snapshot = -1;
 		int64_t boundary_next_schema_version = -1;

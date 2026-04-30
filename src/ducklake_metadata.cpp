@@ -267,9 +267,9 @@ std::string StateTable(const std::string &catalog_name, const std::string &table
 }
 
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
-	auto result =
-	    conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
-	               QuoteLiteral("__ducklake_metadata_" + catalog_name) + " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
+	auto result = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
+	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) +
+	                         " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
 	return result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       result->GetValue(0, 0).GetValue<int64_t>() > 0;
 }
@@ -345,10 +345,9 @@ duckdb::Value SnapshotTime(duckdb::Connection &conn, const std::string &catalog_
 
 int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_name, int64_t last_snapshot,
                            int64_t current_snapshot) {
-	auto result =
-	    conn.Query("SELECT snapshot_id FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id > " + std::to_string(last_snapshot) +
-	               " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	auto result = conn.Query("SELECT snapshot_id FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	                         " WHERE snapshot_id > " + std::to_string(last_snapshot) +
+	                         " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
 	if (!result || result->HasError()) {
 		return -1;
 	}
@@ -579,8 +578,8 @@ std::string DlqDdl(const std::string &catalog_name, bool use_state_schema) {
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
 	CheckCatalogOrThrow(context, catalog_name);
 	duckdb::Connection conn(*context.db);
-	auto create_schema =
-	    conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." + QuoteIdentifier(STATE_SCHEMA));
+	auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
+	                                QuoteIdentifier(STATE_SCHEMA));
 	const bool use_state_schema = create_schema && !create_schema->HasError();
 	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
