@@ -114,15 +114,31 @@ jobs:
     # bugs, and the `cdc_version()` hot path. Deeper coverage is gated on
     # upstream DuckLake building under sanitisers, tracked in
     # docs/upstream-asks.md.
+    #
+    # Build duration expectations: a cold-cache debug+sanitiser build of
+    # libduckdb_static + the unittest binary + ducklake_cdc takes ~25-45
+    # minutes on ubuntu-22.04 (-O0 + sanitiser instrumentation is ~3x
+    # slower than the release build). We skip the DuckDB shell, the
+    # benchmark suite, and the default test-dep extensions because the
+    # sanitiser smoke set doesn't reach any of them. Subsequent runs hit
+    # ccache and complete in ~5-10 minutes.
     name: Sanitiser smoke (ASan + UBSan, no-DuckLake set)
     needs: resolve-duckdb-version
     if: ${{ !inputs.community_pr_only }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       GEN: ninja
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
       VCPKG_TARGET_TRIPLET: x64-linux
+      # Trim the build to only what `SQL_TEST_SMOKE_NO_DUCKLAKE` needs:
+      # libduckdb_static + the unittest binary + ducklake_cdc. The shell,
+      # the benchmark suite, and the default test-dep extensions
+      # (jemalloc / parquet / etc. that get pulled into CORE_EXTENSIONS
+      # via BUILD_EXTENSION_TEST_DEPS=default) are not exercised by the
+      # smoke and add ~30-50% to the cold-cache build time.
+      BUILD_EXTENSION_TEST_DEPS: 'none'
+      EXT_DEBUG_FLAGS: '-DBUILD_SHELL=0 -DBUILD_BENCHMARKS=0'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,6 +154,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
+          # Keep the sanitiser cache distinct from the release cache —
+          # ccache hashes the full compile command (sanitiser flags
+          # included), so Debug+ASan objects never collide with Release
+          # objects anyway, and a shared key just means the two jobs
+          # evict each other.
           key: ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-${{ github.ref }}
           restore-keys: |
             ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-
@@ -149,11 +170,29 @@ jobs:
           vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
 
       - name: Build (debug, sanitisers on by default)
+        # ASan-instrumented compiles peak at 2-3 GB RSS each. Default ninja
+        # parallelism on ubuntu-22.04 (4 vCPU) runs 4-6 jobs concurrently,
+        # which can exceed the runner's 7 GB RAM and get the build killed
+        # by the OOM killer mid-stream (SIGTERM-shaped, not the SIGKILL
+        # you'd expect — the parent ninja catches the child kill and
+        # propagates as 143). Cap parallelism via
+        # `CMAKE_BUILD_PARALLEL_LEVEL=2` (cmake reads this for
+        # `cmake --build`, which is what the upstream extension-ci-tools
+        # Makefile invokes). Slightly slower wall time, reliably under
+        # the memory ceiling.
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+          NINJA_STATUS: '[%f/%t %es] '
         run: |
           export CCACHE_DIR=~/.ccache
           ccache -M 2G
+          # Free swap-able memory before the build; the GitHub runner
+          # ships with no swap by default and ASan-instrumented compiles
+          # are fragile at the edge.
+          free -h
           make debug
           ccache -s
+          free -h
 
       - name: Run no-DuckLake SQL smoke under sanitiser
         env:
