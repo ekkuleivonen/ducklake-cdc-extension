@@ -162,8 +162,7 @@ CDC_INCOMPATIBLE_CATALOG
 # the __ducklake_cdc_* tables were created as a side-effect of this test.
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = 'lake'
-  AND schema_name = 'main'
+WHERE database_name = '__ducklake_metadata_lake'
   AND table_name LIKE '\_\_ducklake\_cdc\_%' ESCAPE '\';
 ----
 0

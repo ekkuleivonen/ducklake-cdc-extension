@@ -16,7 +16,11 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/ducklake_cdc_extension.cpp
     src/compat_check.cpp
-    src/consumer_state.cpp)
+    src/ducklake_metadata.cpp
+    src/consumer.cpp
+    src/ddl.cpp
+    src/dml.cpp
+    src/stats.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

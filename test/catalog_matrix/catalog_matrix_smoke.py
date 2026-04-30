@@ -189,17 +189,15 @@ def run_demo_flow(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
     end_snapshot = scalar(conn, f"SELECT end_snapshot FROM cdc_window('lake', {quote_string(consumer)})")
     require_ok(conn, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer)}, {end_snapshot})")
 
-    # `lag_snapshots` is `current_snapshot() - last_committed_snapshot`, which
-    # is never zero for a live consumer: every `cdc_window`/`cdc_commit` call
-    # writes a CDC self-write snapshot (lease UPDATE, audit row) that lands
-    # AFTER the cursor. The right thing to assert on the matrix smoke leg is
-    # that the consumer is queryable and the lease is alive after the final
-    # commit; the exact lag depends on backend snapshot allocation.
+    # CDC state writes live in the metadata catalog now, so the final commit
+    # should leave the consumer caught up to the DuckLake snapshot head.
     stats = require_rows(
         conn,
-        "SELECT consumer_name, lease_alive FROM cdc_consumer_stats('lake', consumer := " + quote_string(consumer) + ")",
+        "SELECT consumer_name, lag_snapshots, lease_alive FROM cdc_consumer_stats('lake', consumer := "
+        + quote_string(consumer)
+        + ")",
     )
-    if len(stats) != 1 or stats[0][0] != consumer or stats[0][1] is not True:
+    if len(stats) != 1 or stats[0][0] != consumer or stats[0][1] != 0 or stats[0][2] is not True:
         raise RuntimeError(f"{backend}: unexpected cdc_consumer_stats row: {stats!r}")
 
 

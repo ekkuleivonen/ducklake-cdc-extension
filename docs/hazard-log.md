@@ -181,3 +181,74 @@ go; this file says what can hurt users or maintainers on the way there.
   retention expires the pre-drop snapshot.
 - Next action: Keep this as a known limitation unless a real audit workflow
   needs a helper around the time-travel recipe.
+
+### H-015: Sibling Metadata Schema State
+
+- Risk: Moving CDC persistence out of DuckLake-managed tables and into a
+  sibling schema in the metadata catalog removes DuckLake snapshot overhead, but
+  it also means CDC state is no longer protected by DuckLake's table DDL,
+  catalog-versioning, or data-type translation layer.
+- Status: partially handled.
+- Handling: CDC state now lives in the metadata catalog, using
+  `__ducklake_metadata_<catalog>.__ducklake_cdc` where schemas are supported and
+  a prefixed-table fallback for SQLite. Repeated string fields use portable JSON
+  text because SQLite does not preserve DuckDB LIST columns through the scanner
+  layer.
+- Notes: DuckDB and SQLite are covered by the catalog matrix smoke. PostgreSQL
+  still needs the same focused probe before this is treated as fully portable.
+- Next action: Extend the backend matrix probe to PostgreSQL and add explicit
+  cleanup/migration coverage for the state tables.
+
+### H-016: CDC State and DuckLake Snapshot Atomicity
+
+- Risk: Once CDC state lives outside DuckLake-managed tables, a `cdc_commit`
+  updates metadata-catalog state without creating a DuckLake snapshot. This is
+  the performance goal, but it weakens the current "all state is ordinary
+  DuckLake data" consistency story and can expose ordering bugs around producer
+  commits, consumer commits, rollbacks, and retries.
+- Status: partially handled.
+- Handling: Hot-path state writes are intentionally narrow metadata-catalog
+  updates, and `cdc_window` / `cdc_commit` continue resolving committed
+  snapshot ids against DuckLake before returning or advancing the cursor.
+- Notes: SQLite cannot safely hold a direct metadata write transaction open
+  while DuckLake reads snapshot metadata from the same backend, so lease and
+  commit writes are not grouped with the later snapshot scan. This preserves the
+  at-least-once SQL contract but weakens the old "one DuckLake table
+  transaction" story.
+- Next action: Add restart/race tests for commit idempotence, stolen-lease
+  rejection, and recovery after process death.
+
+### H-017: CDC State Discoverability and Migration
+
+- Risk: Users and operators can currently inspect CDC state as DuckLake tables
+  under `main`. A sibling metadata schema changes where state lives, which can
+  break ad-hoc runbooks, backups, and upgrades from earlier releases.
+- Status: partially handled.
+- Handling: Preserve the public table functions (`cdc_consumer_stats`,
+  `cdc_audit_recent`, and lifecycle functions) as the supported inspection
+  surface instead of asking users to query storage tables directly.
+- Notes: Existing `__ducklake_cdc_*` DuckLake tables may exist in early user
+  catalogs. The migration path must be explicit: either one-way copy into the
+  sibling schema with clear ownership, or a documented reset path for pre-1.0
+  catalogs.
+- Next action: Add an upgrade test that starts from the old DuckLake-table
+  layout.
+
+### H-018: Metadata State Retention
+
+- Risk: CDC-owned metadata tables are no longer DuckLake-managed data, so
+  DuckLake cleanup, compaction, and snapshot expiration will not prune them.
+  `__ducklake_cdc_audit` can grow without bound, and future DLQ writes would
+  create the same risk for `__ducklake_cdc_dlq`.
+- Status: partially handled.
+- Handling: `__ducklake_cdc_consumers` is bounded by the number of named
+  consumers, and `__ducklake_cdc_dlq` is schema-only in the shipped surface.
+  The current unbounded table is `__ducklake_cdc_audit`, which appends lifecycle
+  and lease-recovery events.
+- Notes: Heartbeats and commits should remain updates to
+  `__ducklake_cdc_consumers`, not append-only audit events, unless there is a
+  retention policy in place. Any future DLQ write path must ship with
+  acknowledge/replay/prune semantics.
+- Next action: Add an explicit maintenance surface, such as audit pruning by
+  age and observability for CDC metadata table row counts, before treating
+  long-lived catalogs as production-ready.

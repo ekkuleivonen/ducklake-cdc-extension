@@ -129,12 +129,21 @@ feature_* -> main -> manual release
 ## Where to start
 
 - `src/ducklake_cdc_extension.cpp` is the extension entry point. It registers
-  `cdc_version()` and the CDC table functions.
-- `src/include/consumer_state.hpp` shows the public surface for the consumer
-  state implementation.
-- `src/consumer_state.cpp` contains the CDC primitives and sugar functions.
-  Start from the registration function near the bottom, then jump to the
-  function you are changing.
+  `cdc_version()` and calls into the per-domain `Register*Functions`.
+- `src/include/ducklake_metadata.hpp` is the shared facts layer (catalog
+  table-name builders, snapshot lookups, JSON / quoting helpers, state-table
+  DDL, lazy bootstrap). `src/ducklake_metadata.cpp` implements it.
+- `src/include/consumer.hpp` + `src/consumer.cpp` own the consumer state
+  machine (create / reset / drop / list / force-release / heartbeat) and the
+  cursor primitives (cdc_window / cdc_commit / cdc_wait), plus the lease,
+  audit-writer, and notice helpers.
+- `src/include/ddl.hpp` + `src/ddl.cpp` own the schema-change reads
+  (cdc_ddl, cdc_recent_ddl, cdc_schema_diff) and the per-snapshot DDL
+  extraction / column-diff machinery.
+- `src/include/dml.hpp` + `src/dml.cpp` own the row-level reads
+  (cdc_events, cdc_changes, cdc_recent_changes).
+- `src/include/stats.hpp` + `src/stats.cpp` own the observability surface
+  (cdc_consumer_stats, cdc_audit_recent).
 - `test/sql/ducklake_cdc.test` is the smallest extension smoke test.
 - `test/sql/consumer_state.test` and `test/sql/sugar.test` are the best
   behavioural specs for the cursor and sugar surfaces.

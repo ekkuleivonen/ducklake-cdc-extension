@@ -1,0 +1,612 @@
+//===----------------------------------------------------------------------===//
+//                         ducklake_cdc
+//
+// ducklake_metadata.cpp
+//
+// Implementation of the shared "facts about the lake" layer. See
+// ducklake_metadata.hpp for the facts-vs-policy boundary that governs
+// what does and does not belong in this file.
+//===----------------------------------------------------------------------===//
+
+#include "ducklake_metadata.hpp"
+
+#include "compat_check.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+
+#include <cctype>
+#include <sstream>
+
+namespace duckdb_cdc {
+
+//===--------------------------------------------------------------------===//
+// State-schema constants and tunables (declared in ducklake_metadata.hpp)
+//===--------------------------------------------------------------------===//
+
+const char *const CONSUMERS_TABLE = "__ducklake_cdc_consumers";
+const char *const AUDIT_TABLE = "__ducklake_cdc_audit";
+const char *const DLQ_TABLE = "__ducklake_cdc_dlq";
+const char *const STATE_SCHEMA = "__ducklake_cdc";
+
+const int64_t DEFAULT_MAX_SNAPSHOTS = 100;
+const int64_t HARD_MAX_SNAPSHOTS = 1000;
+const int64_t DEFAULT_WAIT_TIMEOUT_MS = 30000;
+const int64_t HARD_WAIT_TIMEOUT_MS = 300000;
+const int64_t WAIT_INITIAL_INTERVAL_MS = 100;
+const int64_t WAIT_MAX_INTERVAL_MS = 10000;
+
+//===--------------------------------------------------------------------===//
+// SQL identifier / literal helpers
+//===--------------------------------------------------------------------===//
+
+std::string QuoteIdentifier(const std::string &identifier) {
+	return duckdb::KeywordHelper::WriteOptionallyQuoted(identifier);
+}
+
+std::string QuoteLiteral(const std::string &value) {
+	return duckdb::KeywordHelper::WriteQuoted(value);
+}
+
+//===--------------------------------------------------------------------===//
+// JSON / string helpers
+//===--------------------------------------------------------------------===//
+
+std::string JsonEscape(const std::string &value) {
+	std::ostringstream out;
+	for (auto c : value) {
+		switch (c) {
+		case '\\':
+			out << "\\\\";
+			break;
+		case '"':
+			out << "\\\"";
+			break;
+		default:
+			out << c;
+			break;
+		}
+	}
+	return out.str();
+}
+
+std::string TrimCopy(const std::string &value) {
+	size_t start = 0;
+	while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+		start++;
+	}
+	size_t end = value.size();
+	while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+		end--;
+	}
+	return value.substr(start, end - start);
+}
+
+std::string JsonStringArray(const std::vector<std::string> &values) {
+	std::ostringstream out;
+	out << "[";
+	for (size_t i = 0; i < values.size(); ++i) {
+		if (i > 0) {
+			out << ",";
+		}
+		out << "\"" << JsonEscape(values[i]) << "\"";
+	}
+	out << "]";
+	return out.str();
+}
+
+std::vector<std::string> ParseStringArray(const std::string &input) {
+	std::vector<std::string> values;
+	const auto text = TrimCopy(input);
+	if (text.empty() || text == "NULL") {
+		return values;
+	}
+	if (text.front() != '[' || text.back() != ']') {
+		values.push_back(text);
+		return values;
+	}
+	size_t i = 1;
+	while (i + 1 < text.size()) {
+		while (i + 1 < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',')) {
+			i++;
+		}
+		if (i + 1 >= text.size()) {
+			break;
+		}
+		if (text[i] == '"') {
+			i++;
+			std::ostringstream value;
+			while (i < text.size()) {
+				const auto c = text[i++];
+				if (c == '\\' && i < text.size()) {
+					value << text[i++];
+					continue;
+				}
+				if (c == '"') {
+					break;
+				}
+				value << c;
+			}
+			values.push_back(value.str());
+			continue;
+		}
+		const auto comma = text.find(',', i);
+		const auto end = comma == std::string::npos ? text.size() - 1 : comma;
+		const auto value = TrimCopy(text.substr(i, end - i));
+		if (!value.empty()) {
+			values.push_back(value);
+		}
+		if (comma == std::string::npos) {
+			break;
+		}
+		i = comma + 1;
+	}
+	return values;
+}
+
+duckdb::Value StringListValue(const duckdb::Value &value) {
+	if (value.IsNull()) {
+		return duckdb::Value();
+	}
+	if (value.type().id() == duckdb::LogicalTypeId::LIST) {
+		return value;
+	}
+	duckdb::vector<duckdb::Value> children;
+	for (const auto &entry : ParseStringArray(value.ToString())) {
+		children.push_back(duckdb::Value(entry));
+	}
+	return duckdb::Value::LIST(duckdb::LogicalType::VARCHAR, children);
+}
+
+bool StartsWith(const std::string &value, const std::string &prefix) {
+	return value.rfind(prefix, 0) == 0;
+}
+
+bool TryParseInt64(const std::string &input, int64_t &out) {
+	if (input.empty()) {
+		return false;
+	}
+	size_t i = 0;
+	if (input[0] == '+' || input[0] == '-') {
+		if (input.size() == 1) {
+			return false;
+		}
+		i = 1;
+	}
+	for (; i < input.size(); ++i) {
+		if (!std::isdigit(static_cast<unsigned char>(input[i]))) {
+			return false;
+		}
+	}
+	try {
+		out = std::stoll(input);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+std::string JsonValue(const duckdb::Value &value) {
+	if (value.IsNull()) {
+		return "null";
+	}
+	return "\"" + JsonEscape(value.ToString()) + "\"";
+}
+
+std::string JsonOptionalString(const duckdb::Value &v) {
+	if (v.IsNull()) {
+		return "null";
+	}
+	return std::string("\"") + JsonEscape(v.ToString()) + "\"";
+}
+
+//===--------------------------------------------------------------------===//
+// Bind-input / query-result helpers
+//===--------------------------------------------------------------------===//
+
+std::string GetStringArg(const duckdb::Value &value, const std::string &name) {
+	if (value.IsNull()) {
+		throw duckdb::BinderException("%s cannot be NULL", name);
+	}
+	return value.GetValue<std::string>();
+}
+
+int64_t SingleInt64(duckdb::MaterializedQueryResult &result, const std::string &description) {
+	if (result.HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID, result.GetError());
+	}
+	if (result.RowCount() == 0) {
+		throw duckdb::InvalidInputException("Unable to resolve %s", description);
+	}
+	auto value = result.GetValue(0, 0);
+	if (value.IsNull()) {
+		throw duckdb::InvalidInputException("Unable to resolve %s", description);
+	}
+	return value.GetValue<int64_t>();
+}
+
+void ThrowIfQueryFailed(const duckdb::unique_ptr<duckdb::MaterializedQueryResult> &result) {
+	if (result && result->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID, result->GetError());
+	}
+}
+
+void ExecuteChecked(duckdb::Connection &conn, const std::string &sql) {
+	auto result = conn.Query(sql);
+	ThrowIfQueryFailed(result);
+}
+
+std::string GenerateUuid(duckdb::Connection &conn) {
+	auto result = conn.Query("SELECT uuid()");
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		throw duckdb::InvalidInputException("Unable to generate owner token");
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
+//===--------------------------------------------------------------------===//
+// Catalog table-name builders + state-schema introspection
+//===--------------------------------------------------------------------===//
+
+std::string MetadataDatabase(const std::string &catalog_name) {
+	return QuoteIdentifier("__ducklake_metadata_" + catalog_name);
+}
+
+std::string MetadataTable(const std::string &catalog_name, const std::string &table_name) {
+	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(table_name);
+}
+
+std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema) {
+	if (use_state_schema) {
+		return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(STATE_SCHEMA) + "." + QuoteIdentifier(table_name);
+	}
+	return MetadataDatabase(catalog_name) + ".main." + QuoteIdentifier(table_name);
+}
+
+bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto result = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
+	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) +
+	                         " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
+	return result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	       result->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name) {
+	return StateTable(catalog_name, table_name, StateSchemaExists(conn, catalog_name));
+}
+
+//===--------------------------------------------------------------------===//
+// Snapshot fact lookups
+//===--------------------------------------------------------------------===//
+
+int64_t ResolveSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &literal,
+                        const std::string &argument_name, const std::string &feature_name, bool null_means_oldest) {
+	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto lower_literal = duckdb::StringUtil::Lower(literal);
+	if (literal.empty() && null_means_oldest) {
+		auto result = conn.Query("SELECT min(snapshot_id) FROM " + snapshot_table);
+		return SingleInt64(*result, argument_name + " => NULL");
+	}
+	if (lower_literal == "now") {
+		auto result = conn.Query("SELECT max(snapshot_id) FROM " + snapshot_table);
+		return SingleInt64(*result, argument_name + " => 'now'");
+	}
+	if (lower_literal == "beginning" || lower_literal == "oldest" || lower_literal == "oldest_available") {
+		auto result = conn.Query("SELECT min(snapshot_id) FROM " + snapshot_table);
+		return SingleInt64(*result, argument_name + " => 'beginning'");
+	}
+	int64_t snapshot = 0;
+	if (TryParseInt64(literal, snapshot)) {
+		auto result = conn.Query("SELECT snapshot_id FROM " + snapshot_table +
+		                         " WHERE snapshot_id = " + std::to_string(snapshot) + " LIMIT 1");
+		if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+			throw duckdb::InvalidInputException("%s %s snapshot %lld does not exist", feature_name, argument_name,
+			                                    static_cast<long long>(snapshot));
+		}
+		return snapshot;
+	}
+	throw duckdb::NotImplementedException(
+	    "CDC_FEATURE_NOT_YET_IMPLEMENTED: " + feature_name + " " + argument_name +
+	    " as TIMESTAMP is deferred; use 'now', 'beginning', 'oldest_available', or a BIGINT snapshot id");
+}
+
+int64_t ResolveCreateSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &start_at) {
+	return ResolveSnapshot(conn, catalog_name, start_at, "start_at", "cdc_consumer_create", false);
+}
+
+int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                             const std::string &to_snapshot) {
+	return ResolveSnapshot(conn, catalog_name, to_snapshot, "to_snapshot", "cdc_consumer_reset", true);
+}
+
+int64_t ResolveSchemaVersion(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
+	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	auto result = conn.Query("SELECT schema_version FROM " + snapshot_table +
+	                         " WHERE snapshot_id = " + std::to_string(snapshot_id) + " LIMIT 1");
+	return SingleInt64(*result, "schema_version");
+}
+
+int64_t CurrentSnapshot(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto result = conn.Query("SELECT max(snapshot_id) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	return SingleInt64(*result, "current snapshot");
+}
+
+duckdb::Value SnapshotTime(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
+	auto result = conn.Query("SELECT snapshot_time FROM " + MetadataTable(catalog_name, "ducklake_snapshot") +
+	                         " WHERE snapshot_id = " + std::to_string(snapshot_id));
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return duckdb::Value();
+	}
+	return result->GetValue(0, 0);
+}
+
+int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_name, int64_t last_snapshot,
+                           int64_t current_snapshot) {
+	auto result = conn.Query("SELECT snapshot_id FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	                         " WHERE snapshot_id > " + std::to_string(last_snapshot) +
+	                         " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	if (!result || result->HasError()) {
+		return -1;
+	}
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		auto snapshot_value = result->GetValue(0, i);
+		if (!snapshot_value.IsNull()) {
+			return snapshot_value.GetValue<int64_t>();
+		}
+	}
+	return -1;
+}
+
+void EnsureSnapshotExistsOrGap(duckdb::Connection &conn, const std::string &catalog_name,
+                               const std::string &consumer_name, int64_t snapshot_id) {
+	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	auto exists =
+	    conn.Query("SELECT count(*) FROM " + snapshot_table + " WHERE snapshot_id = " + std::to_string(snapshot_id));
+	if (SingleInt64(*exists, "snapshot existence") > 0) {
+		return;
+	}
+	auto oldest = conn.Query("SELECT min(snapshot_id) FROM " + snapshot_table);
+	const auto oldest_snapshot = SingleInt64(*oldest, "oldest snapshot");
+	throw duckdb::InvalidInputException(
+	    "CDC_GAP: consumer '%s' is at snapshot %lld, but the oldest available snapshot is %lld. To recover and skip "
+	    "the gap: CALL cdc_consumer_reset('%s', '%s', to_snapshot => 'oldest_available'); To preserve all events, "
+	    "run consumers more frequently than your expire_older_than setting.",
+	    consumer_name, static_cast<long long>(snapshot_id), static_cast<long long>(oldest_snapshot), catalog_name,
+	    consumer_name);
+}
+
+//! Build the human-readable list of qualified table names that exist at
+//! `snapshot_id`, used to fill out the `CDC_INVALID_TABLE_FILTER`
+//! reference message per docs/errors.md ("Tables in the lake at
+//! snapshot N: ..."). Empty list ⇒ "(no tables)".
+std::string ListTablesAtSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
+	auto result =
+	    conn.Query("SELECT s.schema_name || '.' || t.table_name FROM " + MetadataTable(catalog_name, "ducklake_table") +
+	               " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
+	               " s USING (schema_id) WHERE t.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) + ") ORDER BY 1");
+	if (!result || result->HasError()) {
+		return "(unable to enumerate tables)";
+	}
+	std::ostringstream out;
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		if (i > 0) {
+			out << ", ";
+		}
+		out << result->GetValue(0, i).ToString();
+	}
+	const auto rendered = out.str();
+	return rendered.empty() ? "(no tables)" : rendered;
+}
+
+//===--------------------------------------------------------------------===//
+// Structural schema-change predicates
+//===--------------------------------------------------------------------===//
+
+//! True iff `changes_made` contains at least one DDL token.
+bool SnapshotHasSchemaChange(const std::string &changes_made) {
+	static const std::vector<std::string> DDL_PREFIXES = {
+	    "created_table:", "altered_table:", "dropped_table:",  "created_view:",
+	    "altered_view:",  "dropped_view:",  "created_schema:", "dropped_schema:",
+	};
+	if (changes_made.empty()) {
+		return false;
+	}
+	size_t start = 0;
+	while (start < changes_made.size()) {
+		auto comma = changes_made.find(',', start);
+		auto token = changes_made.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+		for (const auto &prefix : DDL_PREFIXES) {
+			if (StartsWith(token, prefix)) {
+				return true;
+			}
+		}
+		if (comma == std::string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+	return false;
+}
+
+//! True iff the snapshot at `snapshot_id` carries at least one
+//! DDL token (i.e. it is itself a schema-change snapshot).
+//! Used by ReadWindow to surface `schema_changes_pending = true` even
+//! when the schema change is at `start_snapshot` (in which case
+//! `NextExternalSchemaChangeSnapshot` returns -1, since it searches
+//! strictly AFTER start).
+bool SnapshotIsExternalSchemaChange(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
+	auto result = conn.Query("SELECT changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	                         " WHERE snapshot_id = " + std::to_string(snapshot_id));
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return false;
+	}
+	auto changes_value = result->GetValue(0, 0);
+	if (changes_value.IsNull()) {
+		return false;
+	}
+	return SnapshotHasSchemaChange(changes_value.ToString());
+}
+
+//! Returns the first snapshot in `(start_snapshot, current_snapshot]`
+//! whose `changes_made` contains a DDL token. Comparing
+//! `ResolveSchemaVersion` directly is too broad because data-only commits can
+//! still advance DuckLake's physical schema version.
+//! `base_schema_version` is unused now (kept for source compat with
+//! older callers); the predicate is structural — "did this snapshot do
+//! DDL?" — not numeric.
+int64_t NextExternalSchemaChangeSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                         int64_t start_snapshot, int64_t current_snapshot,
+                                         int64_t /*base_schema_version*/) {
+	// Search strictly AFTER `start_snapshot`: the snapshot at `start` is
+	// the first one in this window. If it carries a schema change itself
+	// (e.g. the consumer just committed past the previous boundary and is
+	// about to read the ALTER), the window's schema_version is the
+	// post-change version (set by ResolveSchemaVersion(start) in the
+	// caller); bounding the window at `start - 1` here would be wrong.
+	auto result =
+	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	               " WHERE snapshot_id > " + std::to_string(start_snapshot) +
+	               " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	if (!result || result->HasError()) {
+		return -1;
+	}
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		auto snapshot_value = result->GetValue(0, i);
+		auto changes_value = result->GetValue(1, i);
+		if (snapshot_value.IsNull() || changes_value.IsNull()) {
+			continue;
+		}
+		if (SnapshotHasSchemaChange(changes_value.ToString())) {
+			return snapshot_value.GetValue<int64_t>();
+		}
+	}
+	return -1;
+}
+
+//===--------------------------------------------------------------------===//
+// `since_seconds` lookback helpers
+//===--------------------------------------------------------------------===//
+
+int64_t SinceSecondsParameter(duckdb::TableFunctionBindInput &input, int64_t default_value) {
+	auto entry = input.named_parameters.find("since_seconds");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return default_value;
+	}
+	return entry->second.GetValue<int64_t>();
+}
+
+//! Resolve the start snapshot for stateless `cdc_recent_*` calls. The start
+//! is `MAX(snapshot_id)` whose `snapshot_time <= now() - since_seconds`,
+//! so the returned snapshot is the most-recent commit *before* the cutoff
+//! and the read-out range `[start, current_snapshot()]` covers everything
+//! that happened in the lookback window. When no snapshot is older than
+//! the cutoff (typical for a brand-new catalog), start at 0 to include the
+//! catalog from the beginning.
+int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t since_seconds) {
+	// Epoch math instead of `now() - INTERVAL X SECOND`: DuckDB has no
+	// `-(TIMESTAMP_TZ, INTERVAL)` binder, but `epoch(...)` works on any
+	// timestamp variant and the comparison is straight DOUBLE arithmetic.
+	auto result =
+	    conn.Query("SELECT COALESCE(max(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot") +
+	               " WHERE epoch(snapshot_time) <= epoch(now()) - " + std::to_string(since_seconds));
+	return SingleInt64(*result, "since_seconds start snapshot");
+}
+
+//===--------------------------------------------------------------------===//
+// State-table DDL strings + lazy bootstrap
+//===--------------------------------------------------------------------===//
+
+std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema) {
+	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
+	       " ("
+	       "consumer_name VARCHAR, "
+	       "consumer_id BIGINT NOT NULL, "
+	       "tables VARCHAR, "
+	       "change_types VARCHAR, "
+	       "event_categories VARCHAR, "
+	       "stop_at_schema_change BOOLEAN NOT NULL, "
+	       "dml_blocked_by_failed_ddl BOOLEAN NOT NULL, "
+	       "last_committed_snapshot BIGINT, "
+	       "last_committed_schema_version BIGINT, "
+	       "owner_token UUID, "
+	       "owner_acquired_at TIMESTAMP WITH TIME ZONE, "
+	       "owner_heartbeat_at TIMESTAMP WITH TIME ZONE, "
+	       "lease_interval_seconds INTEGER NOT NULL, "
+	       "created_at TIMESTAMP WITH TIME ZONE NOT NULL, "
+	       "created_by VARCHAR, "
+	       "updated_at TIMESTAMP WITH TIME ZONE NOT NULL, "
+	       "metadata VARCHAR"
+	       ")";
+}
+
+std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
+	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, AUDIT_TABLE, use_state_schema) +
+	       " ("
+	       "audit_id BIGINT, "
+	       "ts TIMESTAMP WITH TIME ZONE NOT NULL, "
+	       "actor VARCHAR, "
+	       "action VARCHAR NOT NULL, "
+	       "consumer_name VARCHAR, "
+	       "consumer_id BIGINT, "
+	       "details VARCHAR"
+	       ")";
+}
+
+std::string DlqDdl(const std::string &catalog_name, bool use_state_schema) {
+	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, DLQ_TABLE, use_state_schema) +
+	       " ("
+	       "consumer_name VARCHAR, "
+	       "consumer_id BIGINT, "
+	       "snapshot_id BIGINT, "
+	       "event_kind VARCHAR, "
+	       "table_name VARCHAR, "
+	       "object_kind VARCHAR, "
+	       "object_id BIGINT, "
+	       "rowid BIGINT, "
+	       "change_type VARCHAR, "
+	       "failed_at TIMESTAMP WITH TIME ZONE, "
+	       "attempts INTEGER, "
+	       "last_error VARCHAR, "
+	       "payload VARCHAR"
+	       ")";
+}
+
+void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
+	CheckCatalogOrThrow(context, catalog_name);
+	duckdb::Connection conn(*context.db);
+	auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
+	                                QuoteIdentifier(STATE_SCHEMA));
+	const bool use_state_schema = create_schema && !create_schema->HasError();
+	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
+	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
+	ExecuteChecked(conn, DlqDdl(catalog_name, use_state_schema));
+}
+
+//===--------------------------------------------------------------------===//
+// Row-scan glue
+//===--------------------------------------------------------------------===//
+
+void RowScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input, duckdb::DataChunk &output) {
+	auto &state = input.global_state->Cast<RowScanState>();
+	if (state.offset >= state.rows.size()) {
+		return;
+	}
+	duckdb::idx_t count = 0;
+	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.offset++];
+		if (row.size() != output.ColumnCount()) {
+			throw duckdb::InternalException("Unaligned consumer-state row in table function result");
+		}
+		for (duckdb::idx_t col = 0; col < row.size(); ++col) {
+			output.SetValue(col, count, row[col]);
+		}
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+} // namespace duckdb_cdc
