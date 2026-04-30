@@ -46,8 +46,8 @@ statement ok
 SELECT * FROM cdc_consumer_create('lake', 'orders_only', start_at = '0');
 
 statement ok
-UPDATE lake.__ducklake_cdc_consumers
-SET tables = ['main.orders']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET tables = '["main.orders"]'
 WHERE consumer_name = 'orders_only';
 
 statement ok
@@ -115,8 +115,8 @@ statement ok
 SELECT * FROM cdc_consumer_create('lake', 'typo', start_at = '0');
 
 statement ok
-UPDATE lake.__ducklake_cdc_consumers
-SET tables = ['main.does_not_exist']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET tables = '["main.does_not_exist"]'
 WHERE consumer_name = 'typo';
 
 query II

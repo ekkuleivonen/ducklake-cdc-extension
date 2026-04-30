@@ -137,11 +137,10 @@ jobs:
         # hold against every catalog backend DuckLake supports. The earlier
         # follow-up flag (post-DDL `cdc_changes` returning the OLD schema
         # against runtime-installed DuckLake) was a Bind-time probe-snapshot
-        # bug — the probe was anchored at `last_committed_snapshot + 1`,
-        # which under runtime-loaded DuckLake almost always landed on a CDC
-        # self-write snapshot pre-ALTER, so the bind picked the wrong column
-        # set even when the runtime range crossed into the new schema. The
-        # probe now mirrors `ReadWindow`'s end-snapshot computation
+        # bug — the probe was anchored at `last_committed_snapshot + 1`
+        # instead of mirroring `ReadWindow`'s actual end-snapshot computation,
+        # so the bind could pick the wrong column set when schema boundaries
+        # truncated the runtime range. The probe now mirrors `ReadWindow`
         # read-only; see `CdcChangesBind` in `src/consumer_state.cpp`.
         run: |
           docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait

@@ -98,7 +98,7 @@ statement ok
 SELECT * FROM cdc_consumer_create('lake', 'other_only', start_at = '1');
 
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers SET tables = ['main.something_else']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers SET tables = '["main.something_else"]'
 WHERE consumer_name = 'other_only';
 
 query I
@@ -108,7 +108,7 @@ SELECT count(*) FROM cdc_events('lake', 'other_only');
 
 # Same consumer with 'orders' in its tables filter sees the events.
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers SET tables = ['main.orders']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers SET tables = '["main.orders"]'
 WHERE consumer_name = 'other_only';
 
 query I
@@ -151,8 +151,8 @@ SELECT count(DISTINCT next_snapshot_id) FROM cdc_changes('lake', 'orders_consume
 # filtering - if the consumer asked for it, it gets it; otherwise it
 # doesn't.
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers
-SET change_types = ['insert']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET change_types = '["insert"]'
 WHERE consumer_name = 'orders_consumer';
 
 query II
@@ -163,8 +163,8 @@ insert	1
 insert	2
 
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers
-SET change_types = ['update_postimage', 'update_preimage']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET change_types = '["update_postimage","update_preimage"]'
 WHERE consumer_name = 'orders_consumer';
 
 query II
@@ -180,8 +180,8 @@ statement ok
 SELECT * FROM cdc_consumer_create('lake', 'wrong_table', start_at = '1');
 
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers
-SET tables = ['main.something_else']
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET tables = '["main.something_else"]'
 WHERE consumer_name = 'wrong_table';
 
 statement error

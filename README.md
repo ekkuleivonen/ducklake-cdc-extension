@@ -40,9 +40,10 @@ of [DuckLake](https://ducklake.select).
   and Postgres-mirror sinks are not shipped.
 - **Backend coverage is smoke-level.** DuckDB, SQLite, and PostgreSQL
   catalog paths are exercised in CI, but not exhaustively certified.
-- **No DLQ semantics.** The `__ducklake_cdc_dlq` table is created at
-  bootstrap with the locked schema, but write/read/replay/acknowledge
-  helpers and the DDL-blocks-DML policy are not shipped.
+- **No DLQ semantics.** The metadata-catalog `__ducklake_cdc_dlq` state
+  table is created at bootstrap with the locked schema, but
+  write/read/replay/acknowledge helpers and the DDL-blocks-DML policy are
+  not shipped.
 - **No `doctor` command.** Operational diagnostics are still manual SQL
   via `cdc_consumer_stats` and `cdc_audit_recent`.
 - **Performance numbers are early signal.** The light benchmark harness

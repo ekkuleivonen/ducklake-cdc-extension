@@ -30,13 +30,18 @@ enforcement, and basic observability.
 
 ## Cursor State
 
-Consumer state lives in regular DuckLake catalog tables:
+Consumer state lives beside DuckLake's own metadata tables in the metadata
+catalog backend:
 
 - `__ducklake_cdc_consumers`
 - `__ducklake_cdc_audit`
 - `__ducklake_cdc_dlq`
 
-This keeps state close to the catalog snapshots it tracks. There is no external
+DuckDB and PostgreSQL metadata catalogs use a sibling `__ducklake_cdc` schema
+inside `__ducklake_metadata_<catalog>`. SQLite metadata catalogs do not support
+schemas, so they use prefixed tables in the metadata database `main` schema.
+This keeps state close to the catalog snapshots it tracks without making every
+cursor heartbeat or commit create a DuckLake snapshot. There is no external
 state store and no side database to keep in sync.
 
 ## Read and Commit Stay Separate

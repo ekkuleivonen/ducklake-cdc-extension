@@ -24,23 +24,34 @@ ATTACH 'ducklake:__TEST_DIR__/consumer_state.ducklake' AS lake (DATA_PATH '__TES
 # Fresh DuckLake catalog: no cdc state tables before the first lifecycle call.
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = 'lake'
-  AND schema_name = 'main'
+WHERE database_name = '__ducklake_metadata_lake'
+  AND schema_name = '__ducklake_cdc'
   AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
 ----
 0
 
 # Bootstrap fires on first create; the function returns a small useful row.
+statement ok
+SET VARIABLE snapshots_before_consumer_create = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
 query II
 SELECT consumer_name, consumer_id FROM cdc_consumer_create('lake', 'demo');
 ----
 demo	1
 
+# Consumer-state bootstrap lives outside DuckLake-managed tables and must not
+# create a DuckLake snapshot.
+query I
+SELECT max(snapshot_id) = getvariable('snapshots_before_consumer_create')
+FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+true
+
 # All three catalog-resident state tables now exist.
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = 'lake'
-  AND schema_name = 'main'
+WHERE database_name = '__ducklake_metadata_lake'
+  AND schema_name = '__ducklake_cdc'
   AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
 ----
 3
@@ -53,7 +64,7 @@ demo	1
 
 # The operation and its audit row are created together.
 query III
-SELECT action, consumer_name, consumer_id FROM lake.main.__ducklake_cdc_audit;
+SELECT action, consumer_name, consumer_id FROM __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_audit;
 ----
 consumer_create	demo	1
 
@@ -130,21 +141,30 @@ SELECT heartbeat_extended FROM cdc_consumer_heartbeat('lake', 'dml_window');
 ----
 true
 
+statement ok
+SET VARIABLE dml_window_end_snapshot = (SELECT end_snapshot FROM cdc_window('lake', 'dml_window'));
+
 query III
-SELECT consumer_name, committed_snapshot, schema_version
-FROM cdc_commit('lake', 'dml_window', 13);
+SELECT consumer_name,
+       committed_snapshot = getvariable('dml_window_end_snapshot'),
+       schema_version IS NOT NULL
+FROM cdc_commit('lake', 'dml_window', getvariable('dml_window_end_snapshot'));
 ----
-dml_window	13	4
+dml_window	1	1
 
 query I
-SELECT last_committed_snapshot FROM cdc_consumer_list('lake') WHERE consumer_name = 'dml_window';
+SELECT last_committed_snapshot = getvariable('dml_window_end_snapshot')
+FROM cdc_consumer_list('lake') WHERE consumer_name = 'dml_window';
 ----
-13
+true
 
 query III
-SELECT start_snapshot, end_snapshot, has_changes FROM cdc_window('lake', 'dml_window');
+SELECT start_snapshot = getvariable('dml_window_end_snapshot') + 1,
+       end_snapshot = getvariable('dml_window_end_snapshot'),
+       has_changes
+FROM cdc_window('lake', 'dml_window');
 ----
-14	13	false
+true	true	false
 
 query I
 SELECT snapshot_id IS NULL FROM cdc_wait('lake', 'dml_window', timeout_ms = 0);
@@ -228,7 +248,7 @@ consumer 'missing' does not exist
 
 # Reset writes audit rows and updates list output.
 query III
-SELECT action, consumer_name, consumer_id FROM lake.main.__ducklake_cdc_audit
+SELECT action, consumer_name, consumer_id FROM __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_audit
 WHERE action = 'consumer_reset'
 ORDER BY audit_id;
 ----
@@ -248,7 +268,7 @@ SELECT count(*) FROM cdc_consumer_list('lake') WHERE consumer_name = 'mirror';
 0
 
 query III
-SELECT action, consumer_name, consumer_id FROM lake.main.__ducklake_cdc_audit
+SELECT action, consumer_name, consumer_id FROM __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_audit
 WHERE action = 'consumer_drop'
 ORDER BY audit_id;
 ----
@@ -263,7 +283,7 @@ statement ok
 SELECT * FROM cdc_consumer_create('lake', 'leased');
 
 statement ok
-UPDATE lake.main.__ducklake_cdc_consumers
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
 SET owner_token = '00000000-0000-0000-0000-000000000001'::UUID,
     owner_acquired_at = now(),
     owner_heartbeat_at = now()
@@ -288,7 +308,7 @@ WHERE consumer_name = 'leased';
 true	true	true
 
 query III
-SELECT action, consumer_name, consumer_id FROM lake.main.__ducklake_cdc_audit
+SELECT action, consumer_name, consumer_id FROM __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_audit
 WHERE action = 'consumer_force_release'
 ORDER BY audit_id;
 ----
@@ -369,7 +389,10 @@ SELECT event_kind, object_kind, schema_name, object_name FROM cdc_ddl('ddl_lake'
 created	schema	ddl_s	ddl_s
 
 statement ok
-SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', 5);
+SET VARIABLE ddl_end_snapshot = (SELECT end_snapshot FROM cdc_window('ddl_lake', 'ddl_consumer'));
+
+statement ok
+SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', getvariable('ddl_end_snapshot'));
 
 statement ok
 CREATE TABLE ddl_lake.ddl_s.ddl_t(id INTEGER);
@@ -380,7 +403,10 @@ SELECT event_kind, object_kind, schema_name, object_name FROM cdc_ddl('ddl_lake'
 created	table	ddl_s	ddl_t
 
 statement ok
-SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', 8);
+SET VARIABLE ddl_end_snapshot = (SELECT end_snapshot FROM cdc_window('ddl_lake', 'ddl_consumer'));
+
+statement ok
+SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', getvariable('ddl_end_snapshot'));
 
 statement ok
 CREATE VIEW ddl_lake.ddl_s.ddl_v AS SELECT * FROM ddl_lake.ddl_s.ddl_t;
@@ -391,7 +417,10 @@ SELECT event_kind, object_kind, schema_name, object_name FROM cdc_ddl('ddl_lake'
 created	view	ddl_s	ddl_v
 
 statement ok
-SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', 11);
+SET VARIABLE ddl_end_snapshot = (SELECT end_snapshot FROM cdc_window('ddl_lake', 'ddl_consumer'));
+
+statement ok
+SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', getvariable('ddl_end_snapshot'));
 
 statement ok
 DROP VIEW ddl_lake.ddl_s.ddl_v;
@@ -402,7 +431,10 @@ SELECT event_kind, object_kind, schema_name, object_name FROM cdc_ddl('ddl_lake'
 dropped	view	ddl_s	ddl_v
 
 statement ok
-SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', 14);
+SET VARIABLE ddl_end_snapshot = (SELECT end_snapshot FROM cdc_window('ddl_lake', 'ddl_consumer'));
+
+statement ok
+SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', getvariable('ddl_end_snapshot'));
 
 statement ok
 DROP TABLE ddl_lake.ddl_s.ddl_t;
@@ -413,7 +445,10 @@ SELECT event_kind, object_kind, schema_name, object_name FROM cdc_ddl('ddl_lake'
 dropped	table	ddl_s	ddl_t
 
 statement ok
-SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', 17);
+SET VARIABLE ddl_end_snapshot = (SELECT end_snapshot FROM cdc_window('ddl_lake', 'ddl_consumer'));
+
+statement ok
+SELECT * FROM cdc_commit('ddl_lake', 'ddl_consumer', getvariable('ddl_end_snapshot'));
 
 statement ok
 DROP SCHEMA ddl_lake.ddl_s;
