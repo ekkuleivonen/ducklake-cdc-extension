@@ -32,13 +32,13 @@ in-process consumer.
 
 ## Where to read the numbers
 
-The Phase 1 smoke harness lives in `bench/runner.py`, with the first
-workload descriptor in `bench/light.yaml`. The manual benchmark workflow
-downloads the `linux_amd64` extension artifact from a successful CI run
-(or builds locally), executes that descriptor against the supported
-official DuckDB release, and uploads the result JSON as an artifact. Selected baselines
-can be committed under `bench/results/` once there is enough history to
-make a trajectory meaningful.
+The smoke harness lives in `bench/runner.py`, with the first workload
+descriptor in `bench/light.yaml`. The manual benchmark workflow downloads the
+`linux_amd64` extension artifact from a successful CI run (or builds locally),
+executes that descriptor against the supported official DuckDB release, and
+uploads the result JSON as an artifact. Selected baselines can be committed
+under `bench/results/` once there is enough history to make a trajectory
+meaningful.
 
 ## What we are bad at
 
@@ -69,7 +69,7 @@ A change that improves one axis at the cost of another is a tradeoff
 worth documenting in commit / PR text. A change that improves all four
 is rare and worth celebrating.
 
-## Soft gates today, hard gates after Phase 5
+## Current benchmark discipline
 
 The manual benchmark gate is **"the harness ran and produced a number"**.
 Soft gates print `::warning::` annotations when:
@@ -78,16 +78,14 @@ Soft gates print `::warning::` annotations when:
 - `catalog_qps_avg > 5` (one consumer at default backoff).
 
 Latency thresholds are recorded but not gated. The absolute target
-(`p99 < 1s` for the `light` workload, per ADR 0011) only becomes a
-hard CI gate after Phase 5 ratifies the production number on
-representative hardware. The interim discipline is "no regression vs
+(`p99 < 1s` for the `light` workload) is a design target, not a hard
+contract. The useful discipline for now is "no surprising regression vs.
 previous run for this workload + commit-relative hardware label" — the
-trajectory matters more than the absolute number until the absolute
-number has been measured on representative hardware.
+trajectory matters more than the absolute number until the project has enough
+history.
 
 The benchmark workflow already runs after the extension distribution
 matrix by downloading the matrix-built artifact. The likely future regular
 CI gate is a 5-minute `medium` workload on every platform the matrix
-builds and every supported catalog backend available there. Long soaks,
-heavy workloads, and variable-load profiles remain scheduled or
-release-gated checks rather than the default PR loop.
+builds and every supported catalog backend available there. Long soaks, heavy
+workloads, and variable-load profiles are not part of the default PR loop.
