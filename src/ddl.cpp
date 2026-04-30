@@ -1074,7 +1074,7 @@ void ApplyDdlSubscriptionFilter(std::vector<std::vector<duckdb::Value>> &rows,
 		const auto object_kind = row[3].IsNull() ? std::string() : row[3].ToString();
 		bool keep = false;
 		for (const auto &subscription : subscriptions) {
-			if (subscription.event_category != "ddl" || subscription.status == "dropped") {
+			if (subscription.event_category != "ddl") {
 				continue;
 			}
 			if (subscription.scope_kind == "catalog") {

@@ -450,7 +450,10 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 			probe_snapshot = end_snapshot >= start_snapshot ? end_snapshot : start_snapshot;
 		}
 	}
-	probe_snapshot = current_snapshot;
+	const auto table_name_at_probe = CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, probe_snapshot);
+	if (table_name_at_probe.empty() || table_name_at_probe != result->table_name) {
+		probe_snapshot = current_snapshot;
+	}
 	auto probe = conn.Query("SELECT * FROM " +
 	                        DuckLakeTableChangesCall(result->catalog_name, result->table_name, probe_snapshot,
 	                                                 probe_snapshot) +
