@@ -197,9 +197,7 @@ def run_demo_flow(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
     # commit; the exact lag depends on backend snapshot allocation.
     stats = require_rows(
         conn,
-        "SELECT consumer_name, lease_alive FROM cdc_consumer_stats('lake', consumer := "
-        + quote_string(consumer)
-        + ")",
+        "SELECT consumer_name, lease_alive FROM cdc_consumer_stats('lake', consumer := " + quote_string(consumer) + ")",
     )
     if len(stats) != 1 or stats[0][0] != consumer or stats[0][1] is not True:
         raise RuntimeError(f"{backend}: unexpected cdc_consumer_stats row: {stats!r}")

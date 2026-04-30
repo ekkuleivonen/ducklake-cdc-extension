@@ -2737,8 +2737,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 			const auto start_snapshot = first_external_snapshot;
 			int64_t end_snapshot = std::min(current_snapshot, start_snapshot + result->max_snapshots - 1);
 			if (start_snapshot <= current_snapshot && consumer_row.stop_at_schema_change) {
-				const auto base_schema_version =
-				    ResolveSchemaVersion(conn, result->catalog_name, last_snapshot);
+				const auto base_schema_version = ResolveSchemaVersion(conn, result->catalog_name, last_snapshot);
 				const auto next_schema_change = NextExternalSchemaChangeSnapshot(
 				    conn, result->catalog_name, start_snapshot, current_snapshot, base_schema_version);
 				if (next_schema_change != -1 && next_schema_change <= end_snapshot) {
