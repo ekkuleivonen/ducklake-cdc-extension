@@ -18,8 +18,9 @@ What exists today:
 
 - The SQL extension surface: `cdc_window`, `cdc_commit`, `cdc_wait`,
   `cdc_ddl`, `cdc_changes`, `cdc_events`, `cdc_recent_changes`,
-  `cdc_recent_ddl`, `cdc_schema_diff`, `cdc_consumer_*`,
-  `cdc_consumer_stats`, and `cdc_audit_recent`.
+  `cdc_recent_ddl`, `cdc_range_events`, `cdc_range_ddl`,
+  `cdc_range_changes`, `cdc_schema_diff`, `cdc_doctor`,
+  `cdc_consumer_*`, `cdc_consumer_stats`, and `cdc_audit_recent`.
 - Owner-token leasing for single-reader-per-consumer enforcement.
 - Community extension publishing, proven through the `v0.2.0` line.
 - CI smoke coverage for DuckDB, SQLite, and PostgreSQL DuckLake catalogs.
@@ -29,48 +30,66 @@ What is still intentionally thin:
 
 - No Python client package.
 - No reference sinks.
-- No DLQ helper API beyond the schema created by the extension.
+- No extension-owned sink failure queue or validation framework. Sink retries,
+  failure classification, quarantine policy, and exactly-once-ish semantics
+  belong in clients and sinks.
 - Backend coverage is smoke-level, not exhaustive certification.
 - Performance numbers are early signal, not production contracts.
 
 ## Direction
 
-### Just Finished: Clean Up the Docs
+### Just Finished: TDD the Verified Surface
 
-The docs have been reduced to the pieces a single weekend maintainer should be
-able to keep current.
+The SQL surface has been checked and locked in with tests against the main use
+cases that motivate the project: ad-hoc SQL inspection, managed subscribers,
+streaming pipeline consumers, catalog/schema replication, replay/backfill, and
+operational diagnostics.
 
-What remains:
+Decisions from this pass:
 
-- Keep the README, API reference, examples, roadmap, and hazard log.
-- Keep focused operational docs that explain current behavior.
-- Keep design notes short and tied to shipped metadata/catalog behavior.
-- Keep `INSTALL ducklake_cdc FROM community` working.
+- Keep `cdc_changes`, `cdc_ddl`, and `cdc_events` focused on the current
+  leased consumer window.
+- Added explicit stateless range helpers for bounded replay/export/debug work:
+  `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes`.
+- Added `cdc_doctor` as the common health-check surface for SQL users, support
+  requests, and the future Python client.
+- Treat operational replay as a named-consumer workflow: use a separate
+  backfill consumer when live processing must continue independently.
+- Do not impose a JSON envelope on DuckLake `commit_extra_info`; producers and
+  clients own those conventions.
+- Do not expose an extension-owned sink failure queue. The extension provides
+  at-least-once replay mechanics; clients and sinks own idempotency, retries,
+  validation, quarantine policy, and external side-effect semantics.
 
-### Now: Verify the Extension Surface
+### Now: Python Client
 
-The next chapter is a couple focused passes on the extension itself.
-
-Likely work:
-
-- Check that the SQL API covers the use cases that motivated the project.
-- Add targeted tests for hazards that are real and reproducible.
-- Look for simple performance wins in the hot paths.
-- Keep the catalog-matrix smoke small and meaningful.
-- Improve examples where the SQL surface feels awkward.
-
-### Next: Python Client
-
-The first client should be Python, because it is the shortest path from the SQL
-extension to people actually trying the project in scripts, notebooks, and
+The next chapter is the first client, because it is the shortest path from the
+SQL extension to people actually trying the project in scripts, notebooks, and
 small services.
 
 Likely work:
 
 - Explicit iterator + commit API first.
 - A small `tail()` helper once the explicit API feels right.
+- A replay/backfill helper that can create or use a separate consumer for
+  bounded historical work.
 - Stdout/file/webhook-style examples before heavier sinks.
 - Client-side handling for dedicated wait connections and heartbeats.
+- Client-owned retry/idempotency/failure handling. Do not push sink-specific
+  quarantine semantics back into the extension.
+
+### Next: Client Examples and Feedback
+
+Once the Python client can drive the core consumer loop, use examples and real
+feedback to decide what deserves to become product surface.
+
+Likely work:
+
+- End-to-end examples for DDL-only watching, catalog replication, and table
+  change processing.
+- A small operational recipe around `cdc_doctor`, stale leases, lag, and replay.
+- Tighten docs around client-owned idempotency, retry, and dead-letter handling
+  without adding extension-owned sink semantics.
 
 ### Later: Only If Demand Appears
 
@@ -78,7 +97,7 @@ These are not near-term plans:
 
 - Other language clients.
 - Kafka, Redis Streams, or Postgres mirror sinks.
-- Large DLQ machinery.
+- Large validation or quarantine machinery.
 - Long soak-test programs.
 - A full docs site.
 

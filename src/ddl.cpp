@@ -1255,6 +1255,90 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRecentDdlInit(duckdb::Cl
 }
 
 //===--------------------------------------------------------------------===//
+// cdc_range_ddl
+//===--------------------------------------------------------------------===//
+
+struct CdcRangeDdlData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	int64_t from_snapshot;
+	int64_t to_snapshot;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CdcRangeDdlData>();
+		result->catalog_name = catalog_name;
+		result->from_snapshot = from_snapshot;
+		result->to_snapshot = to_snapshot;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+int64_t RangeDdlToSnapshotParameter(duckdb::Connection &conn, duckdb::TableFunctionBindInput &input,
+                                    const std::string &catalog_name, duckdb::idx_t positional_index) {
+	if (input.inputs.size() > positional_index) {
+		if (input.inputs[positional_index].IsNull()) {
+			return CurrentSnapshot(conn, catalog_name);
+		}
+		return input.inputs[positional_index].GetValue<int64_t>();
+	}
+	auto entry = input.named_parameters.find("to_snapshot");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return CurrentSnapshot(conn, catalog_name);
+	}
+	return entry->second.GetValue<int64_t>();
+}
+
+void ValidateDdlRangeBounds(duckdb::Connection &conn, const std::string &catalog_name, int64_t from_snapshot,
+                            int64_t to_snapshot) {
+	if (to_snapshot < from_snapshot) {
+		throw duckdb::InvalidInputException("cdc_range_ddl: from_snapshot must be <= to_snapshot");
+	}
+	auto oldest_result =
+	    conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
+	if (from_snapshot < oldest_snapshot) {
+		throw duckdb::InvalidInputException(
+		    "cdc_range_ddl: from_snapshot %lld is older than oldest available snapshot %lld",
+		    static_cast<long long>(from_snapshot), static_cast<long long>(oldest_snapshot));
+	}
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcRangeDdlBind(duckdb::ClientContext &context,
+                                                         duckdb::TableFunctionBindInput &input,
+                                                         duckdb::vector<duckdb::LogicalType> &return_types,
+                                                         duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException("cdc_range_ddl requires catalog, from_snapshot, and optional to_snapshot");
+	}
+	auto result = duckdb::make_uniq<CdcRangeDdlData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
+	CheckCatalogOrThrow(context, result->catalog_name);
+	duckdb::Connection conn(*context.db);
+	result->to_snapshot = RangeDdlToSnapshotParameter(conn, input, result->catalog_name, 2);
+	ValidateDdlRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot);
+
+	names = {"snapshot_id", "snapshot_time", "event_kind",  "object_kind", "schema_id",
+	         "schema_name", "object_id",     "object_name", "details"};
+	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,       duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR};
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeDdlInit(duckdb::ClientContext &context,
+                                                                     duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<CdcRangeDdlData>();
+	duckdb::Connection conn(*context.db);
+	ExtractDdlRows(conn, data.catalog_name, data.from_snapshot, data.to_snapshot, std::string(), result->rows);
+	return std::move(result);
+}
+
+//===--------------------------------------------------------------------===//
 // cdc_schema_diff
 //===--------------------------------------------------------------------===//
 
@@ -1584,6 +1668,21 @@ void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
 		recent_ddl_function.named_parameters["since_seconds"] = duckdb::LogicalType::BIGINT;
 		recent_ddl_function.named_parameters["for_table"] = duckdb::LogicalType::VARCHAR;
 		loader.RegisterFunction(recent_ddl_function);
+	}
+
+	for (const auto &name : {"cdc_range_ddl", "ducklake_cdc_range_ddl"}) {
+		duckdb::TableFunction range_ddl_function_2(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
+		    RowScanExecute, CdcRangeDdlBind, CdcRangeDdlInit);
+		range_ddl_function_2.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		loader.RegisterFunction(range_ddl_function_2);
+		duckdb::TableFunction range_ddl_function_3(name,
+		                                           duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
+		                                                                                duckdb::LogicalType::BIGINT,
+		                                                                                duckdb::LogicalType::BIGINT},
+		                                           RowScanExecute, CdcRangeDdlBind, CdcRangeDdlInit);
+		range_ddl_function_3.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		loader.RegisterFunction(range_ddl_function_3);
 	}
 
 	for (const auto &name : {"cdc_schema_diff", "ducklake_cdc_schema_diff"}) {

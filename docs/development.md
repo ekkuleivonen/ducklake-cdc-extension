@@ -77,22 +77,26 @@ One-shot example:
 
 ## Test
 
-Run all SQLLogicTests against the **debug** build:
+Run the full local SQLLogicTest set against the **release** build:
 
 ```bash
-make test_debug
+make test_local_full
 ```
 
-Against the **release** build:
+Run the sanitizer-friendly debug smoke:
 
 ```bash
-make test
+make test_local_sanitizer
 ```
+
+Debug builds enable ASan/UBSan and cannot load the official prebuilt
+`ducklake.duckdb_extension`, so full DuckLake SQL coverage runs through the
+release target.
 
 Run a single SQLLogicTest file:
 
 ```bash
-build/debug/test/unittest --test-dir . "test/sql/ducklake_cdc.test"
+build/release/test/unittest --test-dir . "test/sql/ducklake_cdc.test"
 ```
 
 Swap the path for any file under `test/sql/`.

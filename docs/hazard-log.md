@@ -73,7 +73,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled for the main gap path.
 - Handling: `cdc_window` raises `CDC_GAP`, `cdc_consumer_reset` supports
   recovery, and `test/smoke/toctou_expire_smoke.py` covers the compaction gap
-  path.
+  path. Planned stateless range helpers must apply the same explicit gap
+  handling when `from_snapshot` is older than the oldest available snapshot.
 - Next action: Keep operator docs clear that retention must exceed expected
   consumer lag.
 
@@ -91,16 +92,19 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Client libraries should hide this by using dedicated wait
   connections.
 
-### H-007: DLQ Semantics
+### H-007: Sink Failure Semantics
 
 - Risk: Failed sink writes, especially failed DDL, need a durable operator flow;
   otherwise a single bad event can either halt work or create a flood of bad
   downstream writes.
-- Status: not handled.
-- Handling: The `__ducklake_cdc_dlq` table schema exists, but helper APIs and
-  DDL-blocks-DML semantics are not shipped.
-- Next action: Do not build a large DLQ system until there is a real sink/client
-  path that needs it.
+- Status: intentionally client-owned.
+- Handling: The extension exposes at-least-once windows and only advances a
+  cursor when `cdc_commit` succeeds. It does not persist a generic failure
+  queue because only the client/sink can classify whether a failure belongs to
+  a window, snapshot, table, DDL event, row, or user callback.
+- Next action: Let the Python client and reference sinks prove retry,
+  idempotency, validation, and quarantine patterns before adding any shared
+  failure persistence.
 
 ### H-008: No Client Libraries or Reference Sinks
 
@@ -238,17 +242,37 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: CDC-owned metadata tables are no longer DuckLake-managed data, so
   DuckLake cleanup, compaction, and snapshot expiration will not prune them.
-  `__ducklake_cdc_audit` can grow without bound, and future DLQ writes would
-  create the same risk for `__ducklake_cdc_dlq`.
+  `__ducklake_cdc_audit` can grow without bound.
 - Status: partially handled.
 - Handling: `__ducklake_cdc_consumers` is bounded by the number of named
-  consumers, and `__ducklake_cdc_dlq` is schema-only in the shipped surface.
-  The current unbounded table is `__ducklake_cdc_audit`, which appends lifecycle
-  and lease-recovery events.
+  consumers. The current unbounded table is `__ducklake_cdc_audit`, which
+  appends lifecycle and lease-recovery events.
 - Notes: Heartbeats and commits should remain updates to
   `__ducklake_cdc_consumers`, not append-only audit events, unless there is a
-  retention policy in place. Any future DLQ write path must ship with
-  acknowledge/replay/prune semantics.
+  retention policy in place. Any future shared failure-persistence path must
+  ship with acknowledge/replay/prune semantics.
 - Next action: Add an explicit maintenance surface, such as audit pruning by
   age and observability for CDC metadata table row counts, before treating
   long-lived catalogs as production-ready.
+
+### H-019: Stateless Range Semantics
+
+- Risk: `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes` may appear
+  equivalent to consumer-window reads, but they intentionally do not acquire
+  leases, apply subscription filters, move cursors, or enforce consumer schema
+  boundary policy.
+- Status: not handled.
+- Handling: The API docs distinguish durable replay from stateless range reads.
+- Next action: Add TDD coverage for range gap handling, `to_snapshot := NULL`,
+  DDL/DML ordering, and proof that range reads do not mutate consumer state.
+
+### H-020: Diagnostic False Confidence
+
+- Risk: `cdc_doctor` can make operators trust an incomplete health report,
+  especially if new hazards are added without updating doctor checks.
+- Status: not handled.
+- Handling: `cdc_doctor` is planned as an advisory table function, not a proof
+  of correctness.
+- Next action: Keep doctor checks tied to concrete hazards: gap risk, stale
+  leases, dropped or renamed subscriptions, metadata presence, catalog
+  compatibility, suspicious lag, and recent reset or force-release audit events.

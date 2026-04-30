@@ -35,9 +35,12 @@ contracts.
   [`cdc_ddl`](#cdc_ddl), [`cdc_events`](#cdc_events)
 - Stateless helpers: [`cdc_recent_changes`](#cdc_recent_changes),
   [`cdc_recent_ddl`](#cdc_recent_ddl),
-  [`cdc_schema_diff`](#cdc_schema_diff)
+  [`cdc_schema_diff`](#cdc_schema_diff),
+  [`cdc_range_events`](#cdc_range_events),
+  [`cdc_range_ddl`](#cdc_range_ddl),
+  [`cdc_range_changes`](#cdc_range_changes)
 - Observability: [`cdc_consumer_stats`](#cdc_consumer_stats),
-  [`cdc_audit_recent`](#cdc_audit_recent)
+  [`cdc_audit_recent`](#cdc_audit_recent), [`cdc_doctor`](#cdc_doctor)
 
 ---
 
@@ -150,10 +153,13 @@ SELECT * FROM cdc_consumer_reset(catalog, name, to_snapshot := NULL);
 ```
 
 Repositions the cursor and clears the lease. `to_snapshot := NULL` resets
-to the current head; pass an explicit snapshot id to rewind or fast-forward.
+to the current head; pass an explicit snapshot id to replay from an older
+point or fast-forward past already-handled work.
 
 **Use cases:** re-sync a downstream sink after a corruption rebuild; pin
-a consumer to a known good snapshot during incident recovery.
+a consumer to a known good snapshot during incident recovery; create a
+separate backfill consumer that replays `[to_snapshot, current_head]`
+while the live consumer keeps serving current time.
 
 **Returns:** `consumer_name VARCHAR, consumer_id BIGINT, previous_snapshot BIGINT, new_snapshot BIGINT`.
 
@@ -249,8 +255,7 @@ state each consumer is configured with.
 **Returns:**
 `consumer_name VARCHAR, consumer_id BIGINT, subscription_count BIGINT,
 subscriptions_active BIGINT, subscriptions_renamed BIGINT,
-subscriptions_dropped BIGINT,
-stop_at_schema_change BOOLEAN, dml_blocked_by_failed_ddl BOOLEAN,
+subscriptions_dropped BIGINT, stop_at_schema_change BOOLEAN,
 last_committed_snapshot BIGINT, last_committed_schema_version BIGINT,
 owner_token UUID, owner_acquired_at TIMESTAMPTZ,
 owner_heartbeat_at TIMESTAMPTZ, lease_interval_seconds INTEGER,
@@ -258,11 +263,11 @@ created_at TIMESTAMPTZ, created_by VARCHAR, updated_at TIMESTAMPTZ,
 metadata VARCHAR`.
 
 ```text
-┌───────────────┬─────────────┬────────────────────┬──────────────────────┬───────────────────────┬───────────────────────┬────────────────────────┬──────────────────────────┬─────────────────────────┬───────────────────────────────┬───────────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────────────────┬────────────┬─────────────────────────┬──────────┐
-│ consumer_name │ consumer_id │ subscription_count │ subscriptions_active │ subscriptions_renamed │ subscriptions_dropped │ stop_at_schema_change  │ dml_blocked_by_failed_ddl│ last_committed_snapshot │ last_committed_schema_version │ owner_token           │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ created_at              │ created_by │ updated_at              │ metadata │
-├───────────────┼─────────────┼────────────────────┼──────────────────────┼───────────────────────┼───────────────────────┼────────────────────────┼──────────────────────────┼─────────────────────────┼───────────────────────────────┼───────────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────────────────┼────────────┼─────────────────────────┼──────────┤
-│ orders_sink   │           1 │                  2 │                    2 │                     0 │                     0 │ true                   │ false                    │                      42 │                             3 │ 8f3a3c2e-…-b2c1       │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ 2026-04-30 08:00:00+00  │ ekku       │ 2026-04-30 09:31:08+00  │ NULL     │
-└───────────────┴─────────────┴────────────────────┴──────────────────────┴───────────────────────┴───────────────────────┴────────────────────────┴──────────────────────────┴─────────────────────────┴───────────────────────────────┴───────────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────────────────┴────────────┴─────────────────────────┴──────────┘
+┌───────────────┬─────────────┬────────────────────┬──────────────────────┬───────────────────────┬───────────────────────┬───────────────────────┬─────────────────────────┬───────────────────────────────┬───────────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────────────────┬────────────┬─────────────────────────┬──────────┐
+│ consumer_name │ consumer_id │ subscription_count │ subscriptions_active │ subscriptions_renamed │ subscriptions_dropped │ stop_at_schema_change │ last_committed_snapshot │ last_committed_schema_version │ owner_token           │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ created_at              │ created_by │ updated_at              │ metadata │
+├───────────────┼─────────────┼────────────────────┼──────────────────────┼───────────────────────┼───────────────────────┼───────────────────────┼─────────────────────────┼───────────────────────────────┼───────────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────────────────┼────────────┼─────────────────────────┼──────────┤
+│ orders_sink   │           1 │                  2 │                    2 │                     0 │                     0 │ true                  │                      42 │                             3 │ 8f3a3c2e-…-b2c1       │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ 2026-04-30 08:00:00+00  │ ekku       │ 2026-04-30 09:31:08+00  │ NULL     │
+└───────────────┴─────────────┴────────────────────┴──────────────────────┴───────────────────────┴───────────────────────┴───────────────────────┴─────────────────────────┴───────────────────────────────┴───────────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────────────────┴────────────┴─────────────────────────┴──────────┘
 ```
 
 ### `cdc_consumer_subscriptions`
@@ -472,6 +477,9 @@ DML rows, use `cdc_changes`; for typed DDL rows, use `cdc_ddl`.
 
 **Use cases:** outbox-style dispatch on `commit_extra_info`; lake
 dashboards that want one row per snapshot with author and message.
+The extension exposes `commit_extra_info` unchanged; producer teams and
+clients own any JSON envelope, versioning, or routing convention they put
+inside it.
 
 **Returns:**
 `snapshot_id BIGINT, snapshot_time TIMESTAMPTZ, changes_made VARCHAR,
@@ -574,6 +582,73 @@ parent_column_id BIGINT`.
 └─────────────┴─────────────────────────┴──────────────┴───────────┴──────────┴─────────────┴──────────┴──────────┴─────────────┴─────────────┴──────────────┴──────────────┴──────────────────┘
 ```
 
+### `cdc_range_events`
+
+```sql
+SELECT * FROM cdc_range_events(
+  catalog,
+  from_snapshot,
+  to_snapshot := NULL
+);
+```
+
+Stateless snapshot-level events over an explicit snapshot range.
+`to_snapshot := NULL` means the current catalog head. This does not create
+or advance a consumer and does not apply subscription filters.
+
+**Use cases:** export or inspect lake activity between two snapshots;
+debug what a future consumer would have seen; build bounded backfill
+plans without touching the live consumer cursor.
+
+**Returns:** the same row shape as `cdc_events`.
+
+### `cdc_range_ddl`
+
+```sql
+SELECT * FROM cdc_range_ddl(
+  catalog,
+  from_snapshot,
+  to_snapshot := NULL
+);
+```
+
+Stateless DDL events over an explicit snapshot range. `to_snapshot :=
+NULL` means the current catalog head. This does not create or advance a
+consumer and does not apply subscription filters.
+
+**Use cases:** audit schema evolution across a bounded range; prepare a
+schema migration plan before replaying data into a downstream sink.
+
+**Returns:** the same row shape as `cdc_ddl`.
+
+### `cdc_range_changes`
+
+```sql
+SELECT * FROM cdc_range_changes(
+  catalog,
+  from_snapshot,
+  to_snapshot   := NULL,
+  table_id      := NULL, -- preferred identity form
+  table_name    := NULL  -- name sugar, resolved for the requested range
+);
+```
+
+Stateless, row-level DML for one table over an explicit snapshot range.
+`to_snapshot := NULL` means the current catalog head. This does not create
+or advance a consumer and does not apply subscription filters.
+
+Snapshot ids are the canonical range boundary. Timestamp sugar may be
+added later, but must define whether a timestamp maps to the first
+snapshot after the timestamp or the latest snapshot at or before it.
+
+**Use cases:** bounded backfills, one-off exports, sink dry-runs, and
+debugging replay plans while a separate live consumer continues to run.
+
+**Returns (variable shape):**
+`snapshot_id BIGINT, rowid BIGINT, change_type VARCHAR,
+<user columns from the table…>, snapshot_time TIMESTAMPTZ,
+author VARCHAR, commit_message VARCHAR, commit_extra_info VARCHAR`.
+
 ---
 
 ## Observability
@@ -638,6 +713,39 @@ consumer_name VARCHAR, consumer_id BIGINT, details VARCHAR`.
 └─────────────────────────┴──────────┴────────┴─────────┴───────────────┴─────────────┴──────────────────────┘
 ```
 
+### `cdc_doctor`
+
+```sql
+SELECT * FROM cdc_doctor(catalog, consumer := NULL);
+```
+
+Read-only operational diagnostics for a catalog, optionally scoped to one
+consumer. `cdc_doctor` packages the checks that operators would otherwise
+assemble manually from `cdc_consumer_list`, `cdc_consumer_subscriptions`,
+`cdc_consumer_stats`, and `cdc_audit_recent`.
+
+**Use cases:** preflight a Python client or long-running consumer; power a
+CLI health check; give support issues a compact snapshot of CDC state.
+
+**Returns:**
+`severity VARCHAR, code VARCHAR, consumer_name VARCHAR, message VARCHAR,
+details VARCHAR`.
+
+```text
+┌──────────┬─────────────────────────┬───────────────┬────────────────────────────────────┬────────────────────────────┐
+│ severity │ code                    │ consumer_name │ message                            │ details                    │
+├──────────┼─────────────────────────┼───────────────┼────────────────────────────────────┼────────────────────────────┤
+│ info     │ CDC_METADATA_OK         │ NULL          │ CDC metadata tables are present    │ NULL                       │
+│ warning  │ CDC_CONSUMER_LAG        │ orders_sink   │ Consumer is 120 snapshots behind   │ {"lag_snapshots":120}      │
+│ error    │ CDC_SUBSCRIPTION_DROPPED│ orders_sink   │ A subscription target was dropped  │ {"subscription_id":3}      │
+└──────────┴─────────────────────────┴───────────────┴────────────────────────────────────┴────────────────────────────┘
+```
+
+Initial checks should cover catalog compatibility, CDC metadata presence,
+gap risk, stale/live leases, dropped or renamed subscriptions, pending
+schema boundaries, suspicious lag, and recent force-release, reset, or
+drop audit events.
+
 ---
 
 ## Filter rules
@@ -667,6 +775,24 @@ consumer_name VARCHAR, consumer_id BIGINT, details VARCHAR`.
 - DML rows preserve DuckLake's `table_changes` row identity and
   `change_type`.
 
+## Replay and Backfill
+
+There are two replay modes:
+
+- Durable replay uses a named consumer. Reset or create a consumer at the
+  desired start snapshot, process normal windows, and commit only after
+  downstream work succeeds. A live consumer can keep running while a
+  separate backfill consumer replays an older range.
+- Stateless range reads use `cdc_range_events`, `cdc_range_ddl`, and
+  `cdc_range_changes`. They are for inspection, export, dry-runs, and
+  bounded backfill planning. They do not acquire a lease and do not move a
+  cursor.
+
+The extension provides at-least-once replay mechanics, not exactly-once
+sink semantics. Clients and sinks own idempotency, retries, validation,
+quarantine policy, and any decision to skip or reprocess external side
+effects.
+
 ## Storage tables
 
 The extension creates these metadata-catalog state tables on first use:
@@ -674,7 +800,6 @@ The extension creates these metadata-catalog state tables on first use:
 - `__ducklake_cdc_consumers`
 - `__ducklake_cdc_consumer_subscriptions`
 - `__ducklake_cdc_audit`
-- `__ducklake_cdc_dlq`
 
 `__ducklake_cdc_consumers` stores cursor, lease, and consumer-level
 configuration. `__ducklake_cdc_consumer_subscriptions` stores one row per
@@ -687,9 +812,6 @@ DuckDB and PostgreSQL metadata catalogs place them under
 `__ducklake_metadata_<catalog>.__ducklake_cdc`. SQLite metadata catalogs do
 not support schemas, so the same table names live in
 `__ducklake_metadata_<catalog>.main`.
-
-The DLQ table exists so the schema is stable, but DLQ helper APIs are
-not shipped yet.
 
 ## Related docs
 

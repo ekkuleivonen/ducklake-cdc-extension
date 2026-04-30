@@ -36,7 +36,6 @@ catalog backend:
 - `__ducklake_cdc_consumers`
 - `__ducklake_cdc_consumer_subscriptions`
 - `__ducklake_cdc_audit`
-- `__ducklake_cdc_dlq`
 
 DuckDB and PostgreSQL metadata catalogs use a sibling `__ducklake_cdc` schema
 inside `__ducklake_metadata_<catalog>`. SQLite metadata catalogs do not support
@@ -47,8 +46,8 @@ cursor heartbeat or commit create a DuckLake snapshot. There is no external
 state store and no side database to keep in sync.
 
 `__ducklake_cdc_consumers` stores one row per named consumer: cursor position,
-schema-boundary policy, DDL failure policy, lease fields, timestamps, and
-metadata. Routing intent is stored only in
+schema-boundary policy, lease fields, timestamps, and metadata. Routing
+intent is stored only in
 `__ducklake_cdc_consumer_subscriptions`.
 
 `__ducklake_cdc_consumer_subscriptions` stores one normalized row per resolved
@@ -59,8 +58,9 @@ schema renames, and drop + recreate with the same name is a new object that
 does not match the old subscription.
 
 `__ducklake_cdc_audit` records lifecycle actions for operational visibility.
-`__ducklake_cdc_dlq` is created so the schema is stable, but DLQ helper APIs and
-write/replay semantics are intentionally not shipped yet.
+Sink retries, idempotency, validation, quarantine handling, and external
+side-effect semantics belong in clients and sinks, not in the SQL extension
+state schema.
 
 ## Read and Commit Stay Separate
 

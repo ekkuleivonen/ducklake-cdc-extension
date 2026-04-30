@@ -500,8 +500,11 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 			} else if (!raw.table_id.IsNull()) {
 				tid = raw.table_id.GetValue<int64_t>();
 				if (!ResolveTableByIdAt(conn, catalog_name, tid, snapshot_id, sid, current_name)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: table identity %lld is not live",
-					                                    static_cast<long long>(tid));
+					const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+					if (!ResolveTableByIdAt(conn, catalog_name, tid, current_snapshot, sid, current_name)) {
+						throw duckdb::InvalidInputException("cdc_consumer_create: table identity %lld is not live",
+						                                    static_cast<long long>(tid));
+					}
 				}
 			} else {
 				throw duckdb::InvalidInputException("cdc_consumer_create: table subscription requires identity");
@@ -593,11 +596,11 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		ExecuteChecked(conn, "INSERT INTO " + consumers +
 		                         " (consumer_name, consumer_id, last_committed_snapshot, "
 		                         "last_committed_schema_version, created_at, created_by, updated_at, "
-		                         "lease_interval_seconds, stop_at_schema_change, dml_blocked_by_failed_ddl) VALUES (" +
+		                         "lease_interval_seconds, stop_at_schema_change) VALUES (" +
 		                         quoted_name + ", " + std::to_string(consumer_id) + ", " +
 		                         std::to_string(resolved_snapshot) + ", " + std::to_string(schema_version) +
 		                         ", now(), " + actor_sql + ", now(), 60, " +
-		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", TRUE)");
+		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ")");
 		for (size_t i = 0; i < subscriptions.size(); ++i) {
 			const auto &sub = subscriptions[i];
 			ExecuteChecked(conn, "INSERT INTO " + subscriptions_table +
@@ -1232,7 +1235,6 @@ void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, 
 	         "subscriptions_renamed",
 	         "subscriptions_dropped",
 	         "stop_at_schema_change",
-	         "dml_blocked_by_failed_ddl",
 	         "last_committed_snapshot",
 	         "last_committed_schema_version",
 	         "owner_token",
@@ -1246,10 +1248,10 @@ void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, 
 	return_types = {
 	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
 	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ,
-	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ,
-	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
+	    duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
+	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
 }
 
 struct ConsumerListData : public duckdb::TableFunctionData {
@@ -1287,7 +1289,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
-	auto query = "SELECT consumer_name, consumer_id, stop_at_schema_change, dml_blocked_by_failed_ddl, "
+	auto query = "SELECT consumer_name, consumer_id, stop_at_schema_change, "
 	             "last_committed_snapshot, last_committed_schema_version, owner_token, owner_acquired_at, "
 	             "owner_heartbeat_at, lease_interval_seconds, created_at, created_by, updated_at, metadata FROM " +
 	             StateTable(conn, data.catalog_name, CONSUMERS_TABLE) + " ORDER BY consumer_id ASC";

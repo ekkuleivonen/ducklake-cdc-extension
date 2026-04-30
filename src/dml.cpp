@@ -678,6 +678,273 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRecentChangesInit(duckdb
 	return std::move(result);
 }
 
+//===--------------------------------------------------------------------===//
+// Stateless range helpers
+//===--------------------------------------------------------------------===//
+
+int64_t RangeToSnapshotParameter(duckdb::Connection &conn, duckdb::TableFunctionBindInput &input,
+                                 const std::string &catalog_name, duckdb::idx_t positional_index) {
+	if (input.inputs.size() > positional_index) {
+		if (input.inputs[positional_index].IsNull()) {
+			return CurrentSnapshot(conn, catalog_name);
+		}
+		return input.inputs[positional_index].GetValue<int64_t>();
+	}
+	auto entry = input.named_parameters.find("to_snapshot");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return CurrentSnapshot(conn, catalog_name);
+	}
+	return entry->second.GetValue<int64_t>();
+}
+
+void ValidateRangeBounds(duckdb::Connection &conn, const std::string &catalog_name, int64_t from_snapshot,
+                         int64_t to_snapshot, const std::string &feature_name) {
+	if (to_snapshot < from_snapshot) {
+		throw duckdb::InvalidInputException("%s: from_snapshot must be <= to_snapshot", feature_name);
+	}
+	auto oldest_result =
+	    conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
+	if (from_snapshot < oldest_snapshot) {
+		throw duckdb::InvalidInputException("%s: from_snapshot %lld is older than oldest available snapshot %lld",
+		                                    feature_name, static_cast<long long>(from_snapshot),
+		                                    static_cast<long long>(oldest_snapshot));
+	}
+}
+
+struct CdcRangeEventsData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	int64_t from_snapshot;
+	int64_t to_snapshot;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CdcRangeEventsData>();
+		result->catalog_name = catalog_name;
+		result->from_snapshot = from_snapshot;
+		result->to_snapshot = to_snapshot;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcRangeEventsBind(duckdb::ClientContext &context,
+                                                            duckdb::TableFunctionBindInput &input,
+                                                            duckdb::vector<duckdb::LogicalType> &return_types,
+                                                            duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException("cdc_range_events requires catalog, from_snapshot, and optional to_snapshot");
+	}
+	auto result = duckdb::make_uniq<CdcRangeEventsData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
+	CheckCatalogOrThrow(context, result->catalog_name);
+	duckdb::Connection conn(*context.db);
+	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_range_events");
+
+	names = {"snapshot_id",      "snapshot_time",  "changes_made",
+	         "author",           "commit_message", "commit_extra_info",
+	         "next_snapshot_id", "schema_version", "schema_changes_pending"};
+	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BOOLEAN};
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeEventsInit(duckdb::ClientContext &context,
+                                                                        duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<CdcRangeEventsData>();
+	duckdb::Connection conn(*context.db);
+	auto rows =
+	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, c.changes_made, c.author, c.commit_message, "
+	                           "c.commit_extra_info, "
+	                           "(SELECT min(n.snapshot_id) FROM ") +
+	               MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
+	               " n WHERE n.snapshot_id > s.snapshot_id AND n.snapshot_id <= " + std::to_string(data.to_snapshot) +
+	               ") AS next_snapshot_id, s.schema_version "
+	               "FROM " +
+	               MetadataTable(data.catalog_name, "ducklake_snapshot") + " s JOIN " +
+	               MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
+	               " c USING (snapshot_id) WHERE s.snapshot_id BETWEEN " + std::to_string(data.from_snapshot) +
+	               " AND " + std::to_string(data.to_snapshot) + " ORDER BY s.snapshot_id ASC");
+	if (!rows || rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        rows ? rows->GetError() : "cdc_range_events scan failed");
+	}
+	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
+		std::vector<duckdb::Value> values;
+		values.reserve(9);
+		for (duckdb::idx_t col_idx = 0; col_idx < rows->ColumnCount(); ++col_idx) {
+			values.push_back(rows->GetValue(col_idx, row_idx));
+		}
+		const auto changes_value = rows->GetValue(2, row_idx);
+		values.push_back(
+		    duckdb::Value::BOOLEAN(!changes_value.IsNull() && SnapshotHasSchemaChange(changes_value.ToString())));
+		result->rows.push_back(std::move(values));
+	}
+	return std::move(result);
+}
+
+struct CdcRangeChangesData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	std::string table_name;
+	int64_t table_id = -1;
+	int64_t from_snapshot;
+	int64_t to_snapshot;
+	bool allow_history_fallback = false;
+	std::vector<std::string> table_column_names;
+	std::vector<duckdb::LogicalType> table_column_types;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CdcRangeChangesData>();
+		result->catalog_name = catalog_name;
+		result->table_name = table_name;
+		result->table_id = table_id;
+		result->from_snapshot = from_snapshot;
+		result->to_snapshot = to_snapshot;
+		result->allow_history_fallback = allow_history_fallback;
+		result->table_column_names = table_column_names;
+		result->table_column_types = table_column_types;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientContext &context,
+                                                             duckdb::TableFunctionBindInput &input,
+                                                             duckdb::vector<duckdb::LogicalType> &return_types,
+                                                             duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException("cdc_range_changes requires catalog, from_snapshot, and optional to_snapshot");
+	}
+	auto result = duckdb::make_uniq<CdcRangeChangesData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
+	CheckCatalogOrThrow(context, result->catalog_name);
+	duckdb::Connection conn(*context.db);
+	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_range_changes");
+
+	auto table_id_entry = input.named_parameters.find("table_id");
+	auto table_name_entry = input.named_parameters.find("table_name");
+	if (table_id_entry != input.named_parameters.end() && !table_id_entry->second.IsNull()) {
+		result->table_id = table_id_entry->second.GetValue<int64_t>();
+		result->table_name =
+		    CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, result->to_snapshot);
+		if (result->table_name.empty()) {
+			throw duckdb::InvalidInputException("cdc_range_changes: table_id %lld is not active at to_snapshot",
+			                                    static_cast<long long>(result->table_id));
+		}
+	} else if (table_name_entry != input.named_parameters.end() && !table_name_entry->second.IsNull()) {
+		result->table_name = table_name_entry->second.GetValue<std::string>();
+		result->allow_history_fallback = true;
+		if (result->table_name.find('.') == std::string::npos) {
+			result->table_name = std::string("main.") + result->table_name;
+		}
+		int64_t schema_id = 0;
+		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, result->to_snapshot, schema_id,
+		                             result->table_id)) {
+			throw duckdb::InvalidInputException("cdc_range_changes failed to resolve table '%s'", result->table_name);
+		}
+	} else {
+		throw duckdb::BinderException("cdc_range_changes requires table_id or table_name");
+	}
+
+	auto probe = conn.Query(
+	    "SELECT * FROM " +
+	    DuckLakeTableChangesCall(result->catalog_name, result->table_name, result->to_snapshot, result->to_snapshot) +
+	    " LIMIT 0");
+	if (!probe || probe->HasError()) {
+		throw duckdb::InvalidInputException(
+		    "cdc_range_changes failed to resolve table '%s' in catalog '%s': %s", result->table_name,
+		    result->catalog_name, probe ? probe->GetError() : std::string("table_changes probe returned no result"));
+	}
+	if (probe->ColumnCount() < 3) {
+		throw duckdb::InvalidInputException(
+		    "cdc_range_changes: unexpected table_changes schema for table '%s' (got %u columns; expected at least 3)",
+		    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
+	}
+	for (duckdb::idx_t i = 3; i < probe->ColumnCount(); ++i) {
+		result->table_column_names.push_back(probe->ColumnName(i));
+		result->table_column_types.push_back(probe->types[i]);
+	}
+
+	names = {"snapshot_id", "rowid", "change_type"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
+	for (duckdb::idx_t i = 0; i < result->table_column_names.size(); ++i) {
+		names.push_back(result->table_column_names[i]);
+		return_types.push_back(result->table_column_types[i]);
+	}
+	for (const auto &extra : {"snapshot_time", "author", "commit_message", "commit_extra_info"}) {
+		names.push_back(extra);
+	}
+	return_types.push_back(duckdb::LogicalType::TIMESTAMP_TZ);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb::ClientContext &context,
+                                                                         duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<CdcRangeChangesData>();
+	duckdb::Connection conn(*context.db);
+
+	std::ostringstream column_list;
+	column_list << "tc.snapshot_id, tc.rowid, tc.change_type";
+	for (const auto &col_name : data.table_column_names) {
+		column_list << ", tc." << QuoteIdentifier(col_name);
+	}
+	auto scan_range = [&](int64_t from_snapshot) {
+		auto query = std::string("SELECT ") + column_list.str() +
+		             ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info FROM " +
+		             DuckLakeTableChangesCall(data.catalog_name, data.table_name, from_snapshot, data.to_snapshot) +
+		             " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
+		             " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
+		             MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
+		             " c ON c.snapshot_id = tc.snapshot_id ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
+		return conn.Query(query);
+	};
+	auto rows = scan_range(data.from_snapshot);
+	if (!rows || rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        rows ? rows->GetError() : "cdc_range_changes scan failed");
+	}
+	if (rows->RowCount() == 0 && data.allow_history_fallback) {
+		auto begin_result = conn.Query("SELECT COALESCE(min(begin_snapshot), " + std::to_string(data.from_snapshot) +
+		                               ") FROM " + MetadataTable(data.catalog_name, "ducklake_table") +
+		                               " WHERE table_id = " + std::to_string(data.table_id));
+		if (begin_result && !begin_result->HasError() && begin_result->RowCount() > 0 &&
+		    !begin_result->GetValue(0, 0).IsNull()) {
+			const auto begin_snapshot = begin_result->GetValue(0, 0).GetValue<int64_t>();
+			if (begin_snapshot < data.from_snapshot) {
+				rows = scan_range(begin_snapshot);
+				if (!rows || rows->HasError()) {
+					throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+					                        rows ? rows->GetError() : "cdc_range_changes scan failed");
+				}
+			}
+		}
+	}
+	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
+		std::vector<duckdb::Value> values;
+		values.reserve(rows->ColumnCount());
+		for (duckdb::idx_t col_idx = 0; col_idx < rows->ColumnCount(); ++col_idx) {
+			values.push_back(rows->GetValue(col_idx, row_idx));
+		}
+		result->rows.push_back(std::move(values));
+	}
+	return std::move(result);
+}
+
 } // namespace
 
 void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
@@ -714,6 +981,40 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		    RowScanExecute, CdcRecentChangesBind, CdcRecentChangesInit);
 		recent_changes_function.named_parameters["since_seconds"] = duckdb::LogicalType::BIGINT;
 		loader.RegisterFunction(recent_changes_function);
+	}
+
+	for (const auto &name : {"cdc_range_events", "ducklake_cdc_range_events"}) {
+		duckdb::TableFunction range_events_function_2(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
+		    RowScanExecute, CdcRangeEventsBind, CdcRangeEventsInit);
+		range_events_function_2.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		loader.RegisterFunction(range_events_function_2);
+		duckdb::TableFunction range_events_function_3(name,
+		                                              duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
+		                                                                                   duckdb::LogicalType::BIGINT,
+		                                                                                   duckdb::LogicalType::BIGINT},
+		                                              RowScanExecute, CdcRangeEventsBind, CdcRangeEventsInit);
+		range_events_function_3.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		loader.RegisterFunction(range_events_function_3);
+	}
+
+	for (const auto &name : {"cdc_range_changes", "ducklake_cdc_range_changes"}) {
+		duckdb::TableFunction range_changes_function_2(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
+		    RowScanExecute, CdcRangeChangesBind, CdcRangeChangesInit);
+		range_changes_function_2.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		range_changes_function_2.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
+		range_changes_function_2.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
+		loader.RegisterFunction(range_changes_function_2);
+		duckdb::TableFunction range_changes_function_3(
+		    name,
+		    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+		                                         duckdb::LogicalType::BIGINT},
+		    RowScanExecute, CdcRangeChangesBind, CdcRangeChangesInit);
+		range_changes_function_3.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		range_changes_function_3.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
+		range_changes_function_3.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
+		loader.RegisterFunction(range_changes_function_3);
 	}
 }
 

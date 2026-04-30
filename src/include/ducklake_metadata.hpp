@@ -42,7 +42,6 @@ namespace duckdb_cdc {
 extern const char *const CONSUMERS_TABLE;
 extern const char *const CONSUMER_SUBSCRIPTIONS_TABLE;
 extern const char *const AUDIT_TABLE;
-extern const char *const DLQ_TABLE;
 extern const char *const STATE_SCHEMA;
 
 extern const int64_t DEFAULT_MAX_SNAPSHOTS;
@@ -136,7 +135,6 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema);
 std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema);
 std::string AuditDdl(const std::string &catalog_name, bool use_state_schema);
-std::string DlqDdl(const std::string &catalog_name, bool use_state_schema);
 
 //! Idempotently create the catalog-resident CDC state tables in a DuckLake
 //! catalog. Throws `CDC_INCOMPATIBLE_CATALOG` before any write when the

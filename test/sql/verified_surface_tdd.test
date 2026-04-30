@@ -1,0 +1,477 @@
+# name: test/sql/verified_surface_tdd.test
+# description: TDD coverage for the verified extension surface
+# group: [sql]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+# DuckLake is loaded at runtime from the official extension repository
+# instead of being compiled from source. `require ducklake` cannot be used
+# because sqllogictest's `require <ext>` only checks for statically-loaded
+# extensions, which DuckLake is not in this build.
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/verified_surface_tdd.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/verified_surface_tdd_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new', 10), (2, 'paid', 20);
+
+statement ok
+SET VARIABLE after_orders_insert = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok
+CREATE TABLE lake.customers(id INTEGER, tier VARCHAR);
+
+statement ok
+INSERT INTO lake.customers VALUES (10, 'gold');
+
+statement ok
+ALTER TABLE lake.orders ADD COLUMN note VARCHAR DEFAULT 'n/a';
+
+statement ok
+INSERT INTO lake.orders VALUES (3, 'packed', 30, 'late');
+
+statement ok
+SET VARIABLE current_head = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok
+SET VARIABLE orders_table_id = (
+  SELECT t.table_id
+  FROM __ducklake_metadata_lake.ducklake_table t
+  JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+  WHERE s.schema_name = 'main'
+    AND t.table_name = 'orders'
+    AND t.begin_snapshot <= getvariable('current_head')
+    AND (t.end_snapshot IS NULL OR t.end_snapshot > getvariable('current_head'))
+);
+
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'live_orders',
+  start_at := getvariable('after_orders_insert'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
+
+# doctor_empty_catalog_ok: cdc_doctor returns an ok/info diagnostic when CDC
+# metadata exists and no unhealthy condition is present for the catalog.
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake')
+WHERE severity = 'info'
+  AND code = 'CDC_METADATA_OK';
+----
+true
+
+# doctor_missing_or_incompatible_catalog: cdc_doctor reports an error when the
+# supplied catalog is not a compatible DuckLake catalog.
+statement ok
+ATTACH ':memory:' AS not_ducklake;
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('not_ducklake')
+WHERE severity = 'error'
+  AND code = 'CDC_INCOMPATIBLE_CATALOG';
+----
+true
+
+# doctor_consumer_lag_warning: cdc_doctor reports lag when a consumer is behind
+# the current snapshot.
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity IN ('warning', 'error')
+  AND code = 'CDC_CONSUMER_LAG'
+  AND consumer_name = 'live_orders';
+----
+true
+
+# doctor_gap_risk_error: cdc_doctor reports gap risk when a consumer is behind
+# the oldest available snapshot. The fixture uses a forced state update to make
+# this diagnostic deterministic without relying on DuckLake cleanup.
+statement ok
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET last_committed_snapshot = -1
+WHERE consumer_name = 'live_orders';
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity IN ('warning', 'error')
+  AND code IN ('CDC_GAP_RISK', 'CDC_GAP')
+  AND consumer_name = 'live_orders';
+----
+true
+
+statement ok
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET last_committed_snapshot = getvariable('after_orders_insert')
+WHERE consumer_name = 'live_orders';
+
+# doctor_live_lease_info: a current lease is surfaced as live state and is not
+# reported as stale.
+statement ok
+SELECT * FROM cdc_window('lake', 'live_orders');
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity = 'info'
+  AND code = 'CDC_LEASE_LIVE'
+  AND consumer_name = 'live_orders';
+----
+true
+
+# doctor_stale_lease_warning: an expired heartbeat is reported as a stale lease.
+statement ok
+UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
+SET owner_heartbeat_at = now() - INTERVAL 1 HOUR,
+    owner_acquired_at = now() - INTERVAL 1 HOUR
+WHERE consumer_name = 'live_orders';
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity = 'warning'
+  AND code = 'CDC_LEASE_STALE'
+  AND consumer_name = 'live_orders';
+----
+true
+
+statement ok
+SELECT * FROM cdc_consumer_force_release('lake', 'live_orders');
+
+# doctor_subscription_renamed_warning: renamed subscription targets are
+# surfaced as diagnostics.
+statement ok
+ALTER TABLE lake.orders RENAME TO orders_v2;
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity = 'warning'
+  AND code = 'CDC_SUBSCRIPTION_RENAMED'
+  AND consumer_name = 'live_orders';
+----
+true
+
+# doctor_subscription_dropped_error: dropped subscription targets are surfaced
+# as diagnostics.
+statement ok
+DROP TABLE lake.orders_v2;
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'live_orders')
+WHERE severity = 'error'
+  AND code = 'CDC_SUBSCRIPTION_DROPPED'
+  AND consumer_name = 'live_orders';
+----
+true
+
+# Recreate the table for range tests that follow.
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES (4, 'new', 40), (5, 'paid', 50);
+
+statement ok
+SET VARIABLE range_start = (SELECT min(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot WHERE snapshot_id > getvariable('current_head'));
+
+statement ok
+SET VARIABLE range_head = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok
+SET VARIABLE new_orders_table_id = (
+  SELECT t.table_id
+  FROM __ducklake_metadata_lake.ducklake_table t
+  JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+  WHERE s.schema_name = 'main'
+    AND t.table_name = 'orders'
+    AND t.begin_snapshot <= getvariable('range_head')
+    AND (t.end_snapshot IS NULL OR t.end_snapshot > getvariable('range_head'))
+);
+
+# doctor_schema_boundary_warning: a consumer stopped at a schema boundary gets a
+# pending schema diagnostic.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'schema_boundary',
+  start_at := getvariable('after_orders_insert'),
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ],
+  stop_at_schema_change := true
+);
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake', consumer := 'schema_boundary')
+WHERE severity = 'warning'
+  AND code = 'CDC_SCHEMA_BOUNDARY'
+  AND consumer_name = 'schema_boundary';
+----
+true
+
+# doctor_recent_force_release_notice: recent force-release/reset/drop audit
+# events appear as notable diagnostics.
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake')
+WHERE severity IN ('info', 'warning')
+  AND code = 'CDC_RECENT_FORCE_RELEASE';
+----
+true
+
+# doctor_consumer_filter: consumer scoping returns only diagnostics for that
+# consumer, plus catalog-level diagnostics with NULL consumer_name.
+query I
+SELECT count(*) = 0
+FROM cdc_doctor('lake', consumer := 'schema_boundary')
+WHERE consumer_name IS NOT NULL
+  AND consumer_name <> 'schema_boundary';
+----
+true
+
+# range_events_basic_bounds: cdc_range_events returns snapshots inside the
+# explicit [from_snapshot, to_snapshot] range.
+query I
+SELECT count(*) >= 1
+FROM cdc_range_events('lake', getvariable('range_start'), getvariable('range_head'))
+WHERE snapshot_id BETWEEN getvariable('range_start') AND getvariable('range_head');
+----
+true
+
+# range_events_to_snapshot_null_uses_head: NULL to_snapshot reads through the
+# current catalog head.
+query I
+SELECT max(snapshot_id) = getvariable('range_head')
+FROM cdc_range_events('lake', getvariable('range_start'), to_snapshot := NULL);
+----
+true
+
+# range_events_no_consumer_state_created: range events do not create, lease, or
+# advance a consumer.
+query I
+SELECT count(*) = 0
+FROM cdc_consumer_list('lake')
+WHERE consumer_name = 'range_events_reader';
+----
+true
+
+# range_events_no_subscription_filtering: stateless range events are not
+# filtered by existing consumer subscriptions.
+query I
+SELECT count(*) >= 1
+FROM cdc_range_events('lake', getvariable('range_start'), getvariable('range_head'))
+WHERE changes_made LIKE '%customers%'
+   OR changes_made LIKE '%orders%';
+----
+true
+
+# range_ddl_basic_bounds: cdc_range_ddl returns DDL events inside the requested
+# range.
+query I
+SELECT count(*) >= 1
+FROM cdc_range_ddl('lake', 0, getvariable('range_head'))
+WHERE snapshot_id BETWEEN 0 AND getvariable('range_head');
+----
+true
+
+# range_ddl_to_snapshot_null_uses_head: NULL to_snapshot reads through the
+# current catalog head for DDL.
+query I
+SELECT max(snapshot_id) <= getvariable('range_head')
+FROM cdc_range_ddl('lake', 0, to_snapshot := NULL);
+----
+true
+
+# range_ddl_includes_catalog_scope: DDL range reads do not require a DDL
+# subscription and include catalog-level schema/table activity.
+query I
+SELECT count(*) >= 1
+FROM cdc_range_ddl('lake', 0, getvariable('range_head'))
+WHERE object_kind = 'table';
+----
+true
+
+# range_changes_basic_bounds_by_table_name: cdc_range_changes returns DML rows
+# for one named table inside the requested range.
+query I
+SELECT count(*) = 2
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  getvariable('range_head'),
+  table_name := 'orders'
+);
+----
+true
+
+# range_changes_basic_bounds_by_table_id: table_id reads return the same DML
+# rows as table_name reads.
+query I
+SELECT count(*) = 2
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  getvariable('range_head'),
+  table_id := getvariable('new_orders_table_id')
+);
+----
+true
+
+# range_changes_to_snapshot_null_uses_head: NULL to_snapshot reads through the
+# current head for DML.
+query I
+SELECT count(*) = 2
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  to_snapshot := NULL,
+  table_name := 'orders'
+);
+----
+true
+
+# range_changes_variable_shape_matches_recent_changes: range DML uses the
+# stateless shape and does not include next_snapshot_id.
+statement ok
+CREATE TEMP TABLE range_changes_shape AS
+SELECT *
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  getvariable('range_head'),
+  table_name := 'orders'
+);
+
+query I
+SELECT count(*) = 0
+FROM duckdb_columns()
+WHERE table_name = 'range_changes_shape'
+  AND column_name = 'next_snapshot_id';
+----
+true
+
+# range_changes_no_consumer_state_created: range DML does not create, lease, or
+# advance a consumer.
+query I
+SELECT count(*) = 0
+FROM cdc_consumer_list('lake')
+WHERE consumer_name = 'range_changes_reader';
+----
+true
+
+# range_changes_no_subscription_filtering: stateless range DML ignores existing
+# consumer subscriptions.
+query I
+SELECT count(*) = 1
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  getvariable('range_head'),
+  table_name := 'customers'
+);
+----
+true
+
+# range_invalid_bounds_rejected: from_snapshot must be <= to_snapshot.
+statement error
+SELECT * FROM cdc_range_events('lake', getvariable('range_head'), getvariable('range_start') - 1);
+----
+from_snapshot
+
+# range_gap_before_oldest_rejected: ranges older than the oldest available
+# snapshot fail clearly.
+statement error
+SELECT * FROM cdc_range_events('lake', -1, 0);
+----
+oldest
+
+# range_unknown_table_rejected: unknown table names fail clearly.
+statement error
+SELECT * FROM cdc_range_changes('lake', 0, getvariable('range_head'), table_name := 'missing_table');
+----
+missing_table
+
+# range_table_rename_identity: table_id range reads continue across renames.
+statement ok
+ALTER TABLE lake.orders RENAME TO orders_again;
+
+statement ok
+INSERT INTO lake.orders_again VALUES (6, 'renamed', 60);
+
+statement ok
+SET VARIABLE rename_head = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+query I
+SELECT count(*) >= 1
+FROM cdc_range_changes(
+  'lake',
+  getvariable('range_start'),
+  getvariable('rename_head'),
+  table_id := getvariable('new_orders_table_id')
+)
+WHERE id = 6;
+----
+true
+
+# consumer_reset_backfill_isolated_from_live: a separate backfill consumer can
+# replay old snapshots without moving the live consumer.
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'backfill_orders',
+  start_at := getvariable('range_start'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := getvariable('new_orders_table_id'),
+                event_category := 'dml', change_type := '*')
+  ]
+);
+
+statement ok
+SELECT * FROM cdc_window('lake', 'backfill_orders');
+
+query I
+SELECT live.last_committed_snapshot <> backfill.last_committed_snapshot
+FROM cdc_consumer_list('lake') live
+JOIN cdc_consumer_list('lake') backfill ON true
+WHERE live.consumer_name = 'live_orders'
+  AND backfill.consumer_name = 'backfill_orders';
+----
+true
+
+# consumer_reset_clears_lease: reset clears an active owner token.
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'backfill_orders', to_snapshot := getvariable('range_start'));
+
+query I
+SELECT owner_token IS NULL
+FROM cdc_consumer_list('lake')
+WHERE consumer_name = 'backfill_orders';
+----
+true
+
