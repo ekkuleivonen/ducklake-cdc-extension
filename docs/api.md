@@ -27,7 +27,8 @@ contracts.
   [`cdc_consumer_drop`](#cdc_consumer_drop),
   [`cdc_consumer_heartbeat`](#cdc_consumer_heartbeat),
   [`cdc_consumer_force_release`](#cdc_consumer_force_release),
-  [`cdc_consumer_list`](#cdc_consumer_list)
+  [`cdc_consumer_list`](#cdc_consumer_list),
+  [`cdc_consumer_subscriptions`](#cdc_consumer_subscriptions)
 - Cursor primitives: [`cdc_window`](#cdc_window),
   [`cdc_commit`](#cdc_commit), [`cdc_wait`](#cdc_wait)
 - Typed event sugars: [`cdc_changes`](#cdc_changes),
@@ -76,27 +77,70 @@ SELECT * FROM cdc_consumer_create(
     catalog,
     name,
     start_at              := 'now',   -- 'now' | 'beginning' | 'oldest' | snapshot id
-    tables                := NULL,    -- NULL or VARCHAR[] of 'schema.table'
-    change_types          := NULL,    -- NULL or subset of insert | update_preimage | update_postimage | delete
-    event_categories      := NULL,    -- NULL or subset of ddl | dml
+    subscriptions         := [
+      {
+        'scope_kind': 'table',          -- catalog | schema | table
+        'schema_name': 'main',          -- name sugar, resolved at start_at
+        'table_name': 'orders',
+        'event_category': 'dml',        -- * | dml | ddl
+        'change_type': '*'              -- * | insert | update_preimage | update_postimage | delete
+      },
+      {
+        'scope_kind': 'schema',
+        'schema_id': 12,                -- identity input, validated at start_at
+        'event_category': 'ddl',
+        'change_type': '*'
+      }
+    ],
     stop_at_schema_change := TRUE     -- BOOLEAN; stop the cursor on schema boundaries
 );
 ```
 
 Creates a named consumer cursor and persists it in the metadata-catalog
-`__ducklake_cdc_consumers` state table.
+`__ducklake_cdc_consumers` state table. The consumer's routing rules are
+stored as normalized rows in `__ducklake_cdc_consumer_subscriptions`.
+
+Subscriptions are identity-first. Qualified names are accepted only as
+creation-time sugar and are resolved at `start_at` to DuckLake object ids.
+A table subscription follows the resolved `table_id` across table renames;
+a schema subscription follows the resolved `schema_id` across schema
+renames. Drop + recreate with the same name is a new identity and is not
+matched by the old subscription.
 
 **Use cases:** register a durable cursor before reading any windows;
-configure per-consumer filters once.
+configure per-consumer subscriptions once; return resolved ids that an
+application can persist in its own control plane.
 
-**Returns:** `consumer_name VARCHAR, consumer_id BIGINT, last_committed_snapshot BIGINT`.
+**Returns:**
+`consumer_name VARCHAR, consumer_id BIGINT, last_committed_snapshot BIGINT,
+subscription_id BIGINT, scope_kind VARCHAR, schema_id BIGINT,
+table_id BIGINT, event_category VARCHAR, change_type VARCHAR,
+original_qualified_name VARCHAR, current_qualified_name VARCHAR`.
 
 ```text
-┌───────────────┬─────────────┬─────────────────────────┐
-│ consumer_name │ consumer_id │ last_committed_snapshot │
-├───────────────┼─────────────┼─────────────────────────┤
-│ orders_sink   │           1 │                       7 │
-└───────────────┴─────────────┴─────────────────────────┘
+┌───────────────┬─────────────┬─────────────────────────┬─────────────────┬────────────┬───────────┬──────────┬────────────────┬─────────────┬─────────────────────────┬────────────────────────┐
+│ consumer_name │ consumer_id │ last_committed_snapshot │ subscription_id │ scope_kind │ schema_id │ table_id │ event_category │ change_type │ original_qualified_name │ current_qualified_name │
+├───────────────┼─────────────┼─────────────────────────┼─────────────────┼────────────┼───────────┼──────────┼────────────────┼─────────────┼─────────────────────────┼────────────────────────┤
+│ orders_sink   │           1 │                       7 │               1 │ table      │         0 │        5 │ dml            │ insert      │ main.orders             │ main.orders            │
+│ orders_sink   │           1 │                       7 │               2 │ table      │         0 │        5 │ dml            │ delete      │ main.orders             │ main.orders            │
+└───────────────┴─────────────┴─────────────────────────┴─────────────────┴────────────┴───────────┴──────────┴────────────────┴─────────────┴─────────────────────────┴────────────────────────┘
+```
+
+`subscriptions` is required. Use explicit `'*'` wildcards rather than
+`NULL`: `event_category := '*'` means both DML and DDL, and
+`change_type := '*'` means every DML change type. `NULL` is not a
+wildcard; it is accepted only where a field is not applicable to the
+chosen `scope_kind` (for example `table_id` on a schema subscription).
+Wildcard entries may expand into multiple persisted subscription rows.
+
+Common subscription shapes:
+
+```text
+catalog + ddl + *             -- all DDL in the catalog
+schema  + dml + insert        -- inserts into any table in one schema identity
+schema  + dml + *             -- all DML for all tables in one schema identity
+table   + dml + *             -- all DML for one table identity
+table   + *   + *             -- DML and DDL for one table identity
 ```
 
 ### `cdc_consumer_reset`
@@ -203,8 +247,9 @@ Enumerates every registered consumer, ordered by `consumer_id`.
 state each consumer is configured with.
 
 **Returns:**
-`consumer_name VARCHAR, consumer_id BIGINT, tables VARCHAR[],
-change_types VARCHAR[], event_categories VARCHAR[],
+`consumer_name VARCHAR, consumer_id BIGINT, subscription_count BIGINT,
+subscriptions_active BIGINT, subscriptions_renamed BIGINT,
+subscriptions_dropped BIGINT,
 stop_at_schema_change BOOLEAN, dml_blocked_by_failed_ddl BOOLEAN,
 last_committed_snapshot BIGINT, last_committed_schema_version BIGINT,
 owner_token UUID, owner_acquired_at TIMESTAMPTZ,
@@ -213,11 +258,42 @@ created_at TIMESTAMPTZ, created_by VARCHAR, updated_at TIMESTAMPTZ,
 metadata VARCHAR`.
 
 ```text
-┌───────────────┬─────────────┬───────────────┬──────────────┬──────────────────┬────────────────────────┬──────────────────────────┬─────────────────────────┬───────────────────────────────┬───────────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────────────────┬────────────┬─────────────────────────┬──────────┐
-│ consumer_name │ consumer_id │ tables        │ change_types │ event_categories │ stop_at_schema_change  │ dml_blocked_by_failed_ddl│ last_committed_snapshot │ last_committed_schema_version │ owner_token           │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ created_at              │ created_by │ updated_at              │ metadata │
-├───────────────┼─────────────┼───────────────┼──────────────┼──────────────────┼────────────────────────┼──────────────────────────┼─────────────────────────┼───────────────────────────────┼───────────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────────────────┼────────────┼─────────────────────────┼──────────┤
-│ orders_sink   │           1 │ [main.orders] │ [insert]     │ [dml]            │ true                   │ false                    │                      42 │                             3 │ 8f3a3c2e-…-b2c1       │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ 2026-04-30 08:00:00+00  │ ekku       │ 2026-04-30 09:31:08+00  │ NULL     │
-└───────────────┴─────────────┴───────────────┴──────────────┴──────────────────┴────────────────────────┴──────────────────────────┴─────────────────────────┴───────────────────────────────┴───────────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────────────────┴────────────┴─────────────────────────┴──────────┘
+┌───────────────┬─────────────┬────────────────────┬──────────────────────┬───────────────────────┬───────────────────────┬────────────────────────┬──────────────────────────┬─────────────────────────┬───────────────────────────────┬───────────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────────────────┬────────────┬─────────────────────────┬──────────┐
+│ consumer_name │ consumer_id │ subscription_count │ subscriptions_active │ subscriptions_renamed │ subscriptions_dropped │ stop_at_schema_change  │ dml_blocked_by_failed_ddl│ last_committed_snapshot │ last_committed_schema_version │ owner_token           │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ created_at              │ created_by │ updated_at              │ metadata │
+├───────────────┼─────────────┼────────────────────┼──────────────────────┼───────────────────────┼───────────────────────┼────────────────────────┼──────────────────────────┼─────────────────────────┼───────────────────────────────┼───────────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────────────────┼────────────┼─────────────────────────┼──────────┤
+│ orders_sink   │           1 │                  2 │                    2 │                     0 │                     0 │ true                   │ false                    │                      42 │                             3 │ 8f3a3c2e-…-b2c1       │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ 2026-04-30 08:00:00+00  │ ekku       │ 2026-04-30 09:31:08+00  │ NULL     │
+└───────────────┴─────────────┴────────────────────┴──────────────────────┴───────────────────────┴───────────────────────┴────────────────────────┴──────────────────────────┴─────────────────────────┴───────────────────────────────┴───────────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────────────────┴────────────┴─────────────────────────┴──────────┘
+```
+
+### `cdc_consumer_subscriptions`
+
+```sql
+SELECT * FROM cdc_consumer_subscriptions(catalog, name := NULL);
+```
+
+Enumerates normalized subscription rows. This is the durable inspection
+surface for routing intent; applications that persist their own
+subscription control plane should store `schema_id` / `table_id` from
+this output, together with the catalog identity.
+
+**Use cases:** inspect resolved subscription identities; detect table or
+schema renames; reconcile an application's stored human-readable filters
+with the current DuckLake names.
+
+**Returns:**
+`consumer_name VARCHAR, consumer_id BIGINT, subscription_id BIGINT,
+scope_kind VARCHAR, schema_id BIGINT, table_id BIGINT,
+event_category VARCHAR, change_type VARCHAR,
+original_qualified_name VARCHAR, current_qualified_name VARCHAR,
+status VARCHAR`.
+
+```text
+┌───────────────┬─────────────┬─────────────────┬────────────┬───────────┬──────────┬────────────────┬─────────────┬─────────────────────────┬────────────────────────┬─────────┐
+│ consumer_name │ consumer_id │ subscription_id │ scope_kind │ schema_id │ table_id │ event_category │ change_type │ original_qualified_name │ current_qualified_name │ status  │
+├───────────────┼─────────────┼─────────────────┼────────────┼───────────┼──────────┼────────────────┼─────────────┼─────────────────────────┼────────────────────────┼─────────┤
+│ orders_sink   │           1 │               1 │ table      │         0 │        5 │ dml            │ insert      │ main.orders             │ main.orders_v2         │ renamed │
+│ schema_watch  │           2 │               3 │ schema     │        12 │     NULL │ ddl            │ *           │ sales                   │ sales_archive          │ renamed │
+└───────────────┴─────────────┴─────────────────┴────────────┴───────────┴──────────┴────────────────┴─────────────┴─────────────────────────┴────────────────────────┴─────────┘
 ```
 
 ---
@@ -308,17 +384,30 @@ available rather than spin on `cdc_window`.
 
 These sugars internally call `cdc_window` and then project events out of
 the resulting `[start_snapshot, end_snapshot]` range. They apply the
-consumer's `change_types` and `event_categories` filters.
+consumer's normalized subscriptions by object identity, not by current
+qualified name.
 
 ### `cdc_changes`
 
 ```sql
-SELECT * FROM cdc_changes(catalog, name, table_name, max_snapshots := 100);
+SELECT * FROM cdc_changes(
+  catalog,
+  name,
+  table_id      := NULL, -- preferred identity form
+  table_name    := NULL, -- name sugar, resolved inside the current window
+  max_snapshots := 100
+);
 ```
 
-Typed, row-level DML for one fully-qualified table inside the current
-window. The middle of the column list mirrors DuckLake's `table_changes`
-output for that table; the ends add snapshot and commit metadata.
+Typed, row-level DML for one subscribed table inside the current window.
+Pass `table_id` when the caller has persisted the DuckLake identity.
+Pass `table_name` for human-facing SQL; the name is resolved to a
+`table_id` and then checked against the consumer's subscription rows. For
+a consumer with exactly one active table-scope DML subscription, both
+`table_id` and `table_name` may be omitted.
+
+The middle of the column list mirrors DuckLake's `table_changes` output
+for the resolved table; the ends add snapshot and commit metadata.
 
 **Use cases:** the typical "give me the rows" call in a sink loop — e.g.
 mirroring `lake.orders` into a downstream warehouse table.
@@ -345,11 +434,14 @@ SELECT * FROM cdc_ddl(catalog, name, max_snapshots := 100);
 ```
 
 Typed schema events inside the current consumer window. Consumers
-should apply DDL before DML for the same snapshot.
+should apply DDL before DML for the same snapshot. Rows are filtered by
+the consumer's DDL subscription rows. Table and schema renames preserve
+`schema_id` / `object_id`; the current names in `schema_name` and
+`object_name` are the names as of the event snapshot.
 
 **Use cases:** drive a schema-aware sink (apply column adds before
 re-reading rows); power schema-only watchers configured with
-`event_categories := ['ddl']`.
+DDL subscription rows.
 
 **Returns:**
 `snapshot_id BIGINT, snapshot_time TIMESTAMPTZ, event_kind VARCHAR
@@ -373,8 +465,10 @@ SELECT * FROM cdc_events(catalog, name, max_snapshots := 100);
 ```
 
 Raw snapshot-level event stream for the current consumer window — one
-row per snapshot, not per data row. For typed DML rows, use
-`cdc_changes`; for typed DDL rows, use `cdc_ddl`.
+row per snapshot, not per data row. The stream is filtered by the
+consumer's subscriptions: a snapshot is returned when its DDL/DML work
+touches at least one subscribed identity and event/change type. For typed
+DML rows, use `cdc_changes`; for typed DDL rows, use `cdc_ddl`.
 
 **Use cases:** outbox-style dispatch on `commit_extra_info`; lake
 dashboards that want one row per snapshot with author and message.
@@ -491,29 +585,31 @@ SELECT * FROM cdc_consumer_stats(catalog, consumer := NULL);
 ```
 
 One row per consumer (filtered by `consumer :=` if provided). Reports
-cursor lag, gap risk versus the oldest available snapshot, table
-filters, and lease state.
+cursor lag, gap risk versus the oldest available snapshot, subscription
+health, and lease state.
 
 **Use cases:** dashboards and alerts — `lag_snapshots`, `lag_seconds`,
-`gap_distance`, `lease_alive`, `tables_unresolved` are the columns most
-operators wire into monitors.
+`gap_distance`, `lease_alive`, `subscriptions_dropped`, and
+`subscriptions_renamed` are the columns most operators wire into
+monitors.
 
 **Returns:**
 `consumer_name VARCHAR, consumer_id BIGINT,
 last_committed_snapshot BIGINT, current_snapshot BIGINT,
 lag_snapshots BIGINT, lag_seconds DOUBLE,
 oldest_available_snapshot BIGINT, gap_distance BIGINT,
-tables VARCHAR[], tables_unresolved VARCHAR[], change_types VARCHAR[],
+subscription_count BIGINT, subscriptions_active BIGINT,
+subscriptions_renamed BIGINT, subscriptions_dropped BIGINT,
 owner_token UUID, owner_acquired_at TIMESTAMPTZ,
 owner_heartbeat_at TIMESTAMPTZ, lease_interval_seconds INTEGER,
 lease_alive BOOLEAN`.
 
 ```text
-┌───────────────┬─────────────┬─────────────────────────┬──────────────────┬───────────────┬─────────────┬───────────────────────────┬──────────────┬───────────────┬───────────────────┬──────────────┬───────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────┐
-│ consumer_name │ consumer_id │ last_committed_snapshot │ current_snapshot │ lag_snapshots │ lag_seconds │ oldest_available_snapshot │ gap_distance │ tables        │ tables_unresolved │ change_types │ owner_token       │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ lease_alive │
-├───────────────┼─────────────┼─────────────────────────┼──────────────────┼───────────────┼─────────────┼───────────────────────────┼──────────────┼───────────────┼───────────────────┼──────────────┼───────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────┤
-│ orders_sink   │           1 │                      42 │               43 │             1 │       12.4  │                         5 │           37 │ [main.orders] │ []                │ [insert]     │ 8f3a3c2e-…-b2c1   │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ true        │
-└───────────────┴─────────────┴─────────────────────────┴──────────────────┴───────────────┴─────────────┴───────────────────────────┴──────────────┴───────────────┴───────────────────┴──────────────┴───────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────┘
+┌───────────────┬─────────────┬─────────────────────────┬──────────────────┬───────────────┬─────────────┬───────────────────────────┬──────────────┬────────────────────┬──────────────────────┬───────────────────────┬───────────────────────┬───────────────────┬─────────────────────────┬─────────────────────────┬────────────────────────┬─────────────┐
+│ consumer_name │ consumer_id │ last_committed_snapshot │ current_snapshot │ lag_snapshots │ lag_seconds │ oldest_available_snapshot │ gap_distance │ subscription_count │ subscriptions_active │ subscriptions_renamed │ subscriptions_dropped │ owner_token       │ owner_acquired_at       │ owner_heartbeat_at      │ lease_interval_seconds │ lease_alive │
+├───────────────┼─────────────┼─────────────────────────┼──────────────────┼───────────────┼─────────────┼───────────────────────────┼──────────────┼────────────────────┼──────────────────────┼───────────────────────┼───────────────────────┼───────────────────┼─────────────────────────┼─────────────────────────┼────────────────────────┼─────────────┤
+│ orders_sink   │           1 │                      42 │               43 │             1 │       12.4  │                         5 │           37 │                  2 │                    2 │                     0 │                     0 │ 8f3a3c2e-…-b2c1   │ 2026-04-30 09:30:51+00  │ 2026-04-30 09:31:08+00  │                     30 │ true        │
+└───────────────┴─────────────┴─────────────────────────┴──────────────────┴───────────────┴─────────────┴───────────────────────────┴──────────────┴────────────────────┴──────────────────────┴───────────────────────┴───────────────────────┴───────────────────┴─────────────────────────┴─────────────────────────┴────────────────────────┴─────────────┘
 ```
 
 ### `cdc_audit_recent`
@@ -546,11 +642,23 @@ consumer_name VARCHAR, consumer_id BIGINT, details VARCHAR`.
 
 ## Filter rules
 
-- `event_categories` is the top-level stream filter.
-- `tables` filters table-scoped DDL and DML.
-- `change_types` filters DML only.
-- Filters compose with AND semantics.
-- Matching is exact on DuckLake's qualified table names.
+- Subscriptions are normalized rows, not JSON/list filters on the consumer
+  row.
+- `scope_kind` is `catalog`, `schema`, or `table`.
+- `event_category` is `dml`, `ddl`, or explicit wildcard `'*'`.
+- `change_type` is `insert`, `update_preimage`, `update_postimage`,
+  `delete`, or explicit wildcard `'*'`.
+- `change_type` applies only to DML. For DDL subscriptions it must be
+  `'*'`.
+- `NULL` is not a wildcard. Wildcards must be written as `'*'`.
+- Names are resolved at `start_at`; persisted matching uses
+  `schema_id` / `table_id`.
+- Schema subscriptions match all current and future tables belonging to
+  the same `schema_id`. Table subscriptions match the same `table_id`
+  across renames.
+- Drop + recreate with the same name creates a new identity and is not
+  matched by an older subscription unless the caller creates a new
+  subscription.
 
 ## Ordering
 
@@ -564,8 +672,16 @@ consumer_name VARCHAR, consumer_id BIGINT, details VARCHAR`.
 The extension creates these metadata-catalog state tables on first use:
 
 - `__ducklake_cdc_consumers`
+- `__ducklake_cdc_consumer_subscriptions`
 - `__ducklake_cdc_audit`
 - `__ducklake_cdc_dlq`
+
+`__ducklake_cdc_consumers` stores cursor, lease, and consumer-level
+configuration. `__ducklake_cdc_consumer_subscriptions` stores one row per
+resolved routing rule, keyed by `consumer_id` plus `subscription_id` and
+DuckLake object identities. Human-readable original names are retained for
+audit and reconciliation, but they are not the source of truth for
+matching.
 
 DuckDB and PostgreSQL metadata catalogs place them under
 `__ducklake_metadata_<catalog>.__ducklake_cdc`. SQLite metadata catalogs do
