@@ -81,7 +81,15 @@ ATTACH 'ducklake:my.ducklake' AS lake (DATA_PATH 'my_data');
 CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
 INSERT INTO lake.orders VALUES (1, 'new');
 
-SELECT * FROM cdc_consumer_create('lake', 'demo');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'demo',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 INSERT INTO lake.orders VALUES (2, 'paid');
 
 -- The cursor loop in three primitives. cdc_window and cdc_commit are

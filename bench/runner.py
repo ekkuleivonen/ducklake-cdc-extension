@@ -74,6 +74,12 @@ std::string QuoteString(const std::string &value) {
 	return result;
 }
 
+std::string CatalogAllSubscription() {
+	return "subscriptions := [struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, "
+	       "table_name := NULL::VARCHAR, schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
+	       "event_category := '*', change_type := '*')]";
+}
+
 int64_t NowNanos() {
 	const auto now = std::chrono::steady_clock::now().time_since_epoch();
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
@@ -146,7 +152,8 @@ int main(int argc, char **argv) {
 	RequireOk(conn, "ATTACH 'ducklake:" + lake_path + "' AS lake (DATA_PATH " + QuoteString(data_path) + ")");
 	RequireOk(conn, "CREATE TABLE lake.bench_events(id BIGINT, produced_ns BIGINT, snapshot_no INTEGER, row_no INTEGER)");
 	for (int consumer = 0; consumer < consumers; consumer++) {
-		RequireOk(conn, "SELECT * FROM cdc_consumer_create('lake', 'bench_" + std::to_string(consumer) + "')");
+		RequireOk(conn, "SELECT * FROM cdc_consumer_create('lake', 'bench_" + std::to_string(consumer) + "', " +
+		                    CatalogAllSubscription() + ")");
 	}
 
 	std::vector<double> latencies_ms;
@@ -314,6 +321,15 @@ def quote_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def catalog_all_subscription_arg() -> str:
+    return (
+        "subscriptions := ["
+        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
+        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
+        "]"
+    )
+
+
 def build_paths(build: str) -> dict[str, Path]:
     lib_name = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
     return {
@@ -440,7 +456,10 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
     require_ok_python(conn, "CREATE TABLE lake.bench_events(id BIGINT, produced_ns BIGINT, snapshot_no INTEGER, row_no INTEGER)")
 
     for consumer in range(workload.consumers):
-        require_ok_python(conn, f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}')")
+        require_ok_python(
+            conn,
+            f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}', {catalog_all_subscription_arg()})",
+        )
 
     planned_snapshots = max(1, math.floor(workload.duration_seconds * workload.target_snapshots_per_second))
     interval_seconds = 1.0 / workload.target_snapshots_per_second
