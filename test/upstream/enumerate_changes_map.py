@@ -133,8 +133,7 @@ def operation_script() -> list[Op]:
         # 415a9ebd) this is FALSE for the cross-transaction case: the
         # delete still produces a snapshot with `inlined_delete`. The spec
         # note may apply only to single-transaction insert+delete; not yet
-        # verified by the upstream probe. Documented in
-        # `docs/operational/inlined-data-edge-cases.md`.
+        # verified by the upstream probe.
         Op(
             "inlined_delete_inline_on_inline",
             "DELETE FROM main.t_main WHERE id = 999",

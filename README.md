@@ -18,12 +18,11 @@ of [DuckLake](https://ducklake.select).
 - Stateless sugar — `cdc_recent_changes`, `cdc_recent_ddl`,
   `cdc_schema_diff` — for ad-hoc exploration without creating a consumer.
 - Composed sugar — `cdc_events`, `cdc_changes` — built over the
-  primitives, applied with the consumer's `change_types` filter.
+  primitives, applied with the consumer's subscription routing rules.
 - Observability — `cdc_consumer_stats`, `cdc_audit_recent`.
 - Structured errors and notices: `CDC_GAP`, `CDC_BUSY`,
-  `CDC_INVALID_TABLE_FILTER`, `CDC_INCOMPATIBLE_CATALOG`,
-  `CDC_SCHEMA_BOUNDARY`, `CDC_WAIT_TIMEOUT_CLAMPED`,
-  `CDC_WAIT_SHARED_CONNECTION` — full list in
+  `CDC_INCOMPATIBLE_CATALOG`, `CDC_SCHEMA_BOUNDARY`,
+  `CDC_WAIT_TIMEOUT_CLAMPED`, `CDC_WAIT_SHARED_CONNECTION` — full list in
   [`docs/errors.md`](./docs/errors.md).
 - Community-extension install: `INSTALL ducklake_cdc FROM community`.
 - DuckDB, SQLite, and PostgreSQL DuckLake catalog smoke coverage in CI.
@@ -67,8 +66,8 @@ guidance lives in [`docs/development.md`](./docs/development.md).
 
 ## Quickstart
 
-![Producer SQL mutating a DuckLake table](./docs/demo/phase1/producer.png)
-![Consumer SQL reading DuckLake CDC events](./docs/demo/phase1/consumer.png)
+![Producer SQL mutating a DuckLake table](./docs/assets/producer.png)
+![Consumer SQL reading DuckLake CDC events](./docs/assets/consumer.png)
 
 ```sql
 -- Preconditions: DuckDB v1.5.1 and the official `ducklake`, `parquet`,
@@ -141,7 +140,7 @@ self-contained script you can pipe into `./build/debug/duckdb`:
 | `04_schema_change.sql` | `schema_changes_pending`, `cdc_ddl`, schema-boundary flow |
 | `05_recent_changes.sql` | stateless `cdc_recent_changes` / `cdc_recent_ddl` |
 | `06_parallel_readers.sql` | orchestrator + worker fan-out under one lease |
-| `07_ddl_only_consumer.sql` | `event_categories := ['ddl']` schema-watcher |
+| `07_ddl_only_consumer.sql` | catalog-scope DDL subscription schema-watcher |
 | `08_cross_schema_window.sql` | `stop_at_schema_change := false` opt-out |
 | `09_lease_recovery.sql` | force-release after a holder dies |
 

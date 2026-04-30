@@ -2,11 +2,10 @@
 # description: PR 4 — create-time validation of cdc_consumer_create
 # group: [sql]
 
-#              (CDC_INVALID_TABLE_FILTER + change_types/event_categories
-#              ALLOWED enum gates), CDC_SCHEMA_BOUNDARY notice on
+#              subscription validation, CDC_SCHEMA_BOUNDARY notice on
 #              cdc_window, CDC_WAIT_TIMEOUT_CLAMPED notice on cdc_wait,
-#              and the DDL-vs-DML routing of consumer.event_categories
-#              into cdc_ddl / cdc_changes. All shipped as v0.0.7.
+#              and the DDL-vs-DML routing of subscription rows into
+#              cdc_ddl / cdc_changes.
 
 require ducklake_cdc
 
@@ -33,51 +32,116 @@ CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
 statement ok
 INSERT INTO lake.orders VALUES (1, 'new');
 
-# tables filter: name that exists at start_at is accepted.
+# table subscription: name that exists at start_at is accepted.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'good_filter', start_at = '1', tables = ['main.orders']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'good_filter',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
-# tables filter: name that does not exist raises CDC_INVALID_TABLE_FILTER.
-# The reference message includes the supplied list, the missing names,
-# the snapshot id, and the actual catalog tables for diagnosis.
+# table subscription: name that does not exist is rejected at create time.
 statement error
-SELECT * FROM cdc_consumer_create('lake', 'typo', start_at = '1', tables = ['main.orders', 'main.ordres']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'typo',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'ordres',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 ----
-CDC_INVALID_TABLE_FILTER
+is not live
 
-# tables filter: empty list is rejected (it would deny everything,
-# which is almost certainly a bug; consumers that take everything
-# should omit the tables parameter).
+# subscriptions: empty list is rejected.
 statement error
-SELECT * FROM cdc_consumer_create('lake', 'empty_filter', start_at = '1', tables = []);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'empty_filter',
+  start_at = '1',
+  subscriptions := []::STRUCT(scope_kind VARCHAR, schema_name VARCHAR, table_name VARCHAR,
+                              schema_id BIGINT, table_id BIGINT,
+                              event_category VARCHAR, change_type VARCHAR)[]
+);
 ----
-empty tables list
+subscriptions
 
-# change_types: known enum entries succeed.
+# change_type: known enum entries succeed.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'inserts_only', start_at = '1', change_types = ['insert']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'inserts_only',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
 
-# change_types: unknown entries are rejected with the allowed set in
-# the message.
+# change_type: unknown entries are rejected with the allowed set in the message.
 statement error
-SELECT * FROM cdc_consumer_create('lake', 'bad_change', start_at = '1', change_types = ['upsert']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bad_change',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'upsert')
+  ]
+);
 ----
-invalid change_types
+invalid change_type
 
-# event_categories: known enum entries succeed.
+# event_category: known enum entries succeed.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'ddl_only', start_at = '1', event_categories = ['ddl']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'ddl_only',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'dml_only', start_at = '1', event_categories = ['dml']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'dml_only',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
-# event_categories: unknown entries rejected.
+# event_category: unknown entries rejected.
 statement error
-SELECT * FROM cdc_consumer_create('lake', 'bad_event', start_at = '1', event_categories = ['snapshot']);
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'bad_event',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'snapshot', change_type := '*')
+  ]
+);
 ----
-invalid event_categories
+invalid event_category
 
-# event_categories filter is honored at read time. Add some DML so the
+# event_category routing is honored at read time. Add some DML so the
 # windows actually have work to do.
 statement ok
 INSERT INTO lake.orders VALUES (2, 'paid');
@@ -140,6 +204,14 @@ statement ok
 INSERT INTO fake.__ducklake_metadata_fake.ducklake_metadata VALUES ('version', '99.99');
 
 statement error
-SELECT * FROM cdc_consumer_create('fake', 'shouldfail', tables = ['main.orders']);
+SELECT * FROM cdc_consumer_create(
+  'fake',
+  'shouldfail',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 ----
 CDC_INCOMPATIBLE_CATALOG

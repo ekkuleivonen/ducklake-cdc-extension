@@ -26,7 +26,8 @@ query I
 SELECT count(*) FROM duckdb_tables()
 WHERE database_name = '__ducklake_metadata_lake'
   AND schema_name = '__ducklake_cdc'
-  AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+  AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
+                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
 ----
 0
 
@@ -35,7 +36,15 @@ statement ok
 SET VARIABLE snapshots_before_consumer_create = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
 
 query II
-SELECT consumer_name, consumer_id FROM cdc_consumer_create('lake', 'demo');
+SELECT consumer_name, consumer_id FROM cdc_consumer_create(
+  'lake',
+  'demo',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 ----
 demo	1
 
@@ -47,14 +56,15 @@ FROM __ducklake_metadata_lake.ducklake_snapshot;
 ----
 true
 
-# All three catalog-resident state tables now exist.
+# All four catalog-resident state tables now exist.
 query I
 SELECT count(*) FROM duckdb_tables()
 WHERE database_name = '__ducklake_metadata_lake'
   AND schema_name = '__ducklake_cdc'
-  AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
+  AND table_name IN ('__ducklake_cdc_consumers', '__ducklake_cdc_consumer_subscriptions',
+                     '__ducklake_cdc_audit', '__ducklake_cdc_dlq');
 ----
-3
+4
 
 # Listing returns rows in creation order.
 query II
@@ -70,7 +80,15 @@ consumer_create	demo	1
 
 # Bootstrap is idempotent; the second consumer gets the next integer id.
 query II
-SELECT consumer_name, consumer_id FROM cdc_consumer_create('lake', 'mirror');
+SELECT consumer_name, consumer_id FROM cdc_consumer_create(
+  'lake',
+  'mirror',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 ----
 mirror	2
 
@@ -83,13 +101,30 @@ mirror	2
 # Duplicate names are rejected even though DuckLake does not yet support
 # PRIMARY KEY/UNIQUE constraints on regular DuckLake tables.
 statement error
-SELECT * FROM cdc_consumer_create('lake', 'demo');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'demo',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 ----
 consumer 'demo' already exists
 
 # start_at = 'beginning' resolves to the oldest DuckLake snapshot.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'from_beginning', start_at = 'beginning');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'from_beginning',
+  start_at = 'beginning',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 query I
 SELECT last_committed_snapshot FROM cdc_consumer_list('lake') WHERE consumer_name = 'from_beginning';
@@ -121,7 +156,15 @@ SELECT schema_changes_pending FROM cdc_window('lake', 'from_beginning');
 true
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'dml_window');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'dml_window',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake.window_probe VALUES (2);
@@ -185,7 +228,15 @@ SELECT * FROM cdc_commit('lake', 'dml_window', 0);
 behind consumer 'dml_window' cursor
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'commit_without_window');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'commit_without_window',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement error
 SELECT * FROM cdc_commit('lake', 'commit_without_window', 0);
@@ -280,7 +331,15 @@ SELECT * FROM cdc_consumer_drop('lake', 'missing');
 consumer 'missing' does not exist
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'leased');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'leased',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
@@ -335,7 +394,15 @@ statement ok
 INSERT INTO fake.__ducklake_metadata_fake.ducklake_metadata VALUES ('version', '99.99');
 
 statement error
-SELECT * FROM cdc_consumer_create('fake', 'shouldfail');
+SELECT * FROM cdc_consumer_create(
+  'fake',
+  'shouldfail',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 ----
 CDC_INCOMPATIBLE_CATALOG
 
@@ -378,7 +445,15 @@ statement ok
 ATTACH 'ducklake:__TEST_DIR__/consumer_state_ddl.ducklake' AS ddl_lake (DATA_PATH '__TEST_DIR__/consumer_state_ddl_data');
 
 statement ok
-SELECT * FROM cdc_consumer_create('ddl_lake', 'ddl_consumer');
+SELECT * FROM cdc_consumer_create(
+  'ddl_lake',
+  'ddl_consumer',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
+);
 
 statement ok
 CREATE SCHEMA ddl_lake.ddl_s;

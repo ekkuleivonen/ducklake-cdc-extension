@@ -31,11 +31,6 @@ commit.
 Use `cdc_consumer_stats` to inspect the holder. Use
 `cdc_consumer_force_release` only when you know the holder is dead.
 
-### `CDC_INVALID_TABLE_FILTER`
-
-`cdc_consumer_create` received a `tables` filter that does not resolve at the
-consumer's start snapshot, or an empty filter list that would deny everything.
-
 ### `CDC_MAX_SNAPSHOTS_EXCEEDED`
 
 `max_snapshots` exceeded the extension's hard cap. Use smaller batches unless

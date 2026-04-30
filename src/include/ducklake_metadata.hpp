@@ -40,6 +40,7 @@ namespace duckdb_cdc {
 //===--------------------------------------------------------------------===//
 
 extern const char *const CONSUMERS_TABLE;
+extern const char *const CONSUMER_SUBSCRIPTIONS_TABLE;
 extern const char *const AUDIT_TABLE;
 extern const char *const DLQ_TABLE;
 extern const char *const STATE_SCHEMA;
@@ -63,12 +64,9 @@ std::string QuoteLiteral(const std::string &value);
 //===--------------------------------------------------------------------===//
 
 std::string JsonEscape(const std::string &value);
-std::string JsonStringArray(const std::vector<std::string> &values);
 std::string JsonValue(const duckdb::Value &value);
 std::string JsonOptionalString(const duckdb::Value &v);
 std::string TrimCopy(const std::string &value);
-std::vector<std::string> ParseStringArray(const std::string &input);
-duckdb::Value StringListValue(const duckdb::Value &value);
 bool StartsWith(const std::string &value, const std::string &prefix);
 bool TryParseInt64(const std::string &input, int64_t &out);
 
@@ -107,7 +105,6 @@ int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_
                            int64_t current_snapshot);
 void EnsureSnapshotExistsOrGap(duckdb::Connection &conn, const std::string &catalog_name,
                                const std::string &consumer_name, int64_t snapshot_id);
-std::string ListTablesAtSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id);
 
 //===--------------------------------------------------------------------===//
 // Structural schema-change predicates
@@ -137,6 +134,7 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 //===--------------------------------------------------------------------===//
 
 std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema);
+std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema);
 std::string AuditDdl(const std::string &catalog_name, bool use_state_schema);
 std::string DlqDdl(const std::string &catalog_name, bool use_state_schema);
 

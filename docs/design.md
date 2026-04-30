@@ -6,13 +6,13 @@ heavy for a small weekend-maintained project.
 
 ## What This Extension Is
 
-`ducklake-cdc` is a small DuckDB extension that adds a durable CDC cursor on
-top of DuckLake. It does not try to replace DuckLake's own snapshot, time
-travel, or table-change APIs.
+`ducklake-cdc` is a small DuckDB extension that adds durable CDC consumers on
+top of DuckLake. It does not replace DuckLake's own snapshot, time-travel, or
+table-change APIs.
 
 The extension exists to make the same SQL surface work from the DuckDB CLI and
 from future clients without each client reimplementing cursor state, leasing,
-schema-boundary logic, and typed DDL extraction.
+subscription routing, schema-boundary logic, and typed DDL extraction.
 
 ## Use DuckLake Directly
 
@@ -24,25 +24,43 @@ Anything DuckLake already exposes should stay DuckLake's job:
 - Commit metadata carries producer-side context.
 - DuckLake maintenance handles compaction, file rewrites, and cleanup.
 
-The extension adds only the parts needed for consumer workflows: cursor state,
-gap detection, long-polling, typed DDL events, schema-boundary handling, lease
-enforcement, and basic observability.
+The extension adds only the parts needed for consumer workflows: durable cursor
+state, identity-based subscriptions, gap detection, long-polling, typed DDL
+events, schema-boundary handling, lease enforcement, and basic observability.
 
-## Cursor State
+## Metadata State
 
 Consumer state lives beside DuckLake's own metadata tables in the metadata
 catalog backend:
 
 - `__ducklake_cdc_consumers`
+- `__ducklake_cdc_consumer_subscriptions`
 - `__ducklake_cdc_audit`
 - `__ducklake_cdc_dlq`
 
 DuckDB and PostgreSQL metadata catalogs use a sibling `__ducklake_cdc` schema
 inside `__ducklake_metadata_<catalog>`. SQLite metadata catalogs do not support
-schemas, so they use prefixed tables in the metadata database `main` schema.
+schemas, so the same table names live in the metadata database `main` schema.
+
 This keeps state close to the catalog snapshots it tracks without making every
 cursor heartbeat or commit create a DuckLake snapshot. There is no external
 state store and no side database to keep in sync.
+
+`__ducklake_cdc_consumers` stores one row per named consumer: cursor position,
+schema-boundary policy, DDL failure policy, lease fields, timestamps, and
+metadata. Routing intent is stored only in
+`__ducklake_cdc_consumer_subscriptions`.
+
+`__ducklake_cdc_consumer_subscriptions` stores one normalized row per resolved
+routing rule. Subscriptions are identity-first: names supplied at create time
+are resolved to DuckLake `schema_id` and `table_id`, then matching uses those
+ids. A table subscription follows table renames, a schema subscription follows
+schema renames, and drop + recreate with the same name is a new object that
+does not match the old subscription.
+
+`__ducklake_cdc_audit` records lifecycle actions for operational visibility.
+`__ducklake_cdc_dlq` is created so the schema is stable, but DLQ helper APIs and
+write/replay semantics are intentionally not shipped yet.
 
 ## Read and Commit Stay Separate
 

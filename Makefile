@@ -48,7 +48,11 @@ export OVERRIDE_GIT_DESCRIBE
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-.PHONY: prepare_tests test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+.PHONY: prepare_tests install-git-hooks test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+
+install-git-hooks:
+	git config core.hooksPath .githooks
+	@echo "Installed git hooks from .githooks"
 
 # Pre-fetch the official ducklake binary for our DuckDB target into the local
 # extension cache so the `INSTALL ducklake` statement in SQL tests resolves

@@ -37,7 +37,16 @@ statement ok
 CREATE TABLE lake_inline.orders(id INTEGER, status VARCHAR);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_inline', 'inline_consumer', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake_inline',
+  'inline_consumer',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake_inline.orders VALUES (1, 'new'), (2, 'paid');
@@ -69,7 +78,7 @@ SELECT count(*) FROM cdc_changes('lake_inline', 'inline_consumer', 'orders');
 
 # -----------------------------------------------------------------------------
 # All four change types pass through unfiltered. Insert / update / delete a
-# row; the default consumer (change_types := NULL) sees four events:
+# row; a wildcard DML subscription sees four events:
 # insert, update_preimage, update_postimage, delete. No implicit
 # update_preimage filtering — that's the project's contract.
 # -----------------------------------------------------------------------------
@@ -81,7 +90,16 @@ statement ok
 CREATE TABLE lake4.events(id INTEGER, status VARCHAR);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake4', 'all_kinds', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake4',
+  'all_kinds',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake4.events VALUES (1, 'created');
@@ -99,7 +117,16 @@ SELECT count(*), count(DISTINCT change_type) FROM cdc_changes('lake4', 'all_kind
 
 # A single-change-type filter (e.g. ['delete']) sees exactly one event.
 statement ok
-SELECT * FROM cdc_consumer_create('lake4', 'deletes_only', start_at = '1', change_types = ['delete']);
+SELECT * FROM cdc_consumer_create(
+  'lake4',
+  'deletes_only',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'delete')
+  ]
+);
 
 query II
 SELECT count(*), count(DISTINCT change_type) FROM cdc_changes('lake4', 'deletes_only', 'events');
@@ -121,7 +148,16 @@ statement ok
 CREATE TABLE lake_sd.orders(id INTEGER);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_sd', 'sd_consumer', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake_sd',
+  'sd_consumer',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake_sd.orders VALUES (1), (2);
@@ -181,7 +217,17 @@ statement ok
 CREATE TABLE lake_so.orders(id INTEGER);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_so', 'so_consumer', start_at = '1', stop_at_schema_change = false);
+SELECT * FROM cdc_consumer_create(
+  'lake_so',
+  'so_consumer',
+  start_at = '1',
+  stop_at_schema_change = false,
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake_so.orders VALUES (1), (2);
@@ -230,7 +276,17 @@ statement ok
 CREATE TABLE lake_dd.orders(id INTEGER);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_dd', 'dd_consumer', start_at = '1', stop_at_schema_change = false);
+SELECT * FROM cdc_consumer_create(
+  'lake_dd',
+  'dd_consumer',
+  start_at = '1',
+  stop_at_schema_change = false,
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake_dd.orders VALUES (1);
@@ -276,7 +332,7 @@ true
 # Column-drop audit limitation, documented behaviour. ALTER TABLE DROP
 # COLUMN + DELETE in one snapshot. cdc_changes returns the deletes WITHOUT
 # the dropped column's value. We assert this is what happens (so we don't
-# silently regress) and link to docs/operational/audit-limitations.md.
+# silently regress).
 # -----------------------------------------------------------------------------
 
 statement ok
@@ -289,7 +345,17 @@ statement ok
 INSERT INTO lake_da.orders VALUES (1, 'a@example.com'), (2, 'b@example.com');
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_da', 'da_consumer', start_at = '2', stop_at_schema_change = false);
+SELECT * FROM cdc_consumer_create(
+  'lake_da',
+  'da_consumer',
+  start_at = '2',
+  stop_at_schema_change = false,
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
 BEGIN TRANSACTION;
@@ -329,7 +395,16 @@ statement ok
 CREATE TABLE lake_cm.orders(id INTEGER);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_cm', 'cm_consumer', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake_cm',
+  'cm_consumer',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
 BEGIN TRANSACTION;
@@ -370,10 +445,28 @@ statement ok
 CREATE TABLE lake_mc.orders(id INTEGER);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_mc', 'consumer_a', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake_mc',
+  'consumer_a',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_mc', 'consumer_b', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake_mc',
+  'consumer_b',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement ok
 INSERT INTO lake_mc.orders VALUES (1), (2), (3);
@@ -403,10 +496,10 @@ consumer_a	true
 consumer_b	false
 
 # -----------------------------------------------------------------------------
-# Dropped-table policy. Consumer with tables := ['main.orders'] continues
-# to advance after DROP TABLE; cdc_consumer_stats().tables_unresolved lists
-# the missing name. This is the contract — we DO NOT halt the consumer.
-# Operators monitor stats and act on tables_unresolved themselves.
+# Dropped-table policy. Consumer with an identity table subscription continues
+# to advance after DROP TABLE; cdc_consumer_stats() counts the dropped
+# subscription. This is the contract — we DO NOT halt the consumer.
+# Operators monitor stats and act on dropped subscriptions themselves.
 # -----------------------------------------------------------------------------
 
 statement ok
@@ -419,16 +512,26 @@ statement ok
 INSERT INTO lake_dr.orders VALUES (1);
 
 statement ok
-SELECT * FROM cdc_consumer_create('lake_dr', 'dr_consumer', start_at = '2', tables = ['main.orders'], stop_at_schema_change = false);
+SELECT * FROM cdc_consumer_create(
+  'lake_dr',
+  'dr_consumer',
+  start_at = '2',
+  stop_at_schema_change = false,
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := '*', change_type := '*')
+  ]
+);
 
 statement ok
 DROP TABLE lake_dr.orders;
 
-# tables_unresolved surfaces the missing qualified name.
+# The dropped table is surfaced as a dropped subscription.
 query II
-SELECT consumer_name, tables_unresolved FROM cdc_consumer_stats('lake_dr', consumer => 'dr_consumer');
+SELECT consumer_name, subscriptions_dropped FROM cdc_consumer_stats('lake_dr', consumer => 'dr_consumer');
 ----
-dr_consumer	[main.orders]
+dr_consumer	5
 
 # cdc_window keeps advancing — the consumer is NOT halted by the drop. The
 # next call to cdc_window succeeds; cdc_ddl returns the dropped.table event.

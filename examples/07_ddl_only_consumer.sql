@@ -1,6 +1,6 @@
 -- DDL-only consumer for schema-watcher workflows.
 --
--- event_categories=['ddl'] projects only DDL events. The durable cursor still
+-- A catalog-scope DDL subscription projects only DDL events. The durable cursor still
 -- advances through the stream, so this can run beside independent DML consumers.
 
 LOAD ducklake;
@@ -17,7 +17,11 @@ SELECT * FROM cdc_consumer_create(
   'lake',
   'schema_watcher',
   start_at = '2',
-  event_categories = ['ddl']
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'ddl', change_type := '*')
+  ]
 );
 
 ALTER TABLE lake.orders ADD COLUMN status VARCHAR DEFAULT 'new';

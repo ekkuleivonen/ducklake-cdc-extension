@@ -5,8 +5,8 @@ release checklist, and it is not a promise that every possible edge case must
 be closed before the next tag.
 
 Known risks live in the [hazard log](./hazard-log.md). Older phase files were
-useful design history, but they are no longer the canonical definition of
-"done."
+useful design history, but the surviving docs are now the canonical definition
+of what exists and what is intentionally deferred.
 
 ## Where We Are
 
@@ -35,23 +35,21 @@ What is still intentionally thin:
 
 ## Direction
 
-### Now: Clean Up the Docs
+### Just Finished: Clean Up the Docs
 
-The near-term goal is to make the project understandable and maintainable for a
-single weekend maintainer.
+The docs have been reduced to the pieces a single weekend maintainer should be
+able to keep current.
 
-Work that belongs here:
+What remains:
 
 - Keep the README, API reference, examples, roadmap, and hazard log.
 - Keep focused operational docs that explain current behavior.
-- Drop old decision logs, long phase plans, and client plans that nobody is actively
-  building.
+- Keep design notes short and tied to shipped metadata/catalog behavior.
 - Keep `INSTALL ducklake_cdc FROM community` working.
 
-### Next: Verify the Extension Surface
+### Now: Verify the Extension Surface
 
-After the docs are smaller, spend a couple focused passes on the extension
-itself.
+The next chapter is a couple focused passes on the extension itself.
 
 Likely work:
 
@@ -61,7 +59,7 @@ Likely work:
 - Keep the catalog-matrix smoke small and meaningful.
 - Improve examples where the SQL surface feels awkward.
 
-### Then: Python Client
+### Next: Python Client
 
 The first client should be Python, because it is the shortest path from the SQL
 extension to people actually trying the project in scripts, notebooks, and

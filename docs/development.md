@@ -97,6 +97,34 @@ build/debug/test/unittest --test-dir . "test/sql/ducklake_cdc.test"
 
 Swap the path for any file under `test/sql/`.
 
+## Formatting
+
+CI runs the DuckDB extension-template formatter gate:
+
+```bash
+make format-check
+```
+
+Apply the same formatter locally before committing:
+
+```bash
+make format-fix
+```
+
+The formatter requires `clang-format 11.0.1` on `PATH` and the Python
+formatter dependencies used by DuckDB's `duckdb/scripts/format.py`.
+
+To enable the local pre-commit hook:
+
+```bash
+make install-git-hooks
+```
+
+The hook runs `make format-check` with a formatter toolchain bootstrapped into
+the ignored `.cache/pre-commit/` directory. That venv provides
+`clang_format==11.0.1`, `black==24.10.0`, and `cmake-format`, so the check does
+not depend on the developer's system `clang-format` version.
+
 ## Python smoke and upstream probes
 
 Some behaviours are easier to smoke-test from Python (stderr notices,

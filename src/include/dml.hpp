@@ -4,10 +4,10 @@
 // dml.hpp
 //
 // Row-level change-event surface. Owns cdc_events (snapshot-by-snapshot
-// commit metadata filtered by the consumer's `tables` predicate),
-// cdc_changes (typed DML rows from `<lake>.table_changes()` projected
-// through the consumer's `change_types` filter), and the stateless
-// cdc_recent_changes sugar for ad-hoc lookback queries.
+// commit metadata filtered by consumer subscriptions), cdc_changes (typed
+// DML rows from `<lake>.table_changes()` projected through subscription
+// change-type rules), and the stateless cdc_recent_changes sugar for
+// ad-hoc lookback queries.
 //===----------------------------------------------------------------------===//
 
 #pragma once

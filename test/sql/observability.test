@@ -37,21 +37,32 @@ INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid');
 statement ok
 INSERT INTO lake.shipments VALUES (10, 1);
 
-# Two consumers — one filtered to a single table (filter is applied
-# directly to consumer state until cdc_consumer_create grows a named
-# param in PR 4), one wide-open. Used to exercise both the per-consumer
-# scope of the named `consumer` parameter and the multi-row case in
-# cdc_consumer_stats.
+# Two consumers with catalog-scope subscriptions. Used to exercise both the
+# per-consumer scope of the named `consumer` parameter and the multi-row case
+# in cdc_consumer_stats.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'orders_only', start_at = '0');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'orders_only',
+  start_at = '0',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
 
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
-SET tables = '["main.orders"]'
-WHERE consumer_name = 'orders_only';
-
-statement ok
-SELECT * FROM cdc_consumer_create('lake', 'wide_open', start_at = '0');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'wide_open',
+  start_at = '0',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
 
 # Bare cdc_consumer_stats returns one row per registered consumer. We don't
 # assert on lag_seconds (clock-dependent) but every other column is
@@ -82,48 +93,56 @@ SELECT count(*) FROM cdc_consumer_stats('lake', consumer => 'orders_only');
 ----
 1
 
-# tables/change_types projection round-trips the consumer's filter set.
-# The wide_open consumer was created without filters so both columns
-# project as NULL (matching their on-disk representation).
-query III
-SELECT consumer_name, tables, change_types
+# Subscription counters summarize normalized subscription state.
+query IIIII
+SELECT consumer_name, subscription_count, subscriptions_active, subscriptions_renamed, subscriptions_dropped
 FROM cdc_consumer_stats('lake', consumer => 'orders_only');
 ----
-orders_only	[main.orders]	NULL
+orders_only	1	1	0	0
 
-query III
-SELECT consumer_name, tables, change_types
+query IIIII
+SELECT consumer_name, subscription_count, subscriptions_active, subscriptions_renamed, subscriptions_dropped
 FROM cdc_consumer_stats('lake', consumer => 'wide_open');
 ----
-wide_open	NULL	NULL
+wide_open	1	1	0	0
 
-# tables_unresolved is empty when every filtered table exists at the
-# current snapshot. (The wide_open consumer has no filter, so the column
-# is also empty by construction.)
+# Existing subscriptions are active at the current snapshot.
 query II
-SELECT consumer_name, tables_unresolved
+SELECT consumer_name, subscriptions_active
 FROM cdc_consumer_stats('lake')
 ORDER BY consumer_name;
 ----
-orders_only	[]
-wide_open	[]
+orders_only	1
+wide_open	1
 
-# A consumer pinned to a table that does not exist surfaces the missing
-# qualified name in tables_unresolved without raising. Lets dashboards
-# distinguish "filter typo" from "lag" without a separate probe.
+# A consumer pinned to a table identity that is later dropped surfaces the
+# dropped subscription without raising.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'typo', start_at = '0');
+CREATE TABLE lake.will_drop(id INTEGER);
 
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
-SET tables = '["main.does_not_exist"]'
-WHERE consumer_name = 'typo';
+SET VARIABLE will_drop_created_snapshot = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'typo',
+  start_at := getvariable('will_drop_created_snapshot'),
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'will_drop',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
+
+statement ok
+DROP TABLE lake.will_drop;
 
 query II
-SELECT consumer_name, tables_unresolved
+SELECT consumer_name, subscriptions_dropped
 FROM cdc_consumer_stats('lake', consumer => 'typo');
 ----
-typo	[main.does_not_exist]
+typo	1
 
 statement ok
 SELECT * FROM cdc_consumer_drop('lake', 'typo');

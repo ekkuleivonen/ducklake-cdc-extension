@@ -46,7 +46,16 @@ SELECT min(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot WHERE sc
 # Start the consumer past the CREATE TABLE so the first window covers the
 # INSERT and the UPDATE without being bounded at the schema-version edge.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'demo', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'demo',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR,
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 # cdc_events: composes cdc_window + ducklake_snapshot_changes. Returns one
 # row per snapshot in the window, with the window's `end_snapshot` projected
@@ -91,37 +100,62 @@ FROM demo_event_snapshot, demo_window_snapshot;
 ----
 true
 
-# A consumer with a tables filter that does NOT include 'orders' sees
+# A consumer with a table subscription that does NOT include 'orders' sees
 # zero events even though the underlying snapshots exist - the composer
-# applies the filter when set.
+# applies the normalized subscription filter.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'other_only', start_at = '1');
+CREATE TABLE lake.something_else(id INTEGER);
 
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers SET tables = '["main.something_else"]'
-WHERE consumer_name = 'other_only';
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'other_only',
+  start_at = '4',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'something_else',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 query I
 SELECT count(*) FROM cdc_events('lake', 'other_only');
 ----
 0
 
-# Same consumer with 'orders' in its tables filter sees the events.
+# A matching table subscription sees the events.
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers SET tables = '["main.orders"]'
-WHERE consumer_name = 'other_only';
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'orders_events',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 query I
-SELECT count(*) FROM cdc_events('lake', 'other_only');
+SELECT count(*) FROM cdc_events('lake', 'orders_events');
 ----
 2
 
 # cdc_changes: dynamic schema discovered from <lake>.table_changes(...).
 # Returns one row per row-level change (insert / update_preimage /
-# update_postimage / delete) with the consumer's change_types filter
+# update_postimage / delete) with the consumer's subscription change_type
 # applied as a WHERE clause.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'orders_consumer', start_at = '1');
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'orders_consumer',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 # All four change types pass through unfiltered by default. Two inserts
 # plus an update gives us insert, insert, update_preimage, update_postimage.
@@ -147,47 +181,68 @@ SELECT count(DISTINCT next_snapshot_id) FROM cdc_changes('lake', 'orders_consume
 ----
 1
 
-# Setting change_types narrows the stream. No implicit update_preimage
+# Setting subscription change_type narrows the stream. No implicit update_preimage
 # filtering - if the consumer asked for it, it gets it; otherwise it
 # doesn't.
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
-SET change_types = '["insert"]'
-WHERE consumer_name = 'orders_consumer';
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'orders_inserts',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'insert')
+  ]
+);
 
 query II
-SELECT change_type, id FROM cdc_changes('lake', 'orders_consumer', 'orders')
+SELECT change_type, id FROM cdc_changes('lake', 'orders_inserts', 'orders')
 ORDER BY id;
 ----
 insert	1
 insert	2
 
 statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
-SET change_types = '["update_postimage","update_preimage"]'
-WHERE consumer_name = 'orders_consumer';
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'orders_updates',
+  start_at = '1',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'update_postimage'),
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := 'update_preimage')
+  ]
+);
 
 query II
-SELECT change_type, id FROM cdc_changes('lake', 'orders_consumer', 'orders')
+SELECT change_type, id FROM cdc_changes('lake', 'orders_updates', 'orders')
 ORDER BY change_type;
 ----
 update_postimage	2
 update_preimage	2
 
-# A consumer with a tables filter that excludes the requested table is
+# A consumer with a table subscription that excludes the requested table is
 # rejected loudly rather than returning silently empty results.
 statement ok
-SELECT * FROM cdc_consumer_create('lake', 'wrong_table', start_at = '1');
-
-statement ok
-UPDATE __ducklake_metadata_lake.__ducklake_cdc.__ducklake_cdc_consumers
-SET tables = '["main.something_else"]'
-WHERE consumer_name = 'wrong_table';
+SELECT * FROM cdc_consumer_create(
+  'lake',
+  'wrong_table',
+  start_at = '4',
+  subscriptions := [
+    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'something_else',
+                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
+                event_category := 'dml', change_type := '*')
+  ]
+);
 
 statement error
 SELECT * FROM cdc_changes('lake', 'wrong_table', 'orders');
 ----
-not in consumer 'wrong_table' tables filter
+not covered by consumer 'wrong_table' subscriptions
 
 # cdc_events and cdc_changes both refuse to run against an incompatible
 # catalog (same guard the underlying primitives apply).
