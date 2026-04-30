@@ -88,8 +88,8 @@ std::vector<std::string> CollectChangeTypes(const duckdb::Value &change_types_va
 
 //! Load normalized subscription rows with current-name and status decoration.
 std::vector<ConsumerSubscriptionRow> LoadConsumerSubscriptions(duckdb::Connection &conn,
-                                                              const std::string &catalog_name,
-                                                              const std::string &consumer_name = std::string());
+                                                               const std::string &catalog_name,
+                                                               const std::string &consumer_name = std::string());
 
 bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_t schema_id, int64_t table_id,
                              const std::string &event_category);

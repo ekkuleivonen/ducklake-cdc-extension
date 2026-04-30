@@ -311,7 +311,8 @@ std::string DuckLakeTableChangesCall(const std::string &catalog_name, const std:
 bool OriginalNameWasRenamed(const std::vector<ConsumerSubscriptionRow> &subscriptions, const std::string &table_name) {
 	for (const auto &subscription : subscriptions) {
 		if (subscription.scope_kind == "table" && subscription.status == "renamed" &&
-		    !subscription.original_qualified_name.IsNull() && subscription.original_qualified_name.ToString() == table_name) {
+		    !subscription.original_qualified_name.IsNull() &&
+		    subscription.original_qualified_name.ToString() == table_name) {
 			return true;
 		}
 	}
@@ -403,8 +404,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 		if (result->table_name.find('.') == std::string::npos) {
 			result->table_name = std::string("main.") + result->table_name;
 		}
-		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, current_snapshot, result->schema_id,
-		                             result->table_id)) {
+		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, current_snapshot,
+		                             result->schema_id, result->table_id)) {
 			if (OriginalNameWasRenamed(subscriptions, result->table_name)) {
 				throw duckdb::InvalidInputException("cdc_changes: table '%s' was renamed; use the current name",
 				                                    result->table_name);
@@ -450,14 +451,15 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 			probe_snapshot = end_snapshot >= start_snapshot ? end_snapshot : start_snapshot;
 		}
 	}
-	const auto table_name_at_probe = CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, probe_snapshot);
+	const auto table_name_at_probe =
+	    CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, probe_snapshot);
 	if (table_name_at_probe.empty() || table_name_at_probe != result->table_name) {
 		probe_snapshot = current_snapshot;
 	}
-	auto probe = conn.Query("SELECT * FROM " +
-	                        DuckLakeTableChangesCall(result->catalog_name, result->table_name, probe_snapshot,
-	                                                 probe_snapshot) +
-	                        " LIMIT 0");
+	auto probe =
+	    conn.Query("SELECT * FROM " +
+	               DuckLakeTableChangesCall(result->catalog_name, result->table_name, probe_snapshot, probe_snapshot) +
+	               " LIMIT 0");
 	if (!probe || probe->HasError()) {
 		throw duckdb::InvalidInputException(
 		    "cdc_changes failed to resolve table '%s' in catalog '%s': %s", result->table_name, result->catalog_name,
@@ -510,7 +512,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 
 	duckdb::Connection conn(*context.db);
 	auto effective_end_snapshot = end_snapshot;
-	const auto table_name_at_end = CurrentQualifiedTableName(conn, data.catalog_name, data.table_id, effective_end_snapshot);
+	const auto table_name_at_end =
+	    CurrentQualifiedTableName(conn, data.catalog_name, data.table_id, effective_end_snapshot);
 	if (table_name_at_end.empty() || table_name_at_end != data.table_name) {
 		effective_end_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	}
@@ -538,15 +541,15 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 		where_clause << ")";
 	}
 
-	auto query =
-	    std::string("SELECT ") + column_list.str() +
-	    ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info, " + std::to_string(effective_end_snapshot) +
-	    " AS next_snapshot_id FROM " +
-	    DuckLakeTableChangesCall(data.catalog_name, data.table_name, start_snapshot, effective_end_snapshot) +
-	    " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
-	    " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
-	    MetadataTable(data.catalog_name, "ducklake_snapshot_changes") + " c ON c.snapshot_id = tc.snapshot_id" +
-	    where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
+	auto query = std::string("SELECT ") + column_list.str() +
+	             ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info, " +
+	             std::to_string(effective_end_snapshot) + " AS next_snapshot_id FROM " +
+	             DuckLakeTableChangesCall(data.catalog_name, data.table_name, start_snapshot, effective_end_snapshot) +
+	             " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
+	             " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
+	             MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
+	             " c ON c.snapshot_id = tc.snapshot_id" + where_clause.str() +
+	             " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "cdc_changes scan failed");

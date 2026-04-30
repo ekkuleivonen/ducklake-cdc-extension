@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "pre-commit: running make format-check"
+
+required_clang_format_version="11.0.1"
+cache_dir="${DUCKLAKE_CDC_HOOK_CACHE:-$repo_root/.cache/pre-commit}"
+formatter_venv="$cache_dir/format-toolchain"
+
+formatter_toolchain_is_compatible() {
+	[ -x "$formatter_venv/bin/clang-format" ] &&
+		"$formatter_venv/bin/clang-format" --version | grep -q "$required_clang_format_version" &&
+		[ -x "$formatter_venv/bin/black" ] &&
+		"$formatter_venv/bin/black" --version | grep -Eq "black, (24|2[5-9]|[3-9][0-9])\\." &&
+		[ -x "$formatter_venv/bin/cmake-format" ]
+}
+
+ensure_formatter_toolchain() {
+	if formatter_toolchain_is_compatible; then
+		return
+	fi
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "pre-commit: python3 is required to bootstrap formatter tools" >&2
+		exit 1
+	fi
+
+	echo "pre-commit: bootstrapping formatter tools in $formatter_venv"
+	rm -rf "$formatter_venv"
+	mkdir -p "$cache_dir"
+	python3 -m venv "$formatter_venv"
+	"$formatter_venv/bin/python" -m pip install --disable-pip-version-check --quiet \
+		"black==24.10.0" \
+		"clang_format==$required_clang_format_version" \
+		"cmake-format"
+}
+
+if command -v clang-format >/dev/null 2>&1 && ! clang-format --version | grep -q "$required_clang_format_version"; then
+	echo "pre-commit: system $(clang-format --version) is not the pinned version"
+elif ! command -v clang-format >/dev/null 2>&1; then
+	echo "pre-commit: system clang-format not found"
+fi
+
+ensure_formatter_toolchain
+export PATH="$formatter_venv/bin:$PATH"
+
+if ! clang-format --version | grep -q "$required_clang_format_version"; then
+	if command -v clang-format >/dev/null 2>&1; then
+		echo "pre-commit: expected clang-format $required_clang_format_version, got:" >&2
+		echo "  $(clang-format --version)" >&2
+	else
+		echo "pre-commit: clang-format not found after formatter bootstrap" >&2
+	fi
+	exit 1
+fi
+
+make format-check

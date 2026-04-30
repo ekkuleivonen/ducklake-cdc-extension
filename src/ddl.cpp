@@ -1083,8 +1083,8 @@ void ApplyDdlSubscriptionFilter(std::vector<std::vector<duckdb::Value>> &rows,
 			           !schema_value.IsNull() &&
 			           subscription.schema_id.GetValue<int64_t>() == schema_value.GetValue<int64_t>()) {
 				keep = true;
-			} else if (subscription.scope_kind == "table" && object_kind == "table" && !subscription.table_id.IsNull() &&
-			           !object_value.IsNull() &&
+			} else if (subscription.scope_kind == "table" && object_kind == "table" &&
+			           !subscription.table_id.IsNull() && !object_value.IsNull() &&
 			           subscription.table_id.GetValue<int64_t>() == object_value.GetValue<int64_t>()) {
 				keep = true;
 			}

@@ -62,40 +62,17 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcConsumerStatsBind(duckdb::ClientCont
 		result->consumer_name = entry->second.GetValue<std::string>();
 	}
 
-	names = {"consumer_name",
-	         "consumer_id",
-	         "last_committed_snapshot",
-	         "current_snapshot",
-	         "lag_snapshots",
-	         "lag_seconds",
-	         "oldest_available_snapshot",
-	         "gap_distance",
-	         "subscription_count",
-	         "subscriptions_active",
-	         "subscriptions_renamed",
-	         "subscriptions_dropped",
-	         "owner_token",
-	         "owner_acquired_at",
-	         "owner_heartbeat_at",
-	         "lease_interval_seconds",
+	names = {"consumer_name",      "consumer_id",          "last_committed_snapshot",   "current_snapshot",
+	         "lag_snapshots",      "lag_seconds",          "oldest_available_snapshot", "gap_distance",
+	         "subscription_count", "subscriptions_active", "subscriptions_renamed",     "subscriptions_dropped",
+	         "owner_token",        "owner_acquired_at",    "owner_heartbeat_at",        "lease_interval_seconds",
 	         "lease_alive"};
-	return_types = {duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::DOUBLE,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::UUID,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::INTEGER,
-	                duckdb::LogicalType::BOOLEAN};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::DOUBLE,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::UUID,    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ,
+	                duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
 	return std::move(result);
 }
 

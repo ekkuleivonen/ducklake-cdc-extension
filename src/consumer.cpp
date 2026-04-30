@@ -331,17 +331,10 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerCreateBind(duckdb::ClientContex
 	         "change_type",
 	         "original_qualified_name",
 	         "current_qualified_name"};
-	return_types = {duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 	return std::move(result);
 }
 
@@ -486,11 +479,10 @@ duckdb::Value OptionalQualifiedName(const std::string &scope_kind, const duckdb:
 
 bool ResolveSchemaByNameAt(duckdb::Connection &conn, const std::string &catalog_name, const std::string &schema_name,
                            int64_t snapshot_id, int64_t &schema_id) {
-	auto result = conn.Query("SELECT schema_id FROM " + MetadataTable(catalog_name, "ducklake_schema") +
-	                         " WHERE schema_name = " + QuoteLiteral(schema_name) +
-	                         " AND begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT schema_id FROM " + MetadataTable(catalog_name, "ducklake_schema") + " WHERE schema_name = " +
+	               QuoteLiteral(schema_name) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -500,11 +492,10 @@ bool ResolveSchemaByNameAt(duckdb::Connection &conn, const std::string &catalog_
 
 bool ResolveSchemaByIdAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t schema_id,
                          int64_t snapshot_id, std::string &schema_name) {
-	auto result = conn.Query("SELECT schema_name FROM " + MetadataTable(catalog_name, "ducklake_schema") +
-	                         " WHERE schema_id = " + std::to_string(schema_id) +
-	                         " AND begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT schema_name FROM " + MetadataTable(catalog_name, "ducklake_schema") + " WHERE schema_id = " +
+	               std::to_string(schema_id) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -514,15 +505,13 @@ bool ResolveSchemaByIdAt(duckdb::Connection &conn, const std::string &catalog_na
 
 bool ResolveTableByIdAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                         int64_t snapshot_id, int64_t &schema_id, std::string &qualified_name) {
-	auto result = conn.Query("SELECT s.schema_id, s.schema_name || '.' || t.table_name FROM " +
-	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
-	                         MetadataTable(catalog_name, "ducklake_schema") +
-	                         " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) +
-	                         " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") LIMIT 1");
+	auto result = conn.Query(
+	    "SELECT s.schema_id, s.schema_name || '.' || t.table_name FROM " +
+	    MetadataTable(catalog_name, "ducklake_table") + " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
+	    " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) + " AND t.begin_snapshot <= " +
+	    std::to_string(snapshot_id) + " AND (t.end_snapshot IS NULL OR t.end_snapshot > " +
+	    std::to_string(snapshot_id) + ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
+	    " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
 	    result->GetValue(1, 0).IsNull()) {
 		return false;
@@ -565,7 +554,8 @@ std::vector<std::pair<std::string, std::string>> ExpandedEventChangePairs(const 
 		pairs.emplace_back("ddl", "*");
 	} else {
 		if (change_type != "*") {
-			throw duckdb::InvalidInputException("cdc_consumer_create: wildcard event_category requires change_type '*'");
+			throw duckdb::InvalidInputException(
+			    "cdc_consumer_create: wildcard event_category requires change_type '*'");
 		}
 		add_dml();
 		pairs.emplace_back("ddl", "*");
@@ -601,7 +591,8 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 		if (raw.scope_kind == "catalog") {
 			if (!raw.schema_name.IsNull() || !raw.table_name.IsNull() || !raw.schema_id.IsNull() ||
 			    !raw.table_id.IsNull()) {
-				throw duckdb::InvalidInputException("cdc_consumer_create: catalog subscription cannot specify identity");
+				throw duckdb::InvalidInputException(
+				    "cdc_consumer_create: catalog subscription cannot specify identity");
 			}
 		} else if (raw.scope_kind == "schema") {
 			if (!raw.table_name.IsNull() || !raw.table_id.IsNull() ||
@@ -613,8 +604,7 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 			if (!raw.schema_name.IsNull()) {
 				sname = raw.schema_name.ToString();
 				if (!ResolveSchemaByNameAt(conn, catalog_name, sname, snapshot_id, sid)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: schema identity '%s' is not live",
-					                                    sname);
+					throw duckdb::InvalidInputException("cdc_consumer_create: schema identity '%s' is not live", sname);
 				}
 			} else if (!raw.schema_id.IsNull()) {
 				sid = raw.schema_id.GetValue<int64_t>();
@@ -628,7 +618,8 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 			schema_id = duckdb::Value::BIGINT(sid);
 			current_name = sname;
 		} else {
-			if ((!raw.table_name.IsNull() && !raw.table_id.IsNull()) || (!raw.schema_name.IsNull() && !raw.table_id.IsNull())) {
+			if ((!raw.table_name.IsNull() && !raw.table_id.IsNull()) ||
+			    (!raw.schema_name.IsNull() && !raw.table_id.IsNull())) {
 				throw duckdb::InvalidInputException("cdc_consumer_create: table subscription has conflicting identity");
 			}
 			int64_t sid = 0;
@@ -652,8 +643,8 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 			schema_id = duckdb::Value::BIGINT(sid);
 			table_id = duckdb::Value::BIGINT(tid);
 		}
-		const auto original_name =
-		    OptionalQualifiedName(raw.scope_kind, raw.schema_name, raw.table_name, raw.schema_id, raw.table_id, current_name);
+		const auto original_name = OptionalQualifiedName(raw.scope_kind, raw.schema_name, raw.table_name, raw.schema_id,
+		                                                 raw.table_id, current_name);
 		for (const auto &pair : ExpandedEventChangePairs(consumer_name, event_category, change_type)) {
 			ResolvedSubscriptionInput out;
 			out.scope_kind = raw.scope_kind;
@@ -679,11 +670,11 @@ std::string SubscriptionJsonArray(const std::vector<ResolvedSubscriptionInput> &
 			out << ",";
 		}
 		const auto &sub = subscriptions[i];
-		out << "{\"scope_kind\":\"" << JsonEscape(sub.scope_kind) << "\",\"schema_id\":"
-		    << (sub.schema_id.IsNull() ? "null" : sub.schema_id.ToString()) << ",\"table_id\":"
-		    << (sub.table_id.IsNull() ? "null" : sub.table_id.ToString()) << ",\"event_category\":\""
-		    << JsonEscape(sub.event_category) << "\",\"change_type\":\"" << JsonEscape(sub.change_type)
-		    << "\",\"original_qualified_name\":";
+		out << "{\"scope_kind\":\"" << JsonEscape(sub.scope_kind)
+		    << "\",\"schema_id\":" << (sub.schema_id.IsNull() ? "null" : sub.schema_id.ToString())
+		    << ",\"table_id\":" << (sub.table_id.IsNull() ? "null" : sub.table_id.ToString())
+		    << ",\"event_category\":\"" << JsonEscape(sub.event_category) << "\",\"change_type\":\""
+		    << JsonEscape(sub.change_type) << "\",\"original_qualified_name\":";
 		if (sub.original_qualified_name.IsNull()) {
 			out << "null";
 		} else {
@@ -709,8 +700,8 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 	if (!data.subscriptions_specified) {
 		throw duckdb::InvalidInputException("cdc_consumer_create requires subscriptions");
 	}
-	const auto subscriptions = ResolveSubscriptions(conn, data.catalog_name, data.consumer_name, data.subscriptions,
-	                                                resolved_snapshot);
+	const auto subscriptions =
+	    ResolveSubscriptions(conn, data.catalog_name, data.consumer_name, data.subscriptions, resolved_snapshot);
 
 	// Audit details JSON stays append-only — every key from the create
 	// call lands here (resolved snapshot included so a later
@@ -744,27 +735,35 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", TRUE, NULL, NULL, NULL)");
 		for (size_t i = 0; i < subscriptions.size(); ++i) {
 			const auto &sub = subscriptions[i];
-			ExecuteChecked(conn,
-			               "INSERT INTO " + subscriptions_table +
-			                   " (consumer_id, subscription_id, scope_kind, schema_id, table_id, event_category, "
-			                   "change_type, original_qualified_name, created_at, metadata) VALUES (" +
-			                   std::to_string(consumer_id) + ", " + std::to_string(i + 1) + ", " +
-			                   QuoteLiteral(sub.scope_kind) + ", " +
-			                   (sub.schema_id.IsNull() ? "NULL" : sub.schema_id.ToString()) + ", " +
-			                   (sub.table_id.IsNull() ? "NULL" : sub.table_id.ToString()) + ", " +
-			                   QuoteLiteral(sub.event_category) + ", " + QuoteLiteral(sub.change_type) + ", " +
-			                   (sub.original_qualified_name.IsNull() ? "NULL"
-			                                                         : QuoteLiteral(sub.original_qualified_name.ToString())) +
-			                   ", now(), NULL)");
+			ExecuteChecked(conn, "INSERT INTO " + subscriptions_table +
+			                         " (consumer_id, subscription_id, scope_kind, schema_id, table_id, event_category, "
+			                         "change_type, original_qualified_name, created_at, metadata) VALUES (" +
+			                         std::to_string(consumer_id) + ", " + std::to_string(i + 1) + ", " +
+			                         QuoteLiteral(sub.scope_kind) + ", " +
+			                         (sub.schema_id.IsNull() ? "NULL" : sub.schema_id.ToString()) + ", " +
+			                         (sub.table_id.IsNull() ? "NULL" : sub.table_id.ToString()) + ", " +
+			                         QuoteLiteral(sub.event_category) + ", " + QuoteLiteral(sub.change_type) + ", " +
+			                         (sub.original_qualified_name.IsNull()
+			                              ? "NULL"
+			                              : QuoteLiteral(sub.original_qualified_name.ToString())) +
+			                         ", now(), NULL)");
 		}
 		InsertAuditRow(conn, data.catalog_name, "consumer_create", data.consumer_name, consumer_id, details.str());
 		ExecuteChecked(conn, "COMMIT");
 		std::vector<duckdb::Value> first_row;
 		const auto decorated = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 		if (decorated.empty()) {
-			return {duckdb::Value(data.consumer_name), duckdb::Value::BIGINT(consumer_id),
-			        duckdb::Value::BIGINT(resolved_snapshot), duckdb::Value(), duckdb::Value(), duckdb::Value(),
-			        duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value(), duckdb::Value()};
+			return {duckdb::Value(data.consumer_name),
+			        duckdb::Value::BIGINT(consumer_id),
+			        duckdb::Value::BIGINT(resolved_snapshot),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value(),
+			        duckdb::Value()};
 		}
 		const auto &sub = decorated[0];
 		return {duckdb::Value(data.consumer_name),
@@ -946,7 +945,8 @@ std::vector<duckdb::Value> DropConsumer(duckdb::ClientContext &context, const Co
 		                     ",\"last_committed_schema_version\":" + std::to_string(row.last_committed_schema_version) +
 		                     "}";
 		InsertAuditRow(conn, data.catalog_name, "consumer_drop", data.consumer_name, row.consumer_id, details);
-		ExecuteChecked(conn, "DELETE FROM " + subscriptions + " WHERE consumer_id = " + std::to_string(row.consumer_id));
+		ExecuteChecked(conn,
+		               "DELETE FROM " + subscriptions + " WHERE consumer_id = " + std::to_string(row.consumer_id));
 		ExecuteChecked(conn, "DELETE FROM " + consumers + " WHERE consumer_name = " + QuoteLiteral(data.consumer_name));
 		return {duckdb::Value(data.consumer_name), duckdb::Value::BIGINT(row.consumer_id),
 		        duckdb::Value::BIGINT(row.last_committed_snapshot)};
@@ -1378,24 +1378,13 @@ void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, 
 	         "created_by",
 	         "updated_at",
 	         "metadata"};
-	return_types = {duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::UUID,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::INTEGER,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::VARCHAR};
+	return_types = {
+	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
 }
 
 struct ConsumerListData : public duckdb::TableFunctionData {
@@ -1518,17 +1507,10 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerSubscriptionsBind(duckdb::Clien
 	         "original_qualified_name",
 	         "current_qualified_name",
 	         "status"};
-	return_types = {duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 	return std::move(result);
 }
 
@@ -1540,16 +1522,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerSubscriptionsInit(d
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	duckdb::Connection conn(*context.db);
 	for (const auto &sub : LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name)) {
-		result->rows.push_back({duckdb::Value(sub.consumer_name),
-		                        duckdb::Value::BIGINT(sub.consumer_id),
-		                        duckdb::Value::BIGINT(sub.subscription_id),
-		                        duckdb::Value(sub.scope_kind),
-		                        sub.schema_id,
-		                        sub.table_id,
-		                        duckdb::Value(sub.event_category),
-		                        duckdb::Value(sub.change_type),
-		                        sub.original_qualified_name,
-		                        sub.current_qualified_name,
+		result->rows.push_back({duckdb::Value(sub.consumer_name), duckdb::Value::BIGINT(sub.consumer_id),
+		                        duckdb::Value::BIGINT(sub.subscription_id), duckdb::Value(sub.scope_kind),
+		                        sub.schema_id, sub.table_id, duckdb::Value(sub.event_category),
+		                        duckdb::Value(sub.change_type), sub.original_qualified_name, sub.current_qualified_name,
 		                        duckdb::Value(sub.status)});
 	}
 	return std::move(result);
@@ -1644,15 +1620,14 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 	}
 	const auto schema_name = qualified_name.substr(0, dot);
 	const auto table_name = qualified_name.substr(dot + 1);
-	auto result = conn.Query("SELECT s.schema_id, t.table_id FROM " + MetadataTable(catalog_name, "ducklake_table") +
-	                         " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-	                         " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) +
-	                         " AND t.table_name = " + QuoteLiteral(table_name) +
-	                         " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
-	                         " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) +
-	                         ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT s.schema_id, t.table_id FROM " + MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
+	               MetadataTable(catalog_name, "ducklake_schema") + " s USING (schema_id) WHERE s.schema_name = " +
+	               QuoteLiteral(schema_name) + " AND t.table_name = " + QuoteLiteral(table_name) +
+	               " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) +
+	               ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
 	    result->GetValue(1, 0).IsNull()) {
 		return false;
@@ -1671,17 +1646,15 @@ std::string CurrentSchemaName(duckdb::Connection &conn, const std::string &catal
 	return schema_name;
 }
 
-std::vector<ConsumerSubscriptionRow> LoadConsumerSubscriptions(duckdb::Connection &conn,
-                                                              const std::string &catalog_name,
-                                                              const std::string &consumer_name) {
+std::vector<ConsumerSubscriptionRow>
+LoadConsumerSubscriptions(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name) {
 	std::vector<ConsumerSubscriptionRow> out;
 	const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
 	std::ostringstream query;
 	query << "SELECT c.consumer_name, c.consumer_id, s.subscription_id, s.scope_kind, s.schema_id, s.table_id, "
 	      << "s.event_category, s.change_type, s.original_qualified_name FROM "
 	      << StateTable(conn, catalog_name, CONSUMERS_TABLE) << " c JOIN "
-	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE)
-	      << " s ON s.consumer_id = c.consumer_id";
+	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE) << " s ON s.consumer_id = c.consumer_id";
 	if (!consumer_name.empty()) {
 		query << " WHERE c.consumer_name = " << QuoteLiteral(consumer_name);
 	}
@@ -1706,7 +1679,8 @@ std::vector<ConsumerSubscriptionRow> LoadConsumerSubscriptions(duckdb::Connectio
 		if (row.scope_kind == "catalog") {
 			row.current_qualified_name = duckdb::Value();
 		} else if (row.scope_kind == "schema" && !row.schema_id.IsNull()) {
-			const auto current = CurrentSchemaName(conn, catalog_name, row.schema_id.GetValue<int64_t>(), current_snapshot);
+			const auto current =
+			    CurrentSchemaName(conn, catalog_name, row.schema_id.GetValue<int64_t>(), current_snapshot);
 			if (current.empty()) {
 				row.status = "dropped";
 				row.current_qualified_name = duckdb::Value();
