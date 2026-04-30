@@ -18,8 +18,9 @@ What exists today:
 
 - The SQL extension surface: `cdc_window`, `cdc_commit`, `cdc_wait`,
   `cdc_ddl`, `cdc_changes`, `cdc_events`, `cdc_recent_changes`,
-  `cdc_recent_ddl`, `cdc_schema_diff`, `cdc_consumer_*`,
-  `cdc_consumer_stats`, and `cdc_audit_recent`.
+  `cdc_recent_ddl`, `cdc_range_events`, `cdc_range_ddl`,
+  `cdc_range_changes`, `cdc_schema_diff`, `cdc_doctor`,
+  `cdc_consumer_*`, `cdc_consumer_stats`, and `cdc_audit_recent`.
 - Owner-token leasing for single-reader-per-consumer enforcement.
 - Community extension publishing, proven through the `v0.2.0` line.
 - CI smoke coverage for DuckDB, SQLite, and PostgreSQL DuckLake catalogs.
@@ -37,20 +38,20 @@ What is still intentionally thin:
 
 ## Direction
 
-### Just Finished: Verify the Extension Surface
+### Just Finished: TDD the Verified Surface
 
-The SQL surface has been checked against the main use cases that motivate the
-project: ad-hoc SQL inspection, managed subscribers, streaming pipeline
-consumers, catalog/schema replication, replay/backfill, and operational
-diagnostics.
+The SQL surface has been checked and locked in with tests against the main use
+cases that motivate the project: ad-hoc SQL inspection, managed subscribers,
+streaming pipeline consumers, catalog/schema replication, replay/backfill, and
+operational diagnostics.
 
 Decisions from this pass:
 
 - Keep `cdc_changes`, `cdc_ddl`, and `cdc_events` focused on the current
   leased consumer window.
-- Add explicit stateless range helpers for bounded replay/export/debug work:
+- Added explicit stateless range helpers for bounded replay/export/debug work:
   `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes`.
-- Add `cdc_doctor` as the common health-check surface for SQL users, support
+- Added `cdc_doctor` as the common health-check surface for SQL users, support
   requests, and the future Python client.
 - Treat operational replay as a named-consumer workflow: use a separate
   backfill consumer when live processing must continue independently.
@@ -60,26 +61,10 @@ Decisions from this pass:
   at-least-once replay mechanics; clients and sinks own idempotency, retries,
   validation, quarantine policy, and external side-effect semantics.
 
-### Now: TDD the Verified Surface
+### Now: Python Client
 
-The next chapter is implementing the small SQL additions and removals that fell
-out of the surface pass.
-
-Likely work:
-
-- Remove the no-op sink-failure table/schema path and any docs that imply
-  extension-owned failure semantics.
-- Add tests for `cdc_doctor` diagnostics before implementing the table
-  function.
-- Add tests for stateless range helpers, including gap handling and
-  `to_snapshot := NULL` as current-head sugar.
-- Keep the existing consumer-window semantics crisp: range reads must not
-  acquire leases, apply subscription filters, or move cursors.
-
-### Next: Python Client
-
-The first client should be Python, because it is the shortest path from the SQL
-extension to people actually trying the project in scripts, notebooks, and
+The next chapter is the first client, because it is the shortest path from the
+SQL extension to people actually trying the project in scripts, notebooks, and
 small services.
 
 Likely work:
@@ -92,6 +77,19 @@ Likely work:
 - Client-side handling for dedicated wait connections and heartbeats.
 - Client-owned retry/idempotency/failure handling. Do not push sink-specific
   quarantine semantics back into the extension.
+
+### Next: Client Examples and Feedback
+
+Once the Python client can drive the core consumer loop, use examples and real
+feedback to decide what deserves to become product surface.
+
+Likely work:
+
+- End-to-end examples for DDL-only watching, catalog replication, and table
+  change processing.
+- A small operational recipe around `cdc_doctor`, stale leases, lag, and replay.
+- Tighten docs around client-owned idempotency, retry, and dead-letter handling
+  without adding extension-owned sink semantics.
 
 ### Later: Only If Demand Appears
 
