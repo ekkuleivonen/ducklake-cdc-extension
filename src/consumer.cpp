@@ -500,8 +500,11 @@ std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &
 			} else if (!raw.table_id.IsNull()) {
 				tid = raw.table_id.GetValue<int64_t>();
 				if (!ResolveTableByIdAt(conn, catalog_name, tid, snapshot_id, sid, current_name)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: table identity %lld is not live",
-					                                    static_cast<long long>(tid));
+					const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+					if (!ResolveTableByIdAt(conn, catalog_name, tid, current_snapshot, sid, current_name)) {
+						throw duckdb::InvalidInputException("cdc_consumer_create: table identity %lld is not live",
+						                                    static_cast<long long>(tid));
+					}
 				}
 			} else {
 				throw duckdb::InvalidInputException("cdc_consumer_create: table subscription requires identity");

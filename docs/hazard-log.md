@@ -73,7 +73,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled for the main gap path.
 - Handling: `cdc_window` raises `CDC_GAP`, `cdc_consumer_reset` supports
   recovery, and `test/smoke/toctou_expire_smoke.py` covers the compaction gap
-  path.
+  path. Planned stateless range helpers must apply the same explicit gap
+  handling when `from_snapshot` is older than the oldest available snapshot.
 - Next action: Keep operator docs clear that retention must exceed expected
   consumer lag.
 
@@ -253,3 +254,25 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Add an explicit maintenance surface, such as audit pruning by
   age and observability for CDC metadata table row counts, before treating
   long-lived catalogs as production-ready.
+
+### H-019: Stateless Range Semantics
+
+- Risk: `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes` may appear
+  equivalent to consumer-window reads, but they intentionally do not acquire
+  leases, apply subscription filters, move cursors, or enforce consumer schema
+  boundary policy.
+- Status: not handled.
+- Handling: The API docs distinguish durable replay from stateless range reads.
+- Next action: Add TDD coverage for range gap handling, `to_snapshot := NULL`,
+  DDL/DML ordering, and proof that range reads do not mutate consumer state.
+
+### H-020: Diagnostic False Confidence
+
+- Risk: `cdc_doctor` can make operators trust an incomplete health report,
+  especially if new hazards are added without updating doctor checks.
+- Status: not handled.
+- Handling: `cdc_doctor` is planned as an advisory table function, not a proof
+  of correctness.
+- Next action: Keep doctor checks tied to concrete hazards: gap risk, stale
+  leases, dropped or renamed subscriptions, metadata presence, catalog
+  compatibility, suspicious lag, and recent reset or force-release audit events.

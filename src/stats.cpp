@@ -12,6 +12,7 @@
 
 #include "stats.hpp"
 
+#include "compat_check.hpp"
 #include "consumer.hpp"
 #include "ducklake_metadata.hpp"
 
@@ -260,6 +261,195 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditRecentInit(duckdb::
 	return std::move(result);
 }
 
+//===--------------------------------------------------------------------===//
+// cdc_doctor
+//===--------------------------------------------------------------------===//
+
+struct CdcDoctorData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	std::string consumer_name;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CdcDoctorData>();
+		result->catalog_name = catalog_name;
+		result->consumer_name = consumer_name;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+void AddDoctorRow(RowScanState &state, const std::string &severity, const std::string &code,
+                  const duckdb::Value &consumer_name, const std::string &message, const duckdb::Value &details) {
+	state.rows.push_back(
+	    {duckdb::Value(severity), duckdb::Value(code), consumer_name, duckdb::Value(message), details});
+}
+
+bool MetadataSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto result = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
+	                         QuoteLiteral("__ducklake_metadata_" + catalog_name));
+	return result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	       result->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+bool LeaseIsAlive(duckdb::Connection &conn, const duckdb::Value &heartbeat, int64_t lease_interval_seconds) {
+	if (heartbeat.IsNull()) {
+		return false;
+	}
+	auto alive = conn.Query(std::string("SELECT epoch(now()) - epoch(") + QuoteLiteral(heartbeat.ToString()) +
+	                        "::TIMESTAMP WITH TIME ZONE) < " + std::to_string(lease_interval_seconds));
+	return alive && !alive->HasError() && alive->RowCount() > 0 && !alive->GetValue(0, 0).IsNull() &&
+	       alive->GetValue(0, 0).GetValue<bool>();
+}
+
+bool HasPendingSchemaBoundary(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &consumer,
+                              int64_t current_snapshot) {
+	if (!consumer.stop_at_schema_change) {
+		return false;
+	}
+	const auto first_snapshot =
+	    FirstSnapshotAfter(conn, catalog_name, consumer.last_committed_snapshot, current_snapshot);
+	if (first_snapshot == -1) {
+		return false;
+	}
+	if (SnapshotIsExternalSchemaChange(conn, catalog_name, first_snapshot)) {
+		return true;
+	}
+	int64_t base_schema_version = -1;
+	try {
+		base_schema_version = ResolveSchemaVersion(conn, catalog_name, consumer.last_committed_snapshot);
+	} catch (...) {
+		return false;
+	}
+	return NextExternalSchemaChangeSnapshot(conn, catalog_name, first_snapshot, current_snapshot,
+	                                        base_schema_version) != -1;
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcDoctorBind(duckdb::ClientContext &context,
+                                                       duckdb::TableFunctionBindInput &input,
+                                                       duckdb::vector<duckdb::LogicalType> &return_types,
+                                                       duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 1) {
+		throw duckdb::BinderException("cdc_doctor requires catalog");
+	}
+	auto result = duckdb::make_uniq<CdcDoctorData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	auto entry = input.named_parameters.find("consumer");
+	if (entry != input.named_parameters.end() && !entry->second.IsNull()) {
+		result->consumer_name = entry->second.GetValue<std::string>();
+	}
+	names = {"severity", "code", "consumer_name", "message", "details"};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDoctorInit(duckdb::ClientContext &context,
+                                                                   duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<CdcDoctorData>();
+	duckdb::Connection conn(*context.db);
+
+	if (!MetadataSchemaExists(conn, data.catalog_name)) {
+		AddDoctorRow(*result, "error", "CDC_INCOMPATIBLE_CATALOG", duckdb::Value(),
+		             "Catalog is not a compatible DuckLake catalog", duckdb::Value());
+		return std::move(result);
+	}
+	try {
+		CheckCatalogOrThrow(context, data.catalog_name);
+		BootstrapConsumerStateOrThrow(context, data.catalog_name);
+	} catch (std::exception &ex) {
+		AddDoctorRow(*result, "error", "CDC_INCOMPATIBLE_CATALOG", duckdb::Value(), ex.what(), duckdb::Value());
+		return std::move(result);
+	}
+
+	AddDoctorRow(*result, "info", "CDC_METADATA_OK", duckdb::Value(), "CDC metadata tables are present",
+	             duckdb::Value());
+
+	const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
+	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
+	                                MetadataTable(data.catalog_name, "ducklake_snapshot"));
+	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
+
+	std::vector<std::string> consumer_names;
+	const auto consumers_table = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
+	std::ostringstream consumer_query;
+	consumer_query << "SELECT consumer_name FROM " << consumers_table;
+	if (!data.consumer_name.empty()) {
+		consumer_query << " WHERE consumer_name = " << QuoteLiteral(data.consumer_name);
+	}
+	consumer_query << " ORDER BY consumer_name ASC";
+	auto consumer_rows = conn.Query(consumer_query.str());
+	if (!consumer_rows || consumer_rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        consumer_rows ? consumer_rows->GetError() : "cdc_doctor consumer scan failed");
+	}
+	for (duckdb::idx_t i = 0; i < consumer_rows->RowCount(); ++i) {
+		if (!consumer_rows->GetValue(0, i).IsNull()) {
+			consumer_names.push_back(consumer_rows->GetValue(0, i).ToString());
+		}
+	}
+
+	for (const auto &consumer_name : consumer_names) {
+		const auto consumer = LoadConsumerOrThrow(conn, data.catalog_name, consumer_name);
+		const auto consumer_value = duckdb::Value(consumer.consumer_name);
+		const auto lag = current_snapshot - consumer.last_committed_snapshot;
+		if (consumer.last_committed_snapshot < oldest_snapshot) {
+			AddDoctorRow(
+			    *result, "error", "CDC_GAP_RISK", consumer_value, "Consumer is behind the oldest available snapshot",
+			    duckdb::Value("{\"last_committed_snapshot\":" + std::to_string(consumer.last_committed_snapshot) +
+			                  ",\"oldest_available_snapshot\":" + std::to_string(oldest_snapshot) + "}"));
+		} else if (lag > 0) {
+			AddDoctorRow(*result, "warning", "CDC_CONSUMER_LAG", consumer_value, "Consumer is behind current head",
+			             duckdb::Value("{\"lag_snapshots\":" + std::to_string(lag) + "}"));
+		}
+
+		if (!consumer.owner_token.IsNull()) {
+			if (LeaseIsAlive(conn, consumer.owner_heartbeat_at, consumer.lease_interval_seconds)) {
+				AddDoctorRow(*result, "info", "CDC_LEASE_LIVE", consumer_value, "Consumer lease is live",
+				             duckdb::Value());
+			} else {
+				AddDoctorRow(*result, "warning", "CDC_LEASE_STALE", consumer_value, "Consumer lease is stale",
+				             duckdb::Value());
+			}
+		}
+
+		for (const auto &subscription : LoadConsumerSubscriptions(conn, data.catalog_name, consumer.consumer_name)) {
+			if (subscription.status == "renamed") {
+				AddDoctorRow(
+				    *result, "warning", "CDC_SUBSCRIPTION_RENAMED", consumer_value, "A subscription target was renamed",
+				    duckdb::Value("{\"subscription_id\":" + std::to_string(subscription.subscription_id) + "}"));
+			} else if (subscription.status == "dropped") {
+				AddDoctorRow(
+				    *result, "error", "CDC_SUBSCRIPTION_DROPPED", consumer_value, "A subscription target was dropped",
+				    duckdb::Value("{\"subscription_id\":" + std::to_string(subscription.subscription_id) + "}"));
+			}
+		}
+
+		if (HasPendingSchemaBoundary(conn, data.catalog_name, consumer, current_snapshot)) {
+			AddDoctorRow(*result, "warning", "CDC_SCHEMA_BOUNDARY", consumer_value,
+			             "Consumer has a pending schema boundary", duckdb::Value());
+		}
+	}
+
+	auto audit_query = std::string("SELECT count(*) FROM ") + StateTable(conn, data.catalog_name, AUDIT_TABLE) +
+	                   " WHERE action = 'consumer_force_release' "
+	                   "AND epoch(ts::TIMESTAMP WITH TIME ZONE) >= epoch(now()) - 86400";
+	if (!data.consumer_name.empty()) {
+		audit_query += " AND consumer_name = " + QuoteLiteral(data.consumer_name);
+	}
+	auto audit = conn.Query(audit_query);
+	if (audit && !audit->HasError() && audit->RowCount() > 0 && !audit->GetValue(0, 0).IsNull() &&
+	    audit->GetValue(0, 0).GetValue<int64_t>() > 0) {
+		AddDoctorRow(*result, "warning", "CDC_RECENT_FORCE_RELEASE", duckdb::Value(),
+		             "A consumer was force-released recently", duckdb::Value());
+	}
+
+	return std::move(result);
+}
+
 } // namespace
 
 void RegisterStatsFunctions(duckdb::ExtensionLoader &loader) {
@@ -276,6 +466,13 @@ void RegisterStatsFunctions(duckdb::ExtensionLoader &loader) {
 		audit_function.named_parameters["since_seconds"] = duckdb::LogicalType::BIGINT;
 		audit_function.named_parameters["consumer"] = duckdb::LogicalType::VARCHAR;
 		loader.RegisterFunction(audit_function);
+	}
+
+	for (const auto &name : {"cdc_doctor", "ducklake_cdc_doctor"}) {
+		duckdb::TableFunction doctor_function(name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
+		                                      RowScanExecute, CdcDoctorBind, CdcDoctorInit);
+		doctor_function.named_parameters["consumer"] = duckdb::LogicalType::VARCHAR;
+		loader.RegisterFunction(doctor_function);
 	}
 }
 
