@@ -3,6 +3,8 @@ This directory contains the test surfaces for `ducklake_cdc`.
 
 - `sql/` holds extension behavior tests written as [SQLLogicTests](https://duckdb.org/dev/sqllogictest/intro.html).
 - `smoke/` holds extension smoke probes that need Python/C++ harnesses.
+- `catalog_matrix/` holds Phase 2 backend smoke tests for DuckDB, SQLite, and
+  Postgres DuckLake catalogs.
 - `upstream/` holds DuckDB/DuckLake contract probes that do not load this extension.
 - `client_py/` and `client_go/` are reserved for future client bindings.
 
@@ -34,6 +36,15 @@ uv run python test/smoke/compat_warning_smoke.py
 uv run python test/smoke/lease_multiconn_smoke.py
 uv run python test/smoke/cdc_wait_interrupt_smoke.py
 uv run python test/smoke/toctou_expire_smoke.py
+```
+
+Run the Phase 2 catalog-matrix smoke harness after `make debug`:
+
+```bash
+uv run python test/catalog_matrix/catalog_matrix_smoke.py
+docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
+uv run python test/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
+docker compose -f test/catalog_matrix/docker-compose.yml down -v
 ```
 
 Run upstream DuckLake contract checks:

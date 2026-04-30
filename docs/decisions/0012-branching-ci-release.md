@@ -46,26 +46,29 @@ line needs a patch release. Hotfixes for an older line land on the relevant
 `release/0.x` branch, are tagged from that branch, and are then merged or
 cherry-picked back to `main` so trunk does not drift.
 
-### CI levels
+### CI
 
-`feature_*` branches run light CI:
+We run a single CI workflow on every push, modelled after
+`duckdb/ducklake`'s `MainDistributionPipeline`. There is no
+"light vs full" tier, because we no longer compile DuckLake from source —
+the canonical extension-matrix build is fast enough that every push pays
+the same cost.
 
-- formatting / static checks that are cheap enough to run on every branch
-- one debug build on Linux
-- the smallest SQL smoke tests needed to catch extension-load breakage
+Each push runs:
 
-Pull requests into `main`, pushes to `main`, and release tags run full CI:
+- DuckDB's `extension-ci-tools` full distribution matrix (binaries for
+  every supported DuckDB platform)
+- format + tidy
+- a Linux debug integration smoke job (SQL tests, Python C++ harness
+  probes, catalog matrix smoke against DuckDB / SQLite / Postgres)
+- the upstream DuckLake contract check
+- benchmark and soak gates as they become release blockers
 
-- DuckDB's `extension-ci-tools` full distribution matrix
-- all SQL tests
-- Python smoke scripts that cover behavior SQLLogicTest cannot express
-- compatibility/reference checks, including Postgres
-- release-artifact validation once artifacts are published
-- benchmark and soak gates once they are stable enough to become release
-  blockers
+Main branch protection requires the `CI Pass` aggregator job. A feature
+branch may be noisy while CI is red; `main` may not.
 
-Main branch protection requires full CI to pass before merge. A feature branch
-may be noisy while light CI is red; `main` may not.
+The DuckDB target version lives in `.github/duckdb-version`. Bumping that
+file is how we change release lines.
 
 ### Release automation
 

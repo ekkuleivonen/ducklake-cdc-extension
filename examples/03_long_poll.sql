@@ -20,8 +20,10 @@ SELECT * FROM cdc_consumer_create('lake', 'poller', start_at = '1');
 --     (DATA_PATH 'examples/03_long_poll_data');
 --   INSERT INTO lake.orders VALUES (1, 'new');
 --
--- This call returns the new snapshot id, or NULL if it times out.
-SELECT cdc_wait('lake', 'poller', timeout_ms = 30000) AS snapshot_id;
+-- cdc_wait is a table function returning one BIGINT row (the new snapshot
+-- id, or NULL on timeout). DuckDB table functions must be read from a FROM
+-- clause; SELECT cdc_wait(...) without FROM raises a binder error.
+SELECT * FROM cdc_wait('lake', 'poller', timeout_ms := 30000);
 
 SELECT * FROM cdc_window('lake', 'poller');
 SELECT snapshot_id, rowid, change_type, id, status

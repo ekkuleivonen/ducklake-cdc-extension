@@ -369,7 +369,9 @@ ADR(s): 0007, 0009.
 ### `cdc_wait`
 
 ```sql
-SELECT cdc_wait(
+-- Table function returning one BIGINT row. Always read it from a FROM
+-- clause; SELECT cdc_wait(...) without FROM raises a binder error.
+SELECT * FROM cdc_wait(
     catalog     VARCHAR,
     consumer    VARCHAR,
     timeout_ms  := 30000   -- BIGINT, hard-capped at 5 min per ADR 0011
@@ -1265,7 +1267,7 @@ All 3 backends (duckdb, postgres, sqlite) emit the same MAP key set for every op
   accordingly.
 - **Backend coverage is explicit.** DuckLake supports three catalog
   backends — DuckDB, SQLite, Postgres — and the upstream probe can run
-  against all three. Full CI runs the DuckDB + SQLite check; run the
+  against all three. CI runs the DuckDB + SQLite check; run the
   Postgres leg before changing the committed reference.
 
 ## Special-type serialization conventions

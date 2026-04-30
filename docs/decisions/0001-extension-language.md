@@ -90,8 +90,22 @@ The memory-safety advantages of Rust are real but mitigable:
   CRUD is mostly straight-line code that does not own memory across
   `RETURNING` / table-function boundaries).
 - `valgrind` / ASan / UBSan in CI catch the C++-class bugs that
-  matter (Phase 1 work item: every CI build runs at least one
-  pass under sanitiser).
+  matter. **Sanitiser placement landed as a release-time gate**, not
+  on every push, for a constraint that surfaced during Phase 1
+  implementation: ADR 0013 collapsed CI to one fast push lane that
+  loads the official prebuilt `ducklake.duckdb_extension` at runtime
+  (no compile-from-source for matrix-cost reasons), and ASan refuses
+  to LOAD a shared library whose runtime metadata it doesn't
+  recognise (the prebuilt is a release binary). The release workflow
+  therefore runs `make debug` (sanitisers on by default via DuckDB's
+  CMake) and exercises `SQL_TEST_SMOKE_NO_DUCKLAKE` — exactly the
+  test/sql files that don't `INSTALL ducklake`. Catches compile-time
+  UB, init-time UB in the extension's `Load()` path, global-construction
+  bugs, and the `cdc_version()` hot path. Deeper sanitiser coverage of
+  the DuckLake-loaded surface is gated on either upstream DuckLake
+  building under sanitisers or compiling DuckLake from source in our
+  build (which we explicitly don't do); tracked in
+  `docs/upstream-asks.md`.
 - The DuckDB project's own C++ codebase has matured to the point
   where the cross-extension boundary surface is well-understood;
   the failure modes that were terrifying in DuckDB v0.5 are
@@ -140,9 +154,14 @@ here so neither phase is closed on a misreading of the criterion.
   third-party deps in v0.1).
 - `Makefile` (extension-template convenience wrapper for
   `make debug` / `make release` / `make test`).
-- `.github/workflows/full-ci.yml` — the C++ build matrix (Linux x86,
-  macOS arm64, Windows x86; Clang canonical, GCC + MSVC supported);
-  ASan, UBSan, and TSan jobs per the sanitiser commitments above.
+- `.github/workflows/ci.yml` — day-to-day CI: format/tidy + a single
+  Linux release build with SQL tests + Python smoke probes + the
+  upstream DuckLake contract check. Sanitiser pass and the full
+  cross-platform build matrix are intentionally not here; they live
+  in `.github/workflows/release.yml` as release-time gates per ADR 0013
+  (and per the sanitiser-placement note above). The original
+  `full-ci.yml` / `light-ci.yml` split is gone — ADR 0013 records the
+  consolidation rationale.
 
 **Why deferring the C++ scaffold is the right call.**
 `duckdb/extension-template` evolves; the Phase 0 → Phase 1 gap is
@@ -191,7 +210,9 @@ language and toolchain decisions above are unaffected.
 
 - **Phase impact.**
   - **Phase 1** scaffolds against `duckdb/extension-template`,
-    implements the primitives in C++17, runs ASan/UBSan in CI, and
+    implements the primitives in C++17, gates releases on an ASan/UBSan
+    smoke pass (`release.yml`'s `sanitiser-smoke` job, scoped to the
+    no-DuckLake test set per the constraint discussed above), and
     ships the first artifact via GitHub releases (no
     community-extensions submission until `cdc_window`, `cdc_commit`,
     and lease are merged and tested).

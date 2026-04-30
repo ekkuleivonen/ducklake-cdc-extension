@@ -23,6 +23,7 @@ The five primitives, sugar wrappers, owner-token lease + single-reader enforceme
 - [ ] First public Python release on PyPI (`0.1.0b1`).
 - [ ] First public Go release tagged (`clients/go/v0.1.0-beta.1`).
 - [ ] Standalone Go binary published as a GitHub release artifact for the operator persona. Homebrew formula is post-launch (next section).
+- [ ] **Visible-cadence release-tag discipline (demoted from Phase 1).** At least four release tags between the `v0.0.x` series and `v0.1.0-beta.1`, with honest "what works / what doesn't" notes for each. Phase 1 proved the release pipeline; Phase 5 is where the cadence discipline actually matters because (a) there is now real feature flow to tag against (catalog matrix in Phase 2, language clients in Phase 3 / 4), and (b) the project's first public users are reading release frequency as a liveness signal. The job is to demonstrate the discipline once, not to manufacture it before there is something to tag.
 
 ### Documentation that ships with beta
 

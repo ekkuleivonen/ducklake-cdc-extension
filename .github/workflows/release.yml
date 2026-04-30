@@ -8,23 +8,29 @@
 #   1. Validates the trigger ref and version format against the policy
 #      in docs/decisions/0012-branching-ci-release.md and
 #      docs/decisions/0013-versioning-and-release-automation.md.
-#   2. Verifies that Full CI is green on the trigger SHA — `main` cannot
-#      be released from a SHA that has not passed the full gate.
-#   3. Creates an annotated git tag (vMAJOR.MINOR.PATCH).
-#   4. Creates the maintenance branch `release/MAJOR.MINOR` from the tag
+#   2. Verifies that day-to-day CI is green on the trigger SHA.
+#   3. Runs the full DuckDB extension distribution matrix (every OS / arch
+#      / Wasm triplet) — this is the release-time gate that proves all
+#      shipped platforms build cleanly. Day-to-day CI does not pay for
+#      this; releases do.
+#   4. Creates an annotated git tag (vMAJOR.MINOR.PATCH).
+#   5. Creates the maintenance branch `release/MAJOR.MINOR` from the tag
 #      if releasing the first patch of a new line.
-#   5. Creates a GitHub Release with auto-generated notes (driven by
+#   6. Creates a GitHub Release with auto-generated notes (driven by
 #      `.github/release.yml` label categories).
-#   6. Opens a PR against `duckdb/community-extensions` that updates this
+#   7. Opens a PR against `duckdb/community-extensions` that updates this
 #      extension's descriptor to point at the new tag SHA.
 #
 # Set `dry_run: true` (the default) the first time you run it on a new
-# version. Nothing is pushed, nothing is published; the workflow just
-# prints what it *would* do.
+# version. Nothing is pushed, nothing is published; the workflow still
+# runs the full matrix so you know all platforms build before you commit
+# to a real release.
 #
 # Set `community_pr_only: true` with `dry_run: false` to retry the
 # community-extensions PR step for an already-created release tag. This
-# does not create or push tags, maintenance branches, or GitHub Releases.
+# skips the matrix gate (the release was already validated when it was
+# cut) and does not create or push tags, maintenance branches, or
+# GitHub Releases.
 #
 # Required secrets:
 #   - `COMMUNITY_BOT_TOKEN` — a GitHub PAT that can push to the token
@@ -67,8 +73,107 @@ env:
   EXTENSION_NAME: ducklake_cdc
 
 jobs:
+  resolve-duckdb-version:
+    name: Resolve DuckDB version
+    runs-on: ubuntu-latest
+    outputs:
+      duckdb_version: ${{ steps.read.outputs.duckdb_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - id: read
+        run: echo "duckdb_version=$(cat .github/duckdb-version)" >> "$GITHUB_OUTPUT"
+
+  full-matrix-build:
+    name: Full extension matrix (release gate)
+    needs: resolve-duckdb-version
+    # Skip the matrix when retrying just the community-extensions PR for
+    # an already-cut release. The matrix already ran when the tag was
+    # created; re-running here would burn ~30 minutes of Actions time
+    # for no new signal.
+    if: ${{ !inputs.community_pr_only }}
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1
+    with:
+      duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
+      ci_tools_version: v1.5.1
+      extension_name: ducklake_cdc
+
+  sanitiser-smoke:
+    # Per ADR 0001's sanitiser commitment (revised in the same ADR):
+    # "every release build runs at least one pass under sanitiser." Day-to-day
+    # CI cannot run this — `make debug` enables ASan + UBSan by default
+    # (DuckDB CMake adds -fsanitize=address,undefined when CMAKE_BUILD_TYPE=Debug),
+    # but the official prebuilt `ducklake.duckdb_extension` is a release
+    # binary with no sanitiser runtime, and ASan refuses to LOAD a shared
+    # library whose runtime metadata it doesn't recognise. We therefore
+    # gate the sanitiser pass on release time and run only the no-DuckLake
+    # smoke set (`SQL_TEST_SMOKE_NO_DUCKLAKE` in the Makefile) — exactly
+    # the test/sql files that don't `INSTALL ducklake`. Catches compile-time
+    # UB, init-time UB in the extension's `Load()` path, global-construction
+    # bugs, and the `cdc_version()` hot path. Deeper coverage is gated on
+    # upstream DuckLake building under sanitisers, tracked in
+    # docs/upstream-asks.md.
+    name: Sanitiser smoke (ASan + UBSan, no-DuckLake set)
+    needs: resolve-duckdb-version
+    if: ${{ !inputs.community_pr_only }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-${{ github.ref }}
+          restore-keys: |
+            ci-ccache-sanitiser-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'vcpkg.json', '.github/duckdb-version') }}-
+            ci-ccache-sanitiser-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.5
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build (debug, sanitisers on by default)
+        run: |
+          export CCACHE_DIR=~/.ccache
+          ccache -M 2G
+          make debug
+          ccache -s
+
+      - name: Run no-DuckLake SQL smoke under sanitiser
+        env:
+          # Surface ASan / UBSan diagnostics as test failures rather than
+          # silent process aborts. `print_stacktrace=1` makes the report
+          # actually useful when a regression lands.
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: make test_debug_smoke_no_ducklake
+
   release:
     name: Tag, release, maintenance branch
+    needs:
+      - full-matrix-build
+      - sanitiser-smoke
+    # Run when either:
+    #   * both the matrix and sanitiser gates succeeded (normal release / dry run), OR
+    #   * we're in community_pr_only mode and both gates were intentionally
+    #     skipped (their result is "skipped", not "success").
+    if: ${{ always() && ((needs.full-matrix-build.result == 'success' && needs.sanitiser-smoke.result == 'success') || (inputs.community_pr_only && needs.full-matrix-build.result == 'skipped' && needs.sanitiser-smoke.result == 'skipped')) }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ inputs.version }}
@@ -174,22 +279,24 @@ jobs:
           git fetch origin "refs/tags/$VERSION:refs/tags/$VERSION"
           echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Full CI is green at the release SHA
+      - name: Verify day-to-day CI is green at the release SHA
         if: ${{ !inputs.community_pr_only }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
         run: |
-          # Branch protection on `main` already requires Full CI to pass
-          # before merge, so the latest SHA on `main` should always be
-          # green. We re-verify here as belt-and-braces, and so that
-          # release-from-release/X.Y also requires a green Full CI run on
-          # that branch.
+          # Branch protection on `main` already requires `CI Pass` to be
+          # green before merge, so the latest SHA on `main` should always
+          # have it. We re-verify here as belt-and-braces, and so that
+          # release-from-release/X.Y also requires a green day-to-day CI
+          # run on that branch. The full extension matrix is a separate
+          # release-time gate (the `full-matrix-build` job in this
+          # workflow) since it only matters when we ship.
           status=$(gh api "repos/${{ github.repository }}/commits/$SHA/check-runs" \
             --jq '[.check_runs[] | select(.name == "CI Pass")] | .[0].conclusion // "missing"')
           echo "ci-pass status at $SHA: $status"
           if [[ "$status" != "success" ]]; then
-            echo "::error::Full CI 'CI Pass' check has not succeeded at $SHA. Refusing to release."
+            echo "::error::CI 'CI Pass' check has not succeeded at $SHA. Refusing to release."
             exit 1
           fi
 

@@ -34,9 +34,9 @@ in-process consumer.
 
 The Phase 1 smoke harness lives in `bench/runner.py`, with the first
 workload descriptor in `bench/light.yaml`. The manual benchmark workflow
-downloads the `linux_amd64` extension artifact from a successful Full CI
-run, executes that descriptor against the supported official DuckDB
-release, and uploads the result JSON as an artifact. Selected baselines
+downloads the `linux_amd64` extension artifact from a successful CI run
+(or builds locally), executes that descriptor against the supported
+official DuckDB release, and uploads the result JSON as an artifact. Selected baselines
 can be committed under `bench/results/` once there is enough history to
 make a trajectory meaningful.
 

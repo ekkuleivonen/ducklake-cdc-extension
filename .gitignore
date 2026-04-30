@@ -1,5 +1,4 @@
 build
-_OLD_REF_TO_MIGRATE/
 .cache/
 .idea
 cmake-build-debug

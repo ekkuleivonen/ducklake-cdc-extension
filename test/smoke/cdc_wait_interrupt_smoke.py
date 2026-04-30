@@ -21,27 +21,60 @@ Usage:
 
     uv run python test/smoke/cdc_wait_interrupt_smoke.py
 
-Run `make debug` first.
+Defaults to the release build because the harness loads the official prebuilt
+DuckLake extension binary (no ASAN runtime), which conflicts with our debug
+build's ASAN. Build it via `make release` first, or override with
+`DUCKLAKE_CDC_BUILD=debug` if you have built debug without sanitizers
+(`DISABLE_SANITIZER=1 make debug`).
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[2]
+BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
 DUCKDB_INCLUDE = REPO / "duckdb" / "src" / "include"
-LIBDUCKDB_DIR = REPO / "build" / "debug" / "src"
+LIBDUCKDB_DIR = REPO / "build" / BUILD / "src"
 LIBDUCKDB = LIBDUCKDB_DIR / ("libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so")
-DUCKLAKE_EXTENSION = REPO / "build" / "debug" / "extension" / "ducklake" / "ducklake.duckdb_extension"
-CDC_EXTENSION = REPO / "build" / "debug" / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
+CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
 
 
-HARNESS = r'''
+def _platform_dir() -> str:
+    """Match `~/.duckdb/extensions/<version>/<platform>/` layout used by
+    `make prepare_tests`. Keep in sync with the same shell expression in the
+    Makefile."""
+    os_name = "osx" if sys.platform == "darwin" else "linux"
+    machine = os.uname().machine
+    arch = "amd64" if machine == "x86_64" else ("arm64" if machine == "aarch64" else machine)
+    return f"{os_name}_{arch}"
+
+
+def _duckdb_version() -> str:
+    return (REPO / ".github" / "duckdb-version").read_text().strip()
+
+
+# Use the prebuilt DuckLake binary that `make prepare_tests` drops in the
+# extension cache for our pinned DuckDB target. We can't `INSTALL ducklake`
+# from inside this harness because the standalone `libduckdb.so` we link
+# against has no proper version stamp (no `OVERRIDE_GIT_DESCRIBE`), so its
+# autoinstall URL collapses to `extensions.duckdb.org/v0.0.1/...` and 404s.
+DUCKLAKE_EXTENSION = (
+    Path(os.environ.get("HOME", "~")).expanduser()
+    / ".duckdb"
+    / "extensions"
+    / _duckdb_version()
+    / _platform_dir()
+    / "ducklake.duckdb_extension"
+)
+
+
+HARNESS = r"""
 #include "duckdb.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 
@@ -60,7 +93,12 @@ using namespace duckdb;
 // 1.6s sleep" run while still failing fast on a real regression.
 static constexpr int64_t WAIT_DEADLINE_MS = 3000;
 
-unique_ptr<QueryResult> RequireOk(Connection &conn, const std::string &sql) {
+// Return the concrete `MaterializedQueryResult` rather than the polymorphic
+// `QueryResult` base. `Connection::Query` already returns a
+// `unique_ptr<MaterializedQueryResult>`; macOS clang implicit-converts that
+// to a `unique_ptr<QueryResult>` on return, but Linux GCC refuses, and
+// hand-rolling `std::move` plus `unique_ptr_cast` here just adds noise.
+unique_ptr<MaterializedQueryResult> RequireOk(Connection &conn, const std::string &sql) {
 	auto result = conn.Query(sql);
 	if (!result || result->HasError()) {
 		throw std::runtime_error(sql + "\n" + (result ? result->GetError() : "no result"));
@@ -161,15 +199,24 @@ int main(int argc, char **argv) {
 	std::cout << "cdc_wait_interrupt_smoke PASSED (interrupt -> return in " << elapsed_ms << "ms)\n";
 	return 0;
 }
-'''
+"""
 
 
 def main() -> int:
     if not LIBDUCKDB.exists():
-        print(f"missing {LIBDUCKDB}; run `make debug` first", file=sys.stderr)
+        print(f"missing {LIBDUCKDB}; run `make {BUILD}` first", file=sys.stderr)
         return 1
-    if not DUCKLAKE_EXTENSION.exists() or not CDC_EXTENSION.exists():
-        print("missing debug extension artifacts; run `make debug` first", file=sys.stderr)
+    if not CDC_EXTENSION.exists():
+        print(
+            f"missing ducklake_cdc {BUILD} artifact; run `make {BUILD}` first",
+            file=sys.stderr,
+        )
+        return 1
+    if not DUCKLAKE_EXTENSION.exists():
+        print(
+            f"missing {DUCKLAKE_EXTENSION}; run `make prepare_tests` first",
+            file=sys.stderr,
+        )
         return 1
 
     with tempfile.TemporaryDirectory(prefix="ducklake_cdc_iw_") as tmp:
@@ -198,7 +245,13 @@ def main() -> int:
         ]
         subprocess.run(compile_cmd, cwd=REPO, check=True)
         completed = subprocess.run(
-            [str(binary), str(DUCKLAKE_EXTENSION), str(CDC_EXTENSION), str(lake), str(data)],
+            [
+                str(binary),
+                str(DUCKLAKE_EXTENSION),
+                str(CDC_EXTENSION),
+                str(lake),
+                str(data),
+            ],
             cwd=REPO,
             text=True,
             stdout=subprocess.PIPE,
