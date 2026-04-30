@@ -289,15 +289,13 @@ altered	{"added":[{"id":6,"name":"region","type":"varchar","nullable":false,"def
 # combination are common; getting any one of the three wrong silently is
 # the failure mode this test exists to prevent.
 #
-# Note: at the rename snapshot (3) Stage-1 emits two altered events
-# under DIFFERENT object_names — one via the Finding-1 rename path
-# (object_name = new name, carries `{old_table_name, new_table_name,
-# ...}`) and one via the `altered_table:<id>` ID-resolved path (object
-# name = old name, carries `{added, type_changed}` only). The dual
-# emission is a pre-existing extraction artefact that is not what
-# Phase 2 deferral 3 is trying to fix; we pin the assertion to the
-# Finding-1 row that carries the full cross-product payload, which is
-# the contract Phase 2 actually promises.
+# Phase 2 follow-up #1 (dedup): the rename snapshot now emits exactly
+# one `altered.table` row — Stage-1 processes `tables_created` before
+# `tables_altered` within a snapshot via the SQL ORDER BY in
+# `ExtractDdlRows`, so the Finding-1 path registers (snapshot_id,
+# table_id) and the sibling `tables_altered:<table_id>` row is dropped.
+# Phase 2 follow-up #2: `LookupTableById` is now snapshot-bound, so the
+# row carries the post-rename name `orders_v2` everywhere it's needed.
 statement ok
 BEGIN TRANSACTION;
 
@@ -313,6 +311,15 @@ ALTER TABLE lake_n.orders_v2 ADD COLUMN customer.country VARCHAR;
 statement ok
 COMMIT;
 
+# Exactly one altered row at the cross-product snapshot now (was two
+# pre-dedup). Phase 2 follow-up #1.
+query I
+SELECT count(*) FROM cdc_recent_ddl('lake_n', for_table => 'orders_v2')
+WHERE event_kind = 'altered'
+  AND snapshot_id = (SELECT max(snapshot_id) FROM lake_n.snapshots());
+----
+1
+
 query II
 SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders_v2')
 WHERE event_kind = 'altered' AND object_name = 'orders_v2'
@@ -323,17 +330,17 @@ altered	{"old_table_name":"orders","new_table_name":"orders_v2","added":[{"id":7
 # DROPPED ordering: when a struct column is dropped, its child fields
 # disappear with it. The diff JSON emits children before the parent
 # (depth descending) so a downstream consumer tearing down a typed
-# schema sees the leaves vanish before the root. The DROP event
-# resolves the table by id (not by Finding-1's qualified-name path), so
-# the post-rename object_name surfaces as the original `orders` — that
-# is the same `LookupTableById`-after-rename quirk noted on the cross-
-# product event above and is unrelated to Phase 2 deferral 3.
+# schema sees the leaves vanish before the root. Phase 2 follow-up #2:
+# this event resolves the table by id and `LookupTableById` is now
+# snapshot-bound, so `object_name` is the post-rename `orders_v2` (was
+# stuck on the original `orders` pre-fix because of an unbounded
+# `LIMIT 1` lookup).
 statement ok
 ALTER TABLE lake_n.orders_v2 DROP COLUMN customer;
 
 query II
-SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders')
-WHERE event_kind = 'altered' AND object_name = 'orders'
+SELECT event_kind, details FROM cdc_recent_ddl('lake_n', for_table => 'orders_v2')
+WHERE event_kind = 'altered' AND object_name = 'orders_v2'
 ORDER BY snapshot_id DESC LIMIT 1;
 ----
 altered	{"dropped":[{"id":3,"name":"name","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":4,"name":"tier","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":6,"name":"region","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":7,"name":"country","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":2,"name":"customer","type":"struct","nullable":true,"default":"NULL"}]}
@@ -378,12 +385,10 @@ altered	{"old_table_name":"orders","new_table_name":"orders_v2"}
 
 # A real ALTER (column list change) bumps schema_version → the shortcut
 # predicate `TableSchemaVersionBumpedAt = true` holds → diff is computed
-# and serialised. Note: the ADD COLUMN event resolves the table by id
-# (via Stage-1's `altered_table:<id>` token, not via Finding-1) and
-# `LookupTableById` returns the original name `orders` because there's
-# no snapshot bound on that lookup — the same pre-existing quirk noted
-# above the cross-product test for deferral 3. The shortcut behaviour
-# is independent of which name the row carries; we filter accordingly.
+# and serialised. Phase 2 follow-up #2: the ADD COLUMN event resolves
+# the table by id and `LookupTableById` is now snapshot-bound, so the
+# row carries the post-rename `orders_v2` (pre-fix it was stuck on the
+# original `orders`).
 statement ok
 ALTER TABLE lake_p.orders_v2 ADD COLUMN extra BIGINT;
 
@@ -395,8 +400,8 @@ WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake_p.ducklake_table
 1
 
 query II
-SELECT event_kind, details FROM cdc_recent_ddl('lake_p', for_table => 'orders')
-WHERE event_kind = 'altered' AND object_name = 'orders'
+SELECT event_kind, details FROM cdc_recent_ddl('lake_p', for_table => 'orders_v2')
+WHERE event_kind = 'altered' AND object_name = 'orders_v2'
 ORDER BY snapshot_id DESC LIMIT 1;
 ----
 altered	{"added":[{"id":3,"name":"extra","type":"int64","nullable":true,"default":"NULL"}]}
@@ -496,3 +501,113 @@ tables_created
 tables_dropped
 views_created
 views_dropped
+
+# -----------------------------------------------------------------------------
+# Phase 2 follow-ups #1 (dedup) and #2 (snapshot-bound LookupTableById):
+# fold the two pre-existing Stage-1 extraction artefacts surfaced during
+# deferral 3 into the typed surface contract.
+#
+# Pre-fix: a transaction combining `RENAME TABLE` with column-list
+# changes emitted *two* `altered.table` rows for the same (snapshot_id,
+# table_id) — one via the Finding-1 rename path with the post-rename
+# name and the rename payload, one via the `tables_altered:<id>` path
+# with the *original* name (because `LookupTableById` had no snapshot
+# bound) and the column-only details. Downstream consumers keying on
+# `(snapshot_id, object_kind, object_id)` would see the table twice.
+#
+# Post-fix: the Stage-1 dispatcher orders `tables_created` map keys
+# before `tables_altered` within a snapshot, registers Finding-1
+# promotions in a per-snapshot set, and skips the matching ID-resolved
+# row. `LookupTableById` (and the Schema/View siblings) now use the
+# same `(begin_snapshot <= snap AND (end_snapshot IS NULL OR
+# end_snapshot > snap))` predicate `LookupTableColumnsAt` already uses
+# — DROPPED events pass `snapshot_id - 1` to hit the row alive
+# immediately before the drop.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_followups.ducklake' AS lake_f (DATA_PATH '__TEST_DIR__/ddl_followups_data');
+
+statement ok
+CREATE TABLE lake_f.orders(id INTEGER, name VARCHAR, amount INTEGER);
+
+# Cross-product in one transaction: rename + add column + type change.
+# Pre-dedup this snapshot would emit two altered.table rows for the
+# same table_id; post-dedup exactly one survives (the Finding-1 row,
+# which carries the strictly larger payload).
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE lake_f.orders RENAME TO orders_v2;
+
+statement ok
+ALTER TABLE lake_f.orders_v2 ADD COLUMN region VARCHAR;
+
+statement ok
+ALTER TABLE lake_f.orders_v2 ALTER COLUMN amount SET DATA TYPE BIGINT;
+
+statement ok
+COMMIT;
+
+# Exactly one altered.table row per (snapshot_id, object_id) — that's
+# the Phase 2 follow-up #1 contract.
+query I
+SELECT count(*) FROM cdc_recent_ddl('lake_f')
+WHERE event_kind = 'altered' AND object_kind = 'table'
+  AND snapshot_id = (SELECT max(snapshot_id) FROM lake_f.snapshots());
+----
+1
+
+# The surviving row is the Finding-1 row: it carries old/new names AND
+# the column diff. (Phase 2 follow-up #1 dropped the smaller sibling.)
+query II
+SELECT object_name, details FROM cdc_recent_ddl('lake_f')
+WHERE event_kind = 'altered' AND object_kind = 'table'
+  AND snapshot_id = (SELECT max(snapshot_id) FROM lake_f.snapshots());
+----
+orders_v2	{"old_table_name":"orders","new_table_name":"orders_v2","added":[{"id":4,"name":"region","type":"varchar","nullable":true,"default":"NULL"}],"type_changed":[{"id":3,"name":"amount","old_type":"int32","new_type":"int64"}]}
+
+# Pure ALTER (no rename) at a later snapshot exercises the
+# tables_altered branch on its own. Phase 2 follow-up #2: the row's
+# object_name reflects the table's name as-of this snapshot
+# (`orders_v2`), not whatever name the storage layer happened to
+# return first.
+statement ok
+ALTER TABLE lake_f.orders_v2 ADD COLUMN status VARCHAR;
+
+query III
+SELECT event_kind, object_name, details FROM cdc_recent_ddl('lake_f')
+WHERE event_kind = 'altered' AND object_kind = 'table'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	orders_v2	{"added":[{"id":5,"name":"status","type":"varchar","nullable":true,"default":"NULL"}]}
+
+# DROP after rename: Phase 2 follow-up #2 makes `LookupTableById` pass
+# `snapshot_id - 1` so the dropped row carries the immediately-before-
+# drop name (`orders_v2`), not the original name.
+statement ok
+DROP TABLE lake_f.orders_v2;
+
+query III
+SELECT event_kind, object_kind, object_name FROM cdc_recent_ddl('lake_f')
+WHERE event_kind = 'dropped' AND object_kind = 'table'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+dropped	table	orders_v2
+
+# cdc_schema_diff exercises the same dedup on its per-snapshot loop:
+# one table_rename row at the cross-product snapshot (not two), and the
+# per-column diff rows are not duplicated. Total: 3 added (3 from
+# CREATE TABLE) + 1 added (region from cross-product) + 1 type_changed
+# (amount) + 1 added (status from later ALTER) + 1 table_rename = 5
+# added, 1 type_changed, 1 table_rename. (DROP TABLE doesn't surface
+# in cdc_schema_diff because target_ids is bounded to live rows.)
+query II
+SELECT change_kind, count(*) FROM cdc_schema_diff('lake_f', 'orders_v2', 0, 99999)
+GROUP BY change_kind
+ORDER BY change_kind;
+----
+added	5
+table_rename	1
+type_changed	1
