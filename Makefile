@@ -27,6 +27,15 @@ DUCKDB_PLATFORM ?= $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed -e 's/dar
 EXT_CACHE_DIR ?= $(HOME)/.duckdb/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}
 EXT_REPO_BASE ?= http://extensions.duckdb.org
 
+# Force libduckdb to embed the pinned DuckDB version so it doesn't fall back
+# to `git describe` on the submodule (which returns "v0.0.1" in CI when the
+# fetch-depth is shallow and no tag is local). Pinning here also keeps
+# DuckLake's LOAD-time version check happy: the prebuilt `ducklake.duckdb_extension`
+# we cache via `prepare_tests` is stamped for `$(DUCKDB_VERSION)` and DuckDB
+# refuses to load it if the host disagrees.
+OVERRIDE_GIT_DESCRIBE ?= ${DUCKDB_VERSION}
+export OVERRIDE_GIT_DESCRIBE
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 

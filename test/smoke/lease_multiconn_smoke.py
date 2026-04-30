@@ -31,13 +31,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parents[2]
 BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
 DUCKDB_INCLUDE = REPO / "duckdb" / "src" / "include"
 LIBDUCKDB_DIR = REPO / "build" / BUILD / "src"
-LIBDUCKDB = LIBDUCKDB_DIR / ("libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so")
-CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
+LIBDUCKDB = LIBDUCKDB_DIR / (
+    "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
+)
+CDC_EXTENSION = (
+    REPO
+    / "build"
+    / BUILD
+    / "extension"
+    / "ducklake_cdc"
+    / "ducklake_cdc.duckdb_extension"
+)
 
 
 def _platform_dir() -> str:
@@ -46,7 +54,11 @@ def _platform_dir() -> str:
     Makefile."""
     os_name = "osx" if sys.platform == "darwin" else "linux"
     machine = os.uname().machine
-    arch = "amd64" if machine == "x86_64" else ("arm64" if machine == "aarch64" else machine)
+    arch = (
+        "amd64"
+        if machine == "x86_64"
+        else ("arm64" if machine == "aarch64" else machine)
+    )
     return f"{os_name}_{arch}"
 
 
@@ -61,11 +73,15 @@ def _duckdb_version() -> str:
 # autoinstall URL collapses to `extensions.duckdb.org/v0.0.1/...` and 404s.
 DUCKLAKE_EXTENSION = (
     Path(os.environ.get("HOME", "~")).expanduser()
-    / ".duckdb" / "extensions" / _duckdb_version() / _platform_dir() / "ducklake.duckdb_extension"
+    / ".duckdb"
+    / "extensions"
+    / _duckdb_version()
+    / _platform_dir()
+    / "ducklake.duckdb_extension"
 )
 
 
-HARNESS = r'''
+HARNESS = r"""
 #include "duckdb.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 
@@ -157,7 +173,7 @@ int main(int argc, char **argv) {
 	std::cout << "lease_multiconn_smoke PASSED\n";
 	return 0;
 }
-'''
+"""
 
 
 def main() -> int:
@@ -165,10 +181,16 @@ def main() -> int:
         print(f"missing {LIBDUCKDB}; run `make {BUILD}` first", file=sys.stderr)
         return 1
     if not CDC_EXTENSION.exists():
-        print(f"missing ducklake_cdc {BUILD} artifact; run `make {BUILD}` first", file=sys.stderr)
+        print(
+            f"missing ducklake_cdc {BUILD} artifact; run `make {BUILD}` first",
+            file=sys.stderr,
+        )
         return 1
     if not DUCKLAKE_EXTENSION.exists():
-        print(f"missing {DUCKLAKE_EXTENSION}; run `make prepare_tests` first", file=sys.stderr)
+        print(
+            f"missing {DUCKLAKE_EXTENSION}; run `make prepare_tests` first",
+            file=sys.stderr,
+        )
         return 1
 
     with tempfile.TemporaryDirectory(prefix="ducklake_cdc_multiconn_") as tmp:
@@ -197,7 +219,13 @@ def main() -> int:
         ]
         subprocess.run(compile_cmd, cwd=REPO, check=True)
         completed = subprocess.run(
-            [str(binary), str(DUCKLAKE_EXTENSION), str(CDC_EXTENSION), str(lake), str(data)],
+            [
+                str(binary),
+                str(DUCKLAKE_EXTENSION),
+                str(CDC_EXTENSION),
+                str(lake),
+                str(data),
+            ],
             cwd=REPO,
             text=True,
             stdout=subprocess.PIPE,
