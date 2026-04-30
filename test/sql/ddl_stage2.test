@@ -337,3 +337,82 @@ WHERE event_kind = 'altered' AND object_name = 'orders'
 ORDER BY snapshot_id DESC LIMIT 1;
 ----
 altered	{"dropped":[{"id":3,"name":"name","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":4,"name":"tier","type":"varchar","nullable":true,"default":"NULL","parent_column_id":2},{"id":6,"name":"region","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":7,"name":"country","type":"varchar","nullable":false,"default":"NULL","parent_column_id":2},{"id":2,"name":"customer","type":"struct","nullable":true,"default":"NULL"}]}
+
+# -----------------------------------------------------------------------------
+# Phase 2 deferral 2: Stage-2 perf shortcut. `BuildAlteredTableDetails`
+# and `cdc_schema_diff` skip the two `LookupTableColumnsAt` calls + the
+# `DiffColumns` traversal whenever `ducklake_schema_versions` shows no
+# per-table schema bump for the snapshot — the diff would be empty by
+# construction.
+#
+# Empirically, every Stage-1-relevant `altered_table:<id>` token under
+# DuckDB 1.5.x / DuckLake 4.x is accompanied by a `ducklake_schema_versions`
+# row at that snapshot (RENAME TABLE bumps schema_version even though
+# the column list is unchanged; ADD/DROP/RENAME/TYPE do too; compaction
+# does NOT bump schema_version but is not Stage-1-relevant). So in
+# practice the shortcut is *defensively correct* rather than a measurable
+# perf win on this DuckLake version — the assertion this test enforces
+# is behavioural equivalence: every ALTER path produces the same JSON
+# payload regardless of which branch the shortcut takes.
+# -----------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_perf.ducklake' AS lake_p (DATA_PATH '__TEST_DIR__/ddl_perf_data');
+
+statement ok
+CREATE TABLE lake_p.orders(id INTEGER, name VARCHAR);
+
+# Pure RENAME: rename payload is correctly emitted; the column-diff
+# part of the JSON stays absent because the column list is unchanged
+# (DuckLake's `ducklake_column` row count for table_id 1 is the same
+# at snapshot N-1 and snapshot N).
+statement ok
+ALTER TABLE lake_p.orders RENAME TO orders_v2;
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake_p', for_table => 'orders_v2')
+WHERE event_kind = 'altered' AND object_name = 'orders_v2'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	{"old_table_name":"orders","new_table_name":"orders_v2"}
+
+# A real ALTER (column list change) bumps schema_version → the shortcut
+# predicate `TableSchemaVersionBumpedAt = true` holds → diff is computed
+# and serialised. Note: the ADD COLUMN event resolves the table by id
+# (via Stage-1's `altered_table:<id>` token, not via Finding-1) and
+# `LookupTableById` returns the original name `orders` because there's
+# no snapshot bound on that lookup — the same pre-existing quirk noted
+# above the cross-product test for deferral 3. The shortcut behaviour
+# is independent of which name the row carries; we filter accordingly.
+statement ok
+ALTER TABLE lake_p.orders_v2 ADD COLUMN extra BIGINT;
+
+query I
+SELECT count(*) FROM __ducklake_metadata_lake_p.ducklake_schema_versions
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_lake_p.ducklake_table WHERE table_name = 'orders_v2')
+  AND begin_snapshot = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake_p.ducklake_snapshot);
+----
+1
+
+query II
+SELECT event_kind, details FROM cdc_recent_ddl('lake_p', for_table => 'orders')
+WHERE event_kind = 'altered' AND object_name = 'orders'
+ORDER BY snapshot_id DESC LIMIT 1;
+----
+altered	{"added":[{"id":3,"name":"extra","type":"int64","nullable":true,"default":"NULL"}]}
+
+# cdc_schema_diff exercises the same shortcut on its per-snapshot loop.
+# Run it across the full window so the shortcut is hit at least once
+# per ALTER snapshot in `target_ids`. We assert: the per-column diff
+# rows are emitted as expected, and the rename row is emitted exactly
+# once. Three `added` rows = the two columns from CREATE TABLE plus the
+# one ADD COLUMN. The rename row comes from the Finding-1 path; per-
+# column rows for the rename snapshot are zero because the column list
+# is unchanged at that snapshot (the perf shortcut path).
+query II
+SELECT change_kind, count(*) FROM cdc_schema_diff('lake_p', 'orders_v2', 0, 99999)
+GROUP BY change_kind
+ORDER BY change_kind;
+----
+added	3
+table_rename	1

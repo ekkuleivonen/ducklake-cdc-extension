@@ -2348,17 +2348,53 @@ std::string BuildCreatedTableDetails(duckdb::Connection &conn, const std::string
 	return out.str();
 }
 
+//! Phase 2 deferral 2: cheap "did `table_id` get a schema-version bump
+//! at `snapshot_id`?" probe used to short-circuit the column-diff
+//! reconstruction in `BuildAlteredTableDetails` and `cdc_schema_diff`.
+//!
+//! `ducklake_schema_versions` has one row per (table_id, begin_snapshot)
+//! whenever a table's column list changed. A pure RENAME TABLE does not
+//! bump schema_version, and (more importantly) the noisy case where
+//! Stage-1 emits `altered_table:<id>` for an `altered_table:<id>` token
+//! whose adjacent text actually came from a rename — the column diff
+//! would be empty regardless. Either way, when no row exists for
+//! (table_id, begin_snapshot=snapshot_id) the two `LookupTableColumnsAt`
+//! calls + the `DiffColumns` traversal are guaranteed redundant; we
+//! skip them and let downstream serialise the empty diff group.
+bool TableSchemaVersionBumpedAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
+                                int64_t snapshot_id) {
+	auto result =
+	    conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_schema_versions") +
+	               " WHERE table_id = " + std::to_string(table_id) +
+	               " AND begin_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
+	if (!result || result->HasError()) {
+		// On error, fall back to "assume bump" so the caller still runs
+		// the full diff path. Better to do redundant work than to drop a
+		// real ALTER on a transient catalog query failure.
+		return true;
+	}
+	return result->RowCount() > 0;
+}
+
 //! Build the typed `details` JSON payload for an `altered.table` event.
 //! When `old_table_name` is non-empty (Finding-1 rename), the rename pair
 //! is included alongside the column-level diff. The diff itself uses
 //! `LookupTableColumnsAt(snapshot_id - 1)` vs `LookupTableColumnsAt(snapshot_id)`
 //! to pick up everything DuckLake committed at this snapshot.
+//!
+//! Phase 2 deferral 2: when `ducklake_schema_versions` shows no per-
+//! table schema bump at `snapshot_id`, skip the column-diff lookups
+//! entirely. The diff would be empty by construction; the rename
+//! payload (if any) is still emitted.
 std::string BuildAlteredTableDetails(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                                      int64_t table_id, const std::string &old_table_name,
                                      const std::string &new_table_name) {
-	const auto old_columns = LookupTableColumnsAt(conn, catalog_name, table_id, snapshot_id - 1);
-	const auto new_columns = LookupTableColumnsAt(conn, catalog_name, table_id, snapshot_id);
-	const auto diffs = DiffColumns(old_columns, new_columns);
+	std::vector<ColumnDiff> diffs;
+	if (TableSchemaVersionBumpedAt(conn, catalog_name, table_id, snapshot_id)) {
+		const auto old_columns = LookupTableColumnsAt(conn, catalog_name, table_id, snapshot_id - 1);
+		const auto new_columns = LookupTableColumnsAt(conn, catalog_name, table_id, snapshot_id);
+		diffs = DiffColumns(old_columns, new_columns);
+	}
 	std::ostringstream out;
 	out << "{";
 	const char *separator = "";
@@ -3319,10 +3355,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 				                        duckdb::Value()});
 			}
 
-			const auto old_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id - 1);
-			const auto new_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id);
-			auto diffs = DiffColumns(old_cols, new_cols);
-			NormaliseDiffParentChildOrdering(diffs);
+			std::vector<ColumnDiff> diffs;
+			if (TableSchemaVersionBumpedAt(conn, data.catalog_name, table_id, snapshot_id)) {
+				const auto old_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id - 1);
+				const auto new_cols = LookupTableColumnsAt(conn, data.catalog_name, table_id, snapshot_id);
+				diffs = DiffColumns(old_cols, new_cols);
+				NormaliseDiffParentChildOrdering(diffs);
+			}
 			for (const auto &d : diffs) {
 				duckdb::Value old_default =
 				    d.old_default.IsNull() ? duckdb::Value() : duckdb::Value(d.old_default.ToString());
