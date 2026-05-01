@@ -101,10 +101,6 @@ class ConsumerCommit(CDCModel):
     schema_version: int
 
 
-class ConsumerWait(CDCModel):
-    snapshot_id: int | None = None
-
-
 class ChangeRow(CDCModel):
     """Dynamic DML row with user table columns collected in `values`."""
 

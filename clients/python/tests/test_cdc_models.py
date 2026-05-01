@@ -8,7 +8,6 @@ from ducklake_cdc import (
     ChangeRow,
     ConsumerStats,
     ConsumerSubscription,
-    ConsumerWait,
     ConsumerWindow,
     DdlEvent,
     DoctorDiagnostic,
@@ -48,10 +47,7 @@ def test_cursor_models_coerce_fixed_rows() -> None:
             "schema_changes_pending": False,
         }
     )
-    wait = ConsumerWait(snapshot_id=None)
-
     assert window.start_snapshot == 7
-    assert wait.snapshot_id is None
 
 
 def test_change_row_collects_dynamic_table_columns() -> None:

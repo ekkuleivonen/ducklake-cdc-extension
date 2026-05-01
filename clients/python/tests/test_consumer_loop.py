@@ -9,8 +9,8 @@ from ducklake_cdc.enums import ChangeType
 from ducklake_cdc.models import (
     ChangeRow,
     ConsumerCommit,
-    ConsumerWait,
     ConsumerWindow,
+    SnapshotEvent,
 )
 
 
@@ -19,9 +19,18 @@ class FakeCDC:
         self.calls: list[str] = []
         self.now = datetime(2026, 5, 1, tzinfo=UTC)
 
-    def wait(self, name: str, *, timeout_ms: int) -> ConsumerWait:
-        self.calls.append(f"wait:{name}:{timeout_ms}")
-        return ConsumerWait(snapshot_id=42)
+    def dml_ticks_listen(self, name: str, *, timeout_ms: int) -> list[SnapshotEvent]:
+        self.calls.append(f"dml_ticks_listen:{name}:{timeout_ms}")
+        return [
+            SnapshotEvent(
+                consumer_name=name,
+                start_snapshot=1,
+                end_snapshot=42,
+                snapshot_id=42,
+                snapshot_time=self.now,
+                schema_version=1,
+            )
+        ]
 
     def window(self, name: str, *, max_snapshots: int) -> ConsumerWindow:
         self.calls.append(f"window:{name}:{max_snapshots}")
@@ -33,7 +42,7 @@ class FakeCDC:
             schema_changes_pending=False,
         )
 
-    def changes_rows(
+    def dml_table_changes_read_rows(
         self,
         name: str,
         *,
@@ -42,7 +51,7 @@ class FakeCDC:
         start_snapshot: int | None = None,
         end_snapshot: int | None = None,
     ) -> list[ChangeRow]:
-        self.calls.append(f"changes:{name}:{table_name}:{max_snapshots}")
+        self.calls.append(f"dml_table_changes_read:{name}:{table_name}:{max_snapshots}")
         if table_name != "main.orders":
             return []
         return [
@@ -158,11 +167,11 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
         "main.orders",
         "main.users",
     ]
-    assert wait_cdc.calls == ["wait:orders_sink:25"]
+    assert wait_cdc.calls == ["dml_ticks_listen:orders_sink:25"]
     assert cdc.calls == [
         "window:orders_sink:10",
-        "changes:orders_sink:main.orders:10",
-        "changes:orders_sink:main.users:10",
+        "dml_table_changes_read:orders_sink:main.orders:10",
+        "dml_table_changes_read:orders_sink:main.users:10",
         "commit:orders_sink:42",
     ]
     assert stats.waits == [True]

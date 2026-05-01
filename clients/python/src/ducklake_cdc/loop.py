@@ -114,17 +114,17 @@ def iter_consumer_batches(
         stats.record_consumer(consumer_name)
 
     while True:
-        wait = _timed(
+        ticks = _timed(
             stats,
             "cdc_dml_ticks_listen",
             lambda: _run_with_retry(
                 retry,
-                lambda: wait_cdc.dml_ticks_wait(consumer_name, timeout_ms=timeout_ms),
+                lambda: wait_cdc.dml_ticks_listen(consumer_name, timeout_ms=timeout_ms),
             ),
         )
         if stats is not None:
-            stats.record_wait(has_snapshot=wait.snapshot_id is not None)
-        if wait.snapshot_id is None:
+            stats.record_wait(has_snapshot=bool(ticks))
+        if not ticks:
             if idle_timeout and time.monotonic() - last_activity >= idle_timeout:
                 return
             continue
