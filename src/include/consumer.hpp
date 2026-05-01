@@ -111,6 +111,18 @@ std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                    const std::string &consumer_name, int64_t timeout_ms);
 
+//! Reactively coalesce integrated listen calls after this process observes a
+//! burst of quick, small non-empty results for the same consumer/stream.
+void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
+                                 const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
+                                 int64_t max_snapshots, int64_t first_matching_snapshot);
+
+//! Update process-local adaptive listen state. This state is only a performance
+//! hint; correctness remains entirely governed by cdc_window/cdc_commit.
+void RecordConsumerListenResult(const std::string &catalog_name, const std::string &consumer_name,
+                                const std::string &stream_key, bool has_rows, int64_t start_snapshot,
+                                int64_t end_snapshot, int64_t row_count, int64_t max_snapshots);
+
 //! Register all consumer-lifecycle and cursor table functions:
 //! cdc_ddl_consumer_create/cdc_dml_consumer_create / reset / drop / force_release / heartbeat / list,
 //! plus cdc_window / cdc_commit / listen calls. Called once at extension load.

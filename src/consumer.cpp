@@ -74,6 +74,22 @@ std::unordered_map<std::string, std::string> TOKEN_CACHE;
 std::mutex WAIT_WARNING_MUTEX;
 std::unordered_set<int64_t> WAIT_WARNED_CONNECTIONS;
 
+struct AdaptiveListenState {
+	bool has_last_success = false;
+	std::chrono::steady_clock::time_point last_success_at;
+	int64_t burst_streak = 0;
+};
+
+std::mutex ADAPTIVE_LISTEN_MUTEX;
+std::unordered_map<std::string, AdaptiveListenState> ADAPTIVE_LISTEN_STATES;
+
+const int64_t ADAPTIVE_LISTEN_BURST_THRESHOLD_MS = 250;
+const int64_t ADAPTIVE_LISTEN_TARGET_ROWS = 64;
+const int64_t ADAPTIVE_LISTEN_TARGET_SNAPSHOTS = 8;
+const int64_t ADAPTIVE_LISTEN_MIN_COALESCE_MS = 5;
+const int64_t ADAPTIVE_LISTEN_MAX_COALESCE_MS = 50;
+const int64_t ADAPTIVE_LISTEN_POLL_MS = 5;
+
 //===--------------------------------------------------------------------===//
 // Lease / cache helpers
 //===--------------------------------------------------------------------===//
@@ -87,6 +103,11 @@ std::string ConnectionCachePrefix(duckdb::ClientContext &context) {
 std::string TokenCacheKey(duckdb::ClientContext &context, const std::string &catalog_name,
                           const std::string &consumer_name) {
 	return ConnectionCachePrefix(context) + ":" + catalog_name + ":" + consumer_name;
+}
+
+std::string AdaptiveListenKey(const std::string &catalog_name, const std::string &consumer_name,
+                              const std::string &stream_key) {
+	return catalog_name + ":" + consumer_name + ":" + stream_key;
 }
 
 std::string CachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
@@ -2208,6 +2229,78 @@ std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &contex
 	data.consumer_name = consumer_name;
 	data.timeout_ms = timeout_ms;
 	return WaitForNextSnapshot(context, data);
+}
+
+int64_t AdaptiveListenDelayMs(const std::string &catalog_name, const std::string &consumer_name,
+                              const std::string &stream_key, int64_t timeout_ms) {
+	if (timeout_ms <= 0) {
+		return 0;
+	}
+	std::lock_guard<std::mutex> guard(ADAPTIVE_LISTEN_MUTEX);
+	const auto entry = ADAPTIVE_LISTEN_STATES.find(AdaptiveListenKey(catalog_name, consumer_name, stream_key));
+	if (entry == ADAPTIVE_LISTEN_STATES.end() || entry->second.burst_streak < 2) {
+		return 0;
+	}
+	const auto exponent = std::min<int64_t>(entry->second.burst_streak - 2, 4);
+	const auto delay_ms = ADAPTIVE_LISTEN_MIN_COALESCE_MS << exponent;
+	return std::min<int64_t>(std::min<int64_t>(delay_ms, ADAPTIVE_LISTEN_MAX_COALESCE_MS), timeout_ms);
+}
+
+void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
+                                 const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
+                                 int64_t max_snapshots, int64_t first_matching_snapshot) {
+	const auto coalesce_ms = AdaptiveListenDelayMs(catalog_name, consumer_name, stream_key, timeout_ms);
+	if (coalesce_ms <= 0 || max_snapshots <= 1 || first_matching_snapshot < 0) {
+		return;
+	}
+
+	duckdb::Connection conn(*context.db);
+	auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(coalesce_ms);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (context.interrupted) {
+			throw duckdb::InterruptException();
+		}
+		if (current_snapshot - first_matching_snapshot + 1 >= max_snapshots) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(ADAPTIVE_LISTEN_POLL_MS));
+		const auto next_snapshot = CurrentSnapshot(conn, catalog_name);
+		if (next_snapshot > current_snapshot) {
+			current_snapshot = next_snapshot;
+		}
+	}
+}
+
+void RecordConsumerListenResult(const std::string &catalog_name, const std::string &consumer_name,
+                                const std::string &stream_key, bool has_rows, int64_t start_snapshot,
+                                int64_t end_snapshot, int64_t row_count, int64_t max_snapshots) {
+	const auto key = AdaptiveListenKey(catalog_name, consumer_name, stream_key);
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> guard(ADAPTIVE_LISTEN_MUTEX);
+	auto &state = ADAPTIVE_LISTEN_STATES[key];
+	if (!has_rows) {
+		state.burst_streak = 0;
+		state.has_last_success = false;
+		return;
+	}
+
+	const auto window_span = end_snapshot >= start_snapshot ? end_snapshot - start_snapshot + 1 : 0;
+	const auto is_small_result = row_count < ADAPTIVE_LISTEN_TARGET_ROWS &&
+	                             window_span < ADAPTIVE_LISTEN_TARGET_SNAPSHOTS && window_span < max_snapshots;
+	const auto is_quick_success =
+	    state.has_last_success &&
+	    std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_success_at).count() <
+	        ADAPTIVE_LISTEN_BURST_THRESHOLD_MS;
+	if (is_quick_success && is_small_result) {
+		state.burst_streak += 1;
+	} else if (!is_small_result) {
+		state.burst_streak = 0;
+	} else {
+		state.burst_streak = std::max<int64_t>(0, state.burst_streak - 1);
+	}
+	state.has_last_success = true;
+	state.last_success_at = now;
 }
 
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
