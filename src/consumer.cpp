@@ -1474,6 +1474,217 @@ int64_t TimeoutMsParameter(duckdb::TableFunctionBindInput &input) {
 	return entry->second.GetValue<int64_t>();
 }
 
+std::vector<std::string> SplitListenChangeTokens(const std::string &changes_made) {
+	std::vector<std::string> tokens;
+	size_t start = 0;
+	while (start < changes_made.size()) {
+		const auto comma = changes_made.find(',', start);
+		tokens.push_back(changes_made.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+		if (comma == std::string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+	return tokens;
+}
+
+bool ParseListenTableIdToken(const std::string &token, const std::string &prefix, int64_t &table_id) {
+	if (token.rfind(prefix, 0) != 0) {
+		return false;
+	}
+	return TryParseInt64(token.substr(prefix.size()), table_id);
+}
+
+std::string UnquoteListenName(const std::string &quoted) {
+	if (quoted.size() >= 2 && quoted.front() == '"' && quoted.back() == '"') {
+		return quoted.substr(1, quoted.size() - 2);
+	}
+	return quoted;
+}
+
+bool ParseListenQualifiedNameToken(const std::string &token, const std::string &prefix, std::string &schema_name,
+                                   std::string &object_name) {
+	if (token.rfind(prefix, 0) != 0) {
+		return false;
+	}
+	const auto value = token.substr(prefix.size());
+	const auto dot = value.find("\".\"");
+	if (dot == std::string::npos) {
+		return false;
+	}
+	schema_name = UnquoteListenName(value.substr(0, dot + 1));
+	object_name = UnquoteListenName(value.substr(dot + 2));
+	return true;
+}
+
+bool ParseListenNameToken(const std::string &token, const std::string &prefix, std::string &name) {
+	if (token.rfind(prefix, 0) != 0) {
+		return false;
+	}
+	name = UnquoteListenName(token.substr(prefix.size()));
+	return !name.empty();
+}
+
+bool ResolveTableIdNearSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
+                                int64_t snapshot_id, int64_t &schema_id, std::string &qualified_name) {
+	if (ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, qualified_name)) {
+		return true;
+	}
+	if (snapshot_id > 0) {
+		return ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id - 1, schema_id, qualified_name);
+	}
+	return false;
+}
+
+bool ResolveSchemaIdNearSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                 const std::string &schema_name, int64_t snapshot_id, int64_t &schema_id) {
+	if (ResolveSchemaByNameAt(conn, catalog_name, schema_name, snapshot_id, schema_id)) {
+		return true;
+	}
+	if (snapshot_id > 0) {
+		return ResolveSchemaByNameAt(conn, catalog_name, schema_name, snapshot_id - 1, schema_id);
+	}
+	return false;
+}
+
+bool AnyDdlSubscriptionMatches(const std::vector<ConsumerSubscriptionRow> &subscriptions, int64_t schema_id,
+                               duckdb::Value table_id) {
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category != "ddl") {
+			continue;
+		}
+		if (subscription.scope_kind == "catalog") {
+			return true;
+		}
+		if (subscription.scope_kind == "schema" && !subscription.schema_id.IsNull() &&
+		    subscription.schema_id.GetValue<int64_t>() == schema_id) {
+			return true;
+		}
+		if (subscription.scope_kind == "table" && !table_id.IsNull() && !subscription.table_id.IsNull() &&
+		    subscription.table_id.GetValue<int64_t>() == table_id.GetValue<int64_t>()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool DmlTableChangesMatchSubscriptions(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
+                                       int64_t schema_id, int64_t table_id, const std::string &qualified_name,
+                                       const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	const auto change_types = MatchingDmlChangeTypes(subscriptions, schema_id, table_id);
+	if (change_types.empty()) {
+		return false;
+	}
+	std::ostringstream filter;
+	filter << " WHERE change_type IN (";
+	for (size_t i = 0; i < change_types.size(); ++i) {
+		if (i > 0) {
+			filter << ", ";
+		}
+		filter << QuoteLiteral(change_types[i]);
+	}
+	filter << ")";
+	auto rows = conn.Query("SELECT count(*) FROM " + QuoteIdentifier(catalog_name) + ".table_changes(" +
+	                       QuoteLiteral(qualified_name) + ", " + std::to_string(snapshot_id) + ", " +
+	                       std::to_string(snapshot_id) + ")" + filter.str());
+	if (!rows || rows->HasError() || rows->RowCount() == 0 || rows->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return rows->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+bool SnapshotTouchesSubscriptions(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
+                                  const std::string &changes_made,
+                                  const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	if (subscriptions.empty()) {
+		return true;
+	}
+	for (const auto &token : SplitListenChangeTokens(changes_made)) {
+		int64_t table_id = 0;
+		bool dml_table_token = false;
+		for (const auto &prefix : {"inserted_into_table:", "deleted_from_table:", "tables_inserted_into:",
+		                           "tables_deleted_from:", "inlined_insert:", "inlined_delete:"}) {
+			if (ParseListenTableIdToken(token, prefix, table_id)) {
+				dml_table_token = true;
+				break;
+			}
+		}
+		if (dml_table_token) {
+			int64_t schema_id = 0;
+			std::string qualified_name;
+			if (ResolveTableIdNearSnapshot(conn, catalog_name, table_id, snapshot_id, schema_id, qualified_name) &&
+			    DmlTableChangesMatchSubscriptions(conn, catalog_name, snapshot_id, schema_id, table_id, qualified_name,
+			                                      subscriptions)) {
+				return true;
+			}
+			continue;
+		}
+
+		std::string schema_name;
+		std::string object_name;
+		if (ParseListenQualifiedNameToken(token, "created_table:", schema_name, object_name)) {
+			int64_t schema_id = 0;
+			int64_t created_table_id = 0;
+			const auto qualified_name = schema_name + "." + object_name;
+			const auto table_value =
+			    ResolveCurrentTableName(conn, catalog_name, qualified_name, snapshot_id, schema_id, created_table_id)
+			        ? duckdb::Value::BIGINT(created_table_id)
+			        : duckdb::Value();
+			if ((table_value.IsNull() &&
+			     ResolveSchemaIdNearSnapshot(conn, catalog_name, schema_name, snapshot_id, schema_id) &&
+			     AnyDdlSubscriptionMatches(subscriptions, schema_id, table_value)) ||
+			    (!table_value.IsNull() && AnyDdlSubscriptionMatches(subscriptions, schema_id, table_value))) {
+				return true;
+			}
+			continue;
+		}
+		for (const auto &prefix : {"altered_table:", "dropped_table:"}) {
+			if (ParseListenTableIdToken(token, prefix, table_id)) {
+				int64_t schema_id = 0;
+				std::string qualified_name;
+				if (ResolveTableIdNearSnapshot(conn, catalog_name, table_id, snapshot_id, schema_id, qualified_name) &&
+				    AnyDdlSubscriptionMatches(subscriptions, schema_id, duckdb::Value::BIGINT(table_id))) {
+					return true;
+				}
+			}
+		}
+		for (const auto &prefix : {"created_schema:", "dropped_schema:"}) {
+			if (ParseListenNameToken(token, prefix, schema_name)) {
+				int64_t schema_id = 0;
+				if (ResolveSchemaIdNearSnapshot(conn, catalog_name, schema_name, snapshot_id, schema_id) &&
+				    AnyDdlSubscriptionMatches(subscriptions, schema_id, duckdb::Value())) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+duckdb::Value NextMatchingSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                   const ConsumerRow &consumer,
+                                   const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	auto rows = conn.Query("SELECT snapshot_id, changes_made FROM " +
+	                       MetadataTable(catalog_name, "ducklake_snapshot_changes") + " WHERE snapshot_id > " +
+	                       std::to_string(consumer.last_committed_snapshot) + " ORDER BY snapshot_id ASC");
+	ThrowIfQueryFailed(rows);
+	if (!rows) {
+		return duckdb::Value();
+	}
+	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
+		if (rows->GetValue(0, row_idx).IsNull()) {
+			continue;
+		}
+		const auto snapshot_id = rows->GetValue(0, row_idx).GetValue<int64_t>();
+		const auto changes_value = rows->GetValue(1, row_idx);
+		const auto changes_made = changes_value.IsNull() ? std::string() : changes_value.ToString();
+		if (SnapshotTouchesSubscriptions(conn, catalog_name, snapshot_id, changes_made, subscriptions)) {
+			return duckdb::Value::BIGINT(snapshot_id);
+		}
+	}
+	return duckdb::Value();
+}
+
 duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &context,
                                                         duckdb::TableFunctionBindInput &input,
                                                         duckdb::vector<duckdb::LogicalType> &return_types,
@@ -1507,14 +1718,15 @@ std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, c
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
 	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	while (true) {
 		if (context.interrupted) {
 			throw duckdb::InterruptException();
 		}
 		const auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
-		if (current_snapshot > row.last_committed_snapshot) {
-			return {duckdb::Value::BIGINT(current_snapshot)};
+		const auto next_matching_snapshot = NextMatchingSnapshot(conn, data.catalog_name, row, subscriptions);
+		if (!next_matching_snapshot.IsNull()) {
+			return {next_matching_snapshot};
 		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline || timeout_ms == 0) {

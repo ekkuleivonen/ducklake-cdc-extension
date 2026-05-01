@@ -24,7 +24,7 @@ ENABLE_EXTENSION_AUTOINSTALL=1
 # subset is what does.
 SQL_TEST_SMOKE_NO_DUCKLAKE=test/sql/ducklake_cdc.test
 SQL_TEST_SMOKE=test/sql/ducklake_cdc.test, test/sql/compat_check.test
-SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test, test/sql/subscriptions_identity.test, test/sql/verified_surface_tdd.test, test/sql/consumer_state.test, test/sql/sugar.test, test/sql/always_breaks.test
+SQL_TEST_DEFAULT=test/sql/ducklake_cdc.test, test/sql/compat_check.test, test/sql/new_api_contract.test, test/sql/recent_sugar.test, test/sql/notices_validation.test, test/sql/observability.test, test/sql/ddl_stage2.test, test/sql/subscriptions_identity.test, test/sql/verified_surface_tdd.test, test/sql/consumer_state.test, test/sql/sugar.test, test/sql/always_breaks.test
 
 # DuckLake binary cache layout: ~/.duckdb/extensions/<version>/<platform>/
 # Pre-staging the binary here lets sqllogictest's `INSTALL ducklake` resolve

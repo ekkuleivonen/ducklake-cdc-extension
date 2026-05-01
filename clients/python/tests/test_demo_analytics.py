@@ -85,12 +85,12 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["catalog_queries_estimated"] == 9
     assert summary["catalog_qps_avg"] == 4.5
     assert summary["empty_window_ratio"] == 0.5
-    assert summary["cdc_wait_calls"] == 2
-    assert summary["cdc_wait_timeouts"] == 1
-    assert summary["cdc_ddl_calls"] == 1
-    assert summary["cdc_events_calls"] == 1
+    assert summary["cdc_dml_ticks_listen_calls"] == 2
+    assert summary["cdc_dml_ticks_listen_timeouts"] == 1
+    assert summary["cdc_ddl_changes_read_changes_read_calls"] == 1
+    assert summary["cdc_dml_ticks_read_calls"] == 1
     assert summary["lake_tables_calls"] == 1
-    assert summary["cdc_changes_calls"] == 1
+    assert summary["cdc_dml_table_changes_read_calls"] == 1
     assert summary["cdc_commit_calls"] == 1
     assert summary["ddl_events"] == 1
     assert summary["snapshot_events"] == 2
@@ -150,9 +150,9 @@ def test_summary_table_renders_key_metrics() -> None:
     stats.record_consumer("consumer_a")
     stats.record_changes(4)
     stats.record_window(has_changes=True)
-    stats.record_operation("cdc_wait", 10.0)
+    stats.record_operation("cdc_dml_ticks_listen", 10.0)
     stats.record_operation("cdc_window", 5.0)
-    stats.record_operation("cdc_changes", 7.0)
+    stats.record_operation("cdc_dml_table_changes_read", 7.0)
     stats.record_operation("cdc_commit", 2.0)
     stats.record_change_latency(
         change_type="insert",
@@ -188,9 +188,9 @@ def test_summary_table_renders_key_metrics() -> None:
     assert "| producer_workers " in table
     assert "| latency_fresh_ms_p50 " in table
     assert "| latency_fresh_ms_p95 " in table
-    assert "| cdc_wait_ms_p50 " in table
+    assert "| cdc_dml_ticks_listen_ms_p50 " in table
     assert "| cdc_window_ms_p95 " in table
-    assert "| cdc_changes_ms_p95 " in table
+    assert "| cdc_dml_table_changes_read_ms_p95 " in table
     assert "| cdc_commit_ms_p95 " in table
     assert "| count_errors " in table
     assert "| count_dropped_rows " in table
@@ -212,7 +212,7 @@ def test_summary_table_renders_key_metrics() -> None:
     assert "ddl_events" not in table
     assert "snapshot_events" not in table
     assert "catalog_queries" not in table
-    assert "cdc_wait_calls" not in table
+    assert "cdc_dml_ticks_listen_calls" not in table
     assert "lake_tables_calls" not in table
     assert "latency_observations" not in table
     assert "latency_all_ms_" not in table
