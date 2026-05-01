@@ -15,7 +15,7 @@ from ducklake.config import (
     quote_identifier,
 )
 from ducklake.result import QueryParameters, Result
-from ducklake.session import Session
+from ducklake.session import Session, Transaction
 from ducklake.table import Table
 
 
@@ -64,6 +64,9 @@ class DuckLake:
 
     def session(self) -> Session:
         return Session(self)
+
+    def transaction(self) -> Transaction:
+        return Transaction(self)
 
     def raw_connection(self) -> Any:
         return self._manager.get()

@@ -88,7 +88,7 @@ HARNESS = r"""
 using namespace duckdb;
 
 // Conservative ceiling: the interrupt check sits at the top of each
-// poll iteration and the backoff doubles from 100ms to a 10s cap. A
+// poll iteration and the backoff doubles from 50ms to a 10s cap. A
 // 3000ms deadline catches even a worst-case "interrupt landed mid
 // 1.6s sleep" run while still failing fast on a real regression.
 static constexpr int64_t WAIT_DEADLINE_MS = 3000;

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from ducklake import Column, DuckLake, Snapshot
+import pytest
+
+from ducklake import Column, DuckLake, DuckLakeQueryError, Snapshot
 from ducklake.result import QueryParameters
 
 
@@ -23,6 +25,28 @@ class FakeResult:
 
     def list(self) -> list[dict[str, object]]:
         return []
+
+
+class FakeConnection:
+    description = [("ok",)]
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object | None]] = []
+
+    def execute(self, query: str, parameters: object | None = None) -> FakeConnection:
+        self.calls.append((query, parameters))
+        return self
+
+    def fetchall(self) -> list[tuple[bool]]:
+        return [(True,)]
+
+
+class FailingCommitConnection(FakeConnection):
+    def execute(self, query: str, parameters: object | None = None) -> FakeConnection:
+        if query == "COMMIT":
+            self.calls.append((query, parameters))
+            raise RuntimeError("database is locked")
+        return super().execute(query, parameters)
 
 
 def test_open_is_lazy() -> None:
@@ -52,6 +76,64 @@ def test_lake_sql_accepts_named_parameters() -> None:
     result = lake.sql("SELECT $value", value=1)
 
     assert result._parameters == {"value": 1}
+
+
+def test_transaction_commits_successful_block() -> None:
+    connection = FakeConnection()
+    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake._manager.get = lambda: connection  # type: ignore[method-assign]
+
+    with lake.transaction() as tx:
+        assert tx.sql("SELECT $value", value=1).list() == [{"ok": True}]
+
+    assert connection.calls == [
+        ("BEGIN TRANSACTION", None),
+        ("SELECT $value", {"value": 1}),
+        ("COMMIT", None),
+    ]
+
+
+def test_transaction_rolls_back_failed_block() -> None:
+    connection = FakeConnection()
+    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake._manager.get = lambda: connection  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with lake.transaction():
+            raise RuntimeError("boom")
+
+    assert connection.calls == [
+        ("BEGIN TRANSACTION", None),
+        ("ROLLBACK", None),
+    ]
+
+
+def test_transaction_wraps_commit_failures() -> None:
+    connection = FailingCommitConnection()
+    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake._manager.get = lambda: connection  # type: ignore[method-assign]
+
+    with pytest.raises(DuckLakeQueryError, match="transaction commit failed"):
+        with lake.transaction():
+            pass
+
+    assert connection.calls == [
+        ("BEGIN TRANSACTION", None),
+        ("COMMIT", None),
+        ("ROLLBACK", None),
+    ]
+
+
+def test_transaction_handle_cannot_run_after_exit() -> None:
+    connection = FakeConnection()
+    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake._manager.get = lambda: connection  # type: ignore[method-assign]
+
+    with lake.transaction() as tx:
+        pass
+
+    with pytest.raises(RuntimeError, match="transaction is not active"):
+        tx.sql("SELECT 1").list()
 
 
 def test_table_builds_common_queries() -> None:

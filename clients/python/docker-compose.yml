@@ -1,0 +1,29 @@
+# Postgres catalog backend for the Python DuckLake CDC demo.
+#
+# Usage:
+#   docker compose up -d --wait
+#   export DUCKLAKE_DEMO_CATALOG='postgresql://ducklake:ducklake@localhost:5435/ducklake'
+#   uv run python demo/consumer.py --analytics
+#   uv run python demo/producer.py --schemas 3 --tables 5 --inserts 100
+#   docker compose down -v
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: dlcdc-python-demo-postgres
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ducklake -d ducklake"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:

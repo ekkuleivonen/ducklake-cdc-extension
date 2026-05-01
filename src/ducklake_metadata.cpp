@@ -36,7 +36,7 @@ const int64_t DEFAULT_MAX_SNAPSHOTS = 100;
 const int64_t HARD_MAX_SNAPSHOTS = 1000;
 const int64_t DEFAULT_WAIT_TIMEOUT_MS = 30000;
 const int64_t HARD_WAIT_TIMEOUT_MS = 300000;
-const int64_t WAIT_INITIAL_INTERVAL_MS = 100;
+const int64_t WAIT_INITIAL_INTERVAL_MS = 50;
 const int64_t WAIT_MAX_INTERVAL_MS = 10000;
 
 //===--------------------------------------------------------------------===//

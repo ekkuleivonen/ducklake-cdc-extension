@@ -4,7 +4,7 @@
 **sub-second to seconds latency**, against a Postgres catalog that
 comfortably serves **~50 consumers** without connection pooling
 (~500 with PgBouncer). Idle consumers are cheap by design — `cdc_wait`
-backs off from 100ms to a 10s cap and resets on activity, so 50 idle
+backs off from 50ms to a 10s cap and resets on activity, so 50 idle
 consumers are 5 catalog queries / sec total.
 
 ## What we measure (and what we don't)
@@ -44,8 +44,8 @@ meaningful.
 
 We are a **poor fit** for:
 
-- **Sub-10ms latency.** The polling backoff bottoms out at 100ms; the
-  ratchet up means a typical `cdc_wait` returns within 100–300ms of
+- **Sub-10ms latency.** The polling backoff bottoms out at 50ms; the
+  ratchet up means a typical `cdc_wait` returns within 50–150ms of
   the producer commit, not microseconds. If you need sub-10ms,
   Debezium against your OLTP database is the right tool.
 - **OLTP CDC.** We read DuckLake snapshots; we do not tap a write-ahead

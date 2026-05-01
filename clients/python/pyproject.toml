@@ -66,3 +66,4 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.11"
 strict = true
 files = ["src", "tests"]
+mypy_path = ["demo"]

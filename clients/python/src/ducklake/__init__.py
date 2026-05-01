@@ -20,6 +20,7 @@ from ducklake.exceptions import (
 )
 from ducklake.lake import DuckLake
 from ducklake.result import Result
+from ducklake.session import Transaction
 from ducklake.table import Column, Snapshot, Table
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "SqliteCatalog",
     "StorageConfig",
     "Table",
+    "Transaction",
 ]
