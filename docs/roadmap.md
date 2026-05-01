@@ -4,9 +4,9 @@ This roadmap describes where `ducklake-cdc` is trying to go. It is not a
 release checklist, and it is not a promise that every possible edge case must
 be closed before the next tag.
 
-Known risks live in the [hazard log](./hazard-log.md). Older phase files were
-useful design history, but the surviving docs are now the canonical definition
-of what exists and what is intentionally deferred.
+Known risks live in the [hazard log](./hazard-log.md). The target SQL contract
+lives in [API reference](./api.md); implementation may temporarily lag that
+document while the project is still pre-stable.
 
 ## Where We Are
 
@@ -16,13 +16,11 @@ row-level change reads on top of DuckLake. The current repository release is
 `v0.3.2`; DuckDB community-extension distribution for that release is green
 and waiting on upstream merge.
 
-What exists today:
+What exists today, before the API-contract cleanup:
 
-- The SQL extension surface: `cdc_window`, `cdc_commit`, `cdc_wait`,
-  `cdc_ddl`, `cdc_changes`, `cdc_events`, `cdc_recent_changes`,
-  `cdc_recent_ddl`, `cdc_range_events`, `cdc_range_ddl`,
-  `cdc_range_changes`, `cdc_schema_diff`, `cdc_doctor`,
-  `cdc_consumer_*`, `cdc_consumer_stats`, and `cdc_audit_recent`.
+- The pre-cleanup SQL extension surface: cursor primitives, consumer lifecycle,
+  DDL/DML row reads, snapshot events, stateless range helpers, diagnostics, and
+  audit inspection.
 - Owner-token leasing for single-reader-per-consumer enforcement.
 - GitHub releases and full DuckDB extension matrix validation, proven through
   the `v0.3.2` line.
@@ -32,6 +30,18 @@ What exists today:
 - CI smoke coverage for DuckDB, SQLite, and PostgreSQL DuckLake catalogs.
 - A lightweight benchmark harness for smoke-level performance tracking,
   including both normal and empty-window workloads.
+
+What the next API iteration is aiming at:
+
+- Split lifecycle into `cdc_ddl_consumer_create` and
+  `cdc_dml_consumer_create`.
+- Treat DML subscriptions as concrete table identities. Use DDL consumers for
+  discovery and application-owned orchestration of future tables.
+- Replace the old mixed sugar split with explicit `listen`, `read`, and
+  stateless `query` functions.
+- Add cheap `ticks` streams for snapshot-level triggers without row payloads.
+- Keep typed single-table DML as a side path and make consumer-level DML generic
+  so multi-table consumers have a stable result schema.
 
 What is still intentionally thin:
 
@@ -48,20 +58,21 @@ What is still intentionally thin:
 
 ## Direction
 
-### Just Finished: Verified SQL Surface and Hot Path Sweep
+### Just Finished: Hot Path Sweep and API Contract Reset
 
-The SQL surface has been checked and locked in with tests against the main use
-cases that motivate the project: ad-hoc SQL inspection, managed subscribers,
-streaming pipeline consumers, catalog/schema replication, replay/backfill, and
-operational diagnostics. The `v0.3.2` sweep also tightened the single-round hot
-path and release packaging.
+The original SQL surface proved the core state machine, but the Python demo and
+performance work exposed places where the greenfield API should be clearer
+before external users depend on it. The target API now separates DDL and DML
+consumers, separates stateful `listen`/`read` from stateless `query`, and keeps
+consumer-level DML generic while preserving typed table-specific reads.
 
 Decisions from this pass:
 
-- Keep `cdc_changes`, `cdc_ddl`, and `cdc_events` focused on the current
-  leased consumer window.
-- Added explicit stateless range helpers for bounded replay/export/debug work:
-  `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes`.
+- Keep read/listen and commit separate by default; `auto_commit` is opt-in.
+- Use DDL consumers as discovery streams and keep DML subscriptions concrete.
+- Keep typed table reads for application processing and generic consumer-level
+  reads for multi-table forwarding.
+- Add explicit stateless query helpers for bounded replay/export/debug work.
 - Added `cdc_doctor` as the common health-check surface for SQL users, support
   requests, and the future Python client.
 - Treat operational replay as a named-consumer workflow: use a separate

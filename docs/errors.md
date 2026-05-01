@@ -45,18 +45,18 @@ extension knows how to read safely.
 
 ### `CDC_SCHEMA_BOUNDARY`
 
-`cdc_window` returned a window with `schema_changes_pending = true`. Commit the
-current window, then read DDL with `cdc_ddl` before applying DML from the next
-window.
+`cdc_window` returned a window with `schema_changes_pending = true`. Consumers
+that process both stream types should read/apply DDL with
+`cdc_ddl_changes_read` before applying DML from the same snapshot range.
 
 ### `CDC_WAIT_TIMEOUT_CLAMPED`
 
-`cdc_wait` was called with a timeout above the extension cap, so the timeout was
-clamped.
+A listen function was called with a timeout above the extension cap, so the
+timeout was clamped.
 
 ### `CDC_WAIT_SHARED_CONNECTION`
 
-`cdc_wait` holds a DuckDB connection for the duration of the wait. Use a
+Listen functions hold a DuckDB connection for the duration of the wait. Use a
 dedicated connection for long-polling so shared pools, notebooks, or request
 handlers are not blocked.
 

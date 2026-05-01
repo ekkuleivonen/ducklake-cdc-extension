@@ -45,17 +45,17 @@ This keeps state close to the catalog snapshots it tracks without making every
 cursor heartbeat or commit create a DuckLake snapshot. There is no external
 state store and no side database to keep in sync.
 
-`__ducklake_cdc_consumers` stores one row per named consumer: cursor position,
-schema-boundary policy, lease fields, timestamps, and metadata. Routing
-intent is stored only in
-`__ducklake_cdc_consumer_subscriptions`.
+`__ducklake_cdc_consumers` stores one row per named consumer: stream kind
+(`ddl` or `dml`), cursor position, lease fields, timestamps, and metadata.
+Routing intent is stored only in `__ducklake_cdc_consumer_subscriptions`.
 
 `__ducklake_cdc_consumer_subscriptions` stores one normalized row per resolved
 routing rule. Subscriptions are identity-first: names supplied at create time
 are resolved to DuckLake `schema_id` and `table_id`, then matching uses those
-ids. A table subscription follows table renames, a schema subscription follows
-schema renames, and drop + recreate with the same name is a new object that
-does not match the old subscription.
+ids. DDL subscriptions may be catalog-, schema-, or table-scoped. DML
+subscriptions are concrete table identities. A table subscription follows table
+renames, a schema DDL subscription follows schema renames, and drop + recreate
+with the same name is a new object that does not match the old subscription.
 
 `__ducklake_cdc_audit` records lifecycle actions for operational visibility.
 Sink retries, idempotency, validation, quarantine handling, and external
@@ -69,8 +69,9 @@ state schema.
 Those are intentionally separate calls. A consumer should only commit after its
 downstream write has succeeded. This is the core at-least-once contract.
 
-The sugar functions (`cdc_changes`, `cdc_events`, `cdc_ddl`) do not
-auto-commit.
+The `listen` and `read` functions may offer `auto_commit`, but it is always
+opt-in and defaults to `false`. The safe production shape remains:
+read/listen, write the sink durably, then call `cdc_commit`.
 
 ## One Consumer, One Logical Reader
 
@@ -83,27 +84,34 @@ commits. Another connection trying to read the same consumer gets `CDC_BUSY`.
 Parallel reads are still possible inside one window: an orchestrator can hold
 the consumer lease, fan out ordinary `table_changes` reads, then commit once.
 
+## DDL and DML Are Separate Streams
+
+DDL changes are part of the stream, but DDL and DML have different subscription
+contracts. DDL is the discovery/control-plane stream and can be filtered by
+catalog, schema, or table. DML is the data-plane stream and is filtered by
+concrete table identities.
+
+Applications that want "all future tables in schema X" should create a DDL
+consumer, watch for table creation, apply their own policy, and then create or
+configure DML consumers. The extension should not implicitly subscribe a DML
+consumer to future tables.
+
 ## Schema Changes Are Boundaries
 
-By default, `cdc_window` avoids crossing schema-version boundaries. The window
-result tells the caller whether schema changes are pending.
+`cdc_window` reports whether schema changes are pending. Consumers that process
+both DDL and DML should apply DDL before DML for the same snapshot.
 
 This keeps consumers from applying rows under a downstream schema that has not
-been updated yet. Consumers that can tolerate cross-schema windows can opt out
-with `stop_at_schema_change := false`.
-
-## DDL Is First-Class
-
-DDL changes are part of the stream. `cdc_ddl` surfaces typed schema events, and
-consumers should apply DDL before DML for the same snapshot.
-
-`cdc_schema_diff` reuses the same extraction logic for ad-hoc inspection.
+been updated yet, while still letting DDL-only consumers act as lightweight
+orchestrators.
 
 ## Values Stay Native in SQL
 
-The extension exposes DuckLake values as DuckDB values. Serialization choices
-such as JSON, GeoJSON, base64, Avro, or sink-specific formats belong in clients
-or sinks, not in the extension.
+The typed table DML path exposes DuckLake values as DuckDB values. The
+consumer-level multi-table DML path uses a generic payload because heterogeneous
+table schemas cannot share one typed result set. Serialization choices such as
+GeoJSON, base64, Avro, or sink-specific envelopes belong in clients or sinks,
+not in the extension.
 
 ## Release Flow
 

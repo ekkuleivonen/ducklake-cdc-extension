@@ -166,16 +166,17 @@ feature_* -> main -> manual release
   table-name builders, snapshot lookups, JSON / quoting helpers, state-table
   DDL, lazy bootstrap). `src/ducklake_metadata.cpp` implements it.
 - `src/include/consumer.hpp` + `src/consumer.cpp` own the consumer state
-  machine (create / reset / drop / list / force-release / heartbeat) and the
-  cursor primitives (cdc_window / cdc_commit / cdc_wait), plus the lease,
-  audit-writer, and notice helpers.
+  machine (DDL/DML create, reset, drop, list, force-release, heartbeat) and the
+  cursor primitives (`cdc_window` / `cdc_commit`), plus the lease, audit-writer,
+  listen/wait helpers, and notices.
 - `src/include/ddl.hpp` + `src/ddl.cpp` own the schema-change reads
-  (cdc_ddl, cdc_recent_ddl, cdc_schema_diff) and the per-snapshot DDL
-  extraction / column-diff machinery.
+  (`cdc_ddl_changes_*`, `cdc_ddl_ticks_*`, and stateless DDL queries) and the
+  per-snapshot DDL extraction / column-diff machinery.
 - `src/include/dml.hpp` + `src/dml.cpp` own the row-level reads
-  (cdc_events, cdc_changes, cdc_recent_changes).
+  (`cdc_dml_changes_*`, typed table DML reads, DML ticks, and stateless DML
+  queries).
 - `src/include/stats.hpp` + `src/stats.cpp` own the observability surface
-  (cdc_consumer_stats, cdc_audit_recent).
+  (`cdc_consumer_stats`, `cdc_audit_events`, `cdc_doctor`).
 - `test/sql/ducklake_cdc.test` is the smallest extension smoke test.
 - `test/sql/consumer_state.test` and `test/sql/sugar.test` are the best
   behavioural specs for the cursor and sugar surfaces.
