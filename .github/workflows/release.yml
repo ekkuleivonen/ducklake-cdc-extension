@@ -1,9 +1,10 @@
 #
 # One-click release automation.
 #
-# A maintainer triggers this from the Actions UI on `main` (for the next
-# minor release line) or on a `release/X.Y` branch (for a patch on a
-# previously-published line). On success, this workflow:
+# A maintainer triggers this from the Actions UI on `main` (for a new minor
+# line, or for a patch on the latest minor line) or on a `release/X.Y`
+# branch (for a patch on a previously-published line). On success, this
+# workflow:
 #
 #   1. Validates the trigger ref and version format against the policy
 #      in docs/decisions/0012-branching-ci-release.md and
@@ -14,8 +15,8 @@
 #      shipped platforms build cleanly. Day-to-day CI does not pay for
 #      this; releases do.
 #   4. Creates an annotated git tag (vMAJOR.MINOR.PATCH).
-#   5. Creates the maintenance branch `release/MAJOR.MINOR` from the tag
-#      if releasing the first patch of a new line.
+#   5. Creates or fast-forwards the maintenance branch
+#      `release/MAJOR.MINOR` to the released commit.
 #   6. Creates a GitHub Release with auto-generated notes (driven by
 #      `.github/release.yml` label categories).
 #   7. Opens a PR against `duckdb/community-extensions` that updates this
@@ -250,6 +251,11 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
       - name: Validate version matches branch policy
         if: ${{ !inputs.community_pr_only }}
         env:
@@ -264,12 +270,23 @@ jobs:
           patch="${stripped##*.}"
 
           if [[ "$REF" == "refs/heads/main" ]]; then
-            # Releases from main must be a .0 patch (a new minor or major
-            # line). Subsequent patches on a published line must be cut
-            # from the corresponding release/X.Y branch.
+            # Main can cut a new .0 line, or a patch for the latest
+            # published minor line. Patches for older lines must come from
+            # their release/X.Y branch.
             if [[ "$patch" != "0" ]]; then
-              echo "::error::Patch releases (patch != 0) must be triggered from release/$major.$minor, not main."
-              exit 1
+              latest_tag="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n 1)"
+              if [[ -z "$latest_tag" ]]; then
+                echo "::error::Patch releases from main require an existing latest release tag."
+                exit 1
+              fi
+              latest_stripped="${latest_tag#v}"
+              latest_major="${latest_stripped%%.*}"
+              latest_rest="${latest_stripped#*.}"
+              latest_minor="${latest_rest%%.*}"
+              if [[ "$major.$minor" != "$latest_major.$latest_minor" ]]; then
+                echo "::error::Patch releases from main are only allowed for the latest minor line ($latest_major.$latest_minor); use release/$major.$minor for $VERSION."
+                exit 1
+              fi
             fi
           else
             # Triggered from refs/heads/release/X.Y; must match the
@@ -285,11 +302,6 @@ jobs:
               exit 1
             fi
           fi
-
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: recursive
 
       - name: Verify tag does not already exist
         if: ${{ !inputs.community_pr_only }}
@@ -378,11 +390,15 @@ jobs:
         if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
-          REF: ${{ github.ref }}
         run: |
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            echo "Maintenance branch $BRANCH already exists; leaving it alone."
-            echo "(Patch releases must be cut from the existing branch, not main.)"
+            git fetch origin "$BRANCH"
+            if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
+              echo "::error::Maintenance branch $BRANCH cannot be fast-forwarded to this release commit."
+              exit 1
+            fi
+            git push origin "HEAD:refs/heads/$BRANCH"
+            echo "Fast-forwarded maintenance branch $BRANCH to $GITHUB_SHA."
           else
             git push origin "HEAD:refs/heads/$BRANCH"
             echo "Created maintenance branch $BRANCH at $GITHUB_SHA."
@@ -493,6 +509,9 @@ jobs:
           path = Path(os.environ["DESCRIPTOR"])
           version = os.environ["STRIPPED_VERSION"]
           sha = os.environ["RELEASE_SHA"]
+          community_test_config = (
+              "  test_config: '{\"test_env_variables\":{\"LINUX_CI_IN_DOCKER\":\"0\"}}'"
+          )
 
           text = path.read_text()
           text = re.sub(
@@ -507,6 +526,13 @@ jobs:
               text,
               count=1,
           )
+          if "test_config:" not in text:
+              text = re.sub(
+                  r'(?m)^(\s*requires_toolchains:\s*.*)$',
+                  lambda m: f"{m.group(1)}\n{community_test_config}",
+                  text,
+                  count=1,
+              )
           path.write_text(text)
           PY
           else
@@ -520,6 +546,7 @@ jobs:
             license: Apache-2.0
             excluded_platforms: ""
             requires_toolchains: ""
+            test_config: '{"test_env_variables":{"LINUX_CI_IN_DOCKER":"0"}}'
             maintainers:
               - "$ACTOR"
 

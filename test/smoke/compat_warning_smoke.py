@@ -27,9 +27,9 @@ What this script does (no Docker, no PyPI deps; all stdlib):
    `LoadInternal` at session start, after the initial database is
    visible. The probe then hits the seeded `__ducklake_metadata_<name>`
    schema, reads `'99.99'`, and emits the structured notice on stderr.
-3. Calls `cdc_consumer_create('<catalog>', 'test')` against the same
-   seeded incompatible catalog and asserts the call-time gate throws the
-   same structured prefix before any catalog write.
+3. Calls `cdc_consumer_create('<catalog>', 'test', subscriptions := ...)`
+   against the same seeded incompatible catalog and asserts the call-time
+   gate throws the same structured prefix before any catalog write.
 4. Asserts both outputs contain the `CDC_INCOMPATIBLE_CATALOG:` prefix
    (the load-bearing surface bindings parse on per `docs/errors.md`)
    AND every required field per the same doc:
@@ -103,6 +103,15 @@ EXPECTED_VERSION_STAMP = "ducklake_cdc "
 EXPECTED_DOC_POINTER = "docs/compatibility.md"
 
 
+def catalog_all_subscription_arg() -> str:
+    return (
+        "subscriptions := ["
+        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
+        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
+        "]"
+    )
+
+
 def seed_fake_catalog(db_path: Path, catalog_name: str) -> None:
     """Write a fresh DuckDB file containing a `__ducklake_metadata_<name>`
     schema with a `ducklake_metadata` row of `('version', FAKE_VERSION)`.
@@ -160,7 +169,7 @@ def capture_call_time_error(db_path: Path, catalog_name: str) -> str:
             "-unsigned",
             str(db_path),
             "-c",
-            f"SELECT * FROM cdc_consumer_create('{catalog_name}', 'test');",
+            f"SELECT * FROM cdc_consumer_create('{catalog_name}', 'test', {catalog_all_subscription_arg()});",
         ],
         capture_output=True,
         text=True,

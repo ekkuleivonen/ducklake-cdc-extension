@@ -1,0 +1,8 @@
+name: empty-window
+load_profile: flat
+duration_seconds: 60
+target_snapshots_per_second: 0.5
+target_rows_per_snapshot: 100
+consumers: 1
+max_snapshots: 100
+empty_window_ratio: 0.8

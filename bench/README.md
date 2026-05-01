@@ -14,8 +14,11 @@ uv run --locked python bench/runner.py \
 ```
 
 `bench/light.yaml` is intentionally short: a 60-second flat profile,
-0.5 target snapshots/second, 100 target rows/snapshot, one consumer. The
-runner accepts command-line overrides for the same fields so local
+0.5 target snapshots/second, 100 target rows/snapshot, one consumer.
+`bench/empty-window.yaml` keeps the same producer shape but adds four
+empty `cdc_window` probes after each committed non-empty window, so 80%
+of window calls measure the steady-state "consumer already at head" path.
+The runner accepts command-line overrides for the same fields so local
 experiments can run faster:
 
 ```sh
@@ -30,7 +33,8 @@ top-level `result_schema_version` makes future result history comparable.
 The schema separates the configured workload from observed measurements:
 
 - `workload`: stable input envelope (`load_profile`, duration, target
-  snapshots/second, target rows/snapshot, consumers, max snapshots).
+  snapshots/second, target rows/snapshot, consumers, max snapshots, and
+  optional empty-window ratio).
 - `measurements`: observed duration, produced/consumed counts, actual
   rates, end-to-end latency summary, CDC call counts, catalog QPS, lag,
   and per-operation timing summaries where the runtime can collect them.

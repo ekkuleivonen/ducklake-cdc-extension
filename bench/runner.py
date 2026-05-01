@@ -74,6 +74,12 @@ std::string QuoteString(const std::string &value) {
 	return result;
 }
 
+std::string CatalogAllSubscription() {
+	return "subscriptions := [struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, "
+	       "table_name := NULL::VARCHAR, schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
+	       "event_category := '*', change_type := '*')]";
+}
+
 int64_t NowNanos() {
 	const auto now = std::chrono::steady_clock::now().time_since_epoch();
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
@@ -146,7 +152,8 @@ int main(int argc, char **argv) {
 	RequireOk(conn, "ATTACH 'ducklake:" + lake_path + "' AS lake (DATA_PATH " + QuoteString(data_path) + ")");
 	RequireOk(conn, "CREATE TABLE lake.bench_events(id BIGINT, produced_ns BIGINT, snapshot_no INTEGER, row_no INTEGER)");
 	for (int consumer = 0; consumer < consumers; consumer++) {
-		RequireOk(conn, "SELECT * FROM cdc_consumer_create('lake', 'bench_" + std::to_string(consumer) + "')");
+		RequireOk(conn, "SELECT * FROM cdc_consumer_create('lake', 'bench_" + std::to_string(consumer) + "', " +
+		                    CatalogAllSubscription() + ")");
 	}
 
 	std::vector<double> latencies_ms;
@@ -246,6 +253,7 @@ class Workload:
     target_rows_per_snapshot: int
     consumers: int
     max_snapshots: int
+    empty_window_ratio: float = 0.0
 
 
 def parse_flat_yaml(path: Path) -> dict[str, str]:
@@ -283,6 +291,7 @@ def load_workload(path: Path, args: argparse.Namespace) -> Workload:
         target_rows_per_snapshot=target_rows_per_snapshot,
         consumers=int(raw["consumers"]),
         max_snapshots=int(raw["max_snapshots"]),
+        empty_window_ratio=float(raw.get("empty_window_ratio", "0")),
     )
     for field_name in (
         "duration_seconds",
@@ -290,6 +299,7 @@ def load_workload(path: Path, args: argparse.Namespace) -> Workload:
         "target_rows_per_snapshot",
         "consumers",
         "max_snapshots",
+        "empty_window_ratio",
     ):
         override = getattr(args, field_name)
         if override is not None:
@@ -307,11 +317,22 @@ def load_workload(path: Path, args: argparse.Namespace) -> Workload:
         or workload.max_snapshots <= 0
     ):
         raise ValueError("all numeric workload parameters must be positive")
+    if workload.empty_window_ratio < 0 or workload.empty_window_ratio >= 1:
+        raise ValueError("empty_window_ratio must be >= 0 and < 1")
     return workload
 
 
 def quote_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def catalog_all_subscription_arg() -> str:
+    return (
+        "subscriptions := ["
+        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
+        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
+        "]"
+    )
 
 
 def build_paths(build: str) -> dict[str, Path]:
@@ -402,12 +423,15 @@ def timed_execute(conn: Any, sql: str, samples_ms: list[float]) -> Any:
         samples_ms.append((now_nanos() - started_ns) / 1000000.0)
 
 
-def timed_fetchall(conn: Any, sql: str, samples_ms: list[float]) -> list[Any]:
+def timed_fetchall(conn: Any, sql: str, samples_ms: list[float], extra_samples_ms: list[float] | None = None) -> list[Any]:
     started_ns = now_nanos()
     try:
         return require_ok_python(conn, sql).fetchall()
     finally:
-        samples_ms.append((now_nanos() - started_ns) / 1000000.0)
+        elapsed_ms = (now_nanos() - started_ns) / 1000000.0
+        samples_ms.append(elapsed_ms)
+        if extra_samples_ms is not None:
+            extra_samples_ms.append(elapsed_ms)
 
 
 def values_for_snapshot(snapshot_index: int, rows_per_snapshot: int, produced_ns: int) -> str:
@@ -416,6 +440,12 @@ def values_for_snapshot(snapshot_index: int, rows_per_snapshot: int, produced_ns
         event_id = (snapshot_index * rows_per_snapshot) + row
         values.append(f"({event_id}, {produced_ns}, {snapshot_index}, {row})")
     return "INSERT INTO lake.bench_events VALUES " + ", ".join(values)
+
+
+def empty_window_probes_per_non_empty(workload: Workload) -> int:
+    if workload.empty_window_ratio <= 0:
+        return 0
+    return max(1, round(workload.empty_window_ratio / (1.0 - workload.empty_window_ratio)))
 
 
 def require_ok_python(conn: Any, sql: str) -> Any:
@@ -440,21 +470,28 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
     require_ok_python(conn, "CREATE TABLE lake.bench_events(id BIGINT, produced_ns BIGINT, snapshot_no INTEGER, row_no INTEGER)")
 
     for consumer in range(workload.consumers):
-        require_ok_python(conn, f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}')")
+        require_ok_python(
+            conn,
+            f"SELECT * FROM cdc_consumer_create('lake', 'bench_{consumer}', {catalog_all_subscription_arg()})",
+        )
 
     planned_snapshots = max(1, math.floor(workload.duration_seconds * workload.target_snapshots_per_second))
     interval_seconds = 1.0 / workload.target_snapshots_per_second
     end_to_end_latencies_ms: list[float] = []
     producer_insert_ms: list[float] = []
     cdc_window_ms: list[float] = []
+    cdc_window_empty_ms: list[float] = []
     cdc_changes_ms: list[float] = []
     cdc_commit_ms: list[float] = []
     consumed_events = 0
     cdc_window_calls = 0
+    cdc_window_non_empty_calls = 0
+    cdc_window_empty_calls = 0
     cdc_changes_calls = 0
     cdc_commit_calls = 0
     producer_inserts = 0
     produced_rows = 0
+    empty_probes_per_non_empty = empty_window_probes_per_non_empty(workload)
     started_at = time.monotonic()
 
     for snapshot in range(planned_snapshots):
@@ -482,6 +519,7 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
                 cdc_window_ms,
             )
             cdc_window_calls += 1
+            cdc_window_non_empty_calls += 1
             if len(window_rows) != 1 or not window_rows[0][2]:
                 raise RuntimeError(f"expected a non-empty cdc_window for {consumer_name}")
             end_snapshot = window_rows[0][1]
@@ -513,6 +551,20 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
             )
             cdc_commit_calls += 1
 
+            for _ in range(empty_probes_per_non_empty):
+                empty_window_rows = timed_fetchall(
+                    conn,
+                    "SELECT * FROM cdc_window('lake', "
+                    + quote_string(consumer_name)
+                    + f", max_snapshots => {workload.max_snapshots})",
+                    cdc_window_ms,
+                    cdc_window_empty_ms,
+                )
+                cdc_window_calls += 1
+                cdc_window_empty_calls += 1
+                if len(empty_window_rows) != 1 or empty_window_rows[0][2]:
+                    raise RuntimeError(f"expected an empty cdc_window for {consumer_name}, got {empty_window_rows!r}")
+
     actual_duration_seconds = time.monotonic() - started_at
     catalog_queries_estimated = cdc_window_calls + cdc_changes_calls + cdc_commit_calls
 
@@ -534,6 +586,7 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
         "operation_ms": {
             "producer_insert": metric_summary(producer_insert_ms),
             "cdc_window": metric_summary(cdc_window_ms),
+            "cdc_window_empty": metric_summary(cdc_window_empty_ms),
             "cdc_changes": metric_summary(cdc_changes_ms),
             "cdc_commit": metric_summary(cdc_commit_ms),
         },
@@ -541,6 +594,11 @@ def run_python_benchmark(cdc_extension: Path, workload: Workload, tmpdir: Path) 
         "catalog_qps_avg": catalog_queries_estimated / actual_duration_seconds,
         "lag_snapshots_max": 0,
         "cdc_window_calls": cdc_window_calls,
+        "cdc_window_non_empty_calls": cdc_window_non_empty_calls,
+        "cdc_window_empty_calls": cdc_window_empty_calls,
+        "empty_window_ratio": (
+            cdc_window_empty_calls / cdc_window_calls if cdc_window_calls > 0 else 0.0
+        ),
         "cdc_changes_calls": cdc_changes_calls,
         "cdc_commit_calls": cdc_commit_calls,
     }
@@ -604,6 +662,9 @@ def normalize_legacy_measurements(measurements: dict[str, Any], workload: Worklo
         "catalog_qps_avg": float(measurements["catalog_qps_avg"]),
         "lag_snapshots_max": int(measurements["lag_snapshots_max"]),
         "cdc_window_calls": int(measurements["cdc_window_calls"]),
+        "cdc_window_non_empty_calls": int(measurements["cdc_window_calls"]),
+        "cdc_window_empty_calls": 0,
+        "empty_window_ratio": 0.0,
         "cdc_changes_calls": int(measurements["cdc_changes_calls"]),
         "cdc_commit_calls": int(measurements["cdc_commit_calls"]),
     }
@@ -639,6 +700,7 @@ def main() -> int:
     parser.add_argument("--target-rows-per-snapshot", type=int)
     parser.add_argument("--consumers", type=int)
     parser.add_argument("--max-snapshots", type=int)
+    parser.add_argument("--empty-window-ratio", type=float)
     args = parser.parse_args()
 
     workload = load_workload(args.workload, args)
@@ -646,6 +708,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ducklake_cdc_bench_") as tmp:
         tmpdir = Path(tmp)
         if args.runtime == "local-build":
+            if workload.empty_window_ratio > 0:
+                raise ValueError("empty_window_ratio workloads require --runtime official")
             paths = build_paths(args.build)
             require_artifacts(paths, args.build)
             binary = compile_harness(tmpdir, paths)
