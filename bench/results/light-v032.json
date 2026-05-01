@@ -1,0 +1,91 @@
+{
+  "build": "official",
+  "commit": "a738914965e2",
+  "hardware_label": "Linux x86_64 runnervmrc6n4",
+  "measurements": {
+    "actual_duration_seconds": 58.07296626200002,
+    "actual_rows_per_second": 51.65914870725394,
+    "actual_snapshots_per_second": 0.5165914870725393,
+    "catalog_qps_avg": 1.549774461217618,
+    "catalog_queries_estimated": 90,
+    "cdc_changes_calls": 30,
+    "cdc_commit_calls": 30,
+    "cdc_window_calls": 30,
+    "cdc_window_empty_calls": 0,
+    "cdc_window_non_empty_calls": 30,
+    "consumed_events": 3000,
+    "consumed_events_per_second": 51.65914870725394,
+    "empty_window_ratio": 0.0,
+    "end_to_end_latency_ms": {
+      "max": 82.58171,
+      "mean": 66.24643033333334,
+      "p50": 65.3225095,
+      "p95": 70.060896,
+      "p99": 82.58171
+    },
+    "lag_snapshots_max": 0,
+    "load_profile": "flat",
+    "operation_ms": {
+      "cdc_changes": {
+        "max": 64.570362,
+        "mean": 45.2116356,
+        "p50": 44.401032,
+        "p95": 47.047737649999995,
+        "p99": 59.80630261000002
+      },
+      "cdc_commit": {
+        "max": 6.542339,
+        "mean": 6.112991666666667,
+        "p50": 6.101337,
+        "p95": 6.32674495,
+        "p99": 6.48193983
+      },
+      "cdc_window": {
+        "max": 12.074682,
+        "mean": 10.278467299999999,
+        "p50": 10.215373,
+        "p95": 11.1196819,
+        "p99": 11.81600954
+      },
+      "cdc_window_empty": {
+        "max": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "producer_insert": {
+        "max": 12.229788,
+        "mean": 10.656238233333333,
+        "p50": 10.623384,
+        "p95": 11.1012563,
+        "p99": 11.94016906
+      }
+    },
+    "planned_snapshots": 30,
+    "produced_rows": 3000,
+    "producer_inserts": 30,
+    "scheduled_duration_seconds": 60,
+    "target_rows_per_snapshot": 100,
+    "target_snapshots_per_second": 0.5,
+    "workload_name": "light"
+  },
+  "result_schema_version": 1,
+  "run_id": "591b7789-cabb-4060-a628-6b6ae9b56c8a",
+  "runtime": "official",
+  "soft_gates": {
+    "catalog_qps_avg_lte": 5,
+    "lag_snapshots_max_lte": 0
+  },
+  "timestamp_utc": "2026-05-01T07:36:44.437785+00:00",
+  "workload": {
+    "consumers": 1,
+    "duration_seconds": 60,
+    "empty_window_ratio": 0.0,
+    "load_profile": "flat",
+    "max_snapshots": 100,
+    "name": "light",
+    "target_rows_per_snapshot": 100,
+    "target_snapshots_per_second": 0.5
+  }
+}

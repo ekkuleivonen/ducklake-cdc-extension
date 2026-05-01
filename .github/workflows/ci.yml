@@ -20,7 +20,15 @@ on:
       - 'release/**'
     tags:
       - 'v*'
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'bench/results/**'
   pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - 'bench/results/**'
   merge_group:
   workflow_dispatch:
 

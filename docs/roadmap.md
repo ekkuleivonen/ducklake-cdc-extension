@@ -10,9 +10,11 @@ of what exists and what is intentionally deferred.
 
 ## Where We Are
 
-`ducklake-cdc` is a community-published DuckDB extension that adds durable
-consumer cursors, long-polling, typed DDL events, schema-boundary handling, and
-row-level change reads on top of DuckLake.
+`ducklake-cdc` is a released DuckDB extension that adds durable consumer
+cursors, long-polling, typed DDL events, schema-boundary handling, and
+row-level change reads on top of DuckLake. The current repository release is
+`v0.3.2`; DuckDB community-extension distribution for that release is green
+and waiting on upstream merge.
 
 What exists today:
 
@@ -22,9 +24,14 @@ What exists today:
   `cdc_range_changes`, `cdc_schema_diff`, `cdc_doctor`,
   `cdc_consumer_*`, `cdc_consumer_stats`, and `cdc_audit_recent`.
 - Owner-token leasing for single-reader-per-consumer enforcement.
-- Community extension publishing, proven through the `v0.2.0` line.
+- GitHub releases and full DuckDB extension matrix validation, proven through
+  the `v0.3.2` line.
+- Community-extension packaging for `v0.3.2`, with SQL tests disabled in the
+  community repo because this extension's DuckLake-dependent integration suite
+  runs in its own CI.
 - CI smoke coverage for DuckDB, SQLite, and PostgreSQL DuckLake catalogs.
-- A lightweight benchmark harness for smoke-level performance tracking.
+- A lightweight benchmark harness for smoke-level performance tracking,
+  including both normal and empty-window workloads.
 
 What is still intentionally thin:
 
@@ -34,16 +41,20 @@ What is still intentionally thin:
   failure classification, quarantine policy, and exactly-once-ish semantics
   belong in clients and sinks.
 - Backend coverage is smoke-level, not exhaustive certification.
+- `UPDATE ... RETURNING` fast paths are currently enabled only for DuckDB
+  metadata catalogs. SQLite and PostgreSQL stay on the portable path because
+  DuckDB's attached-table scanners reject `UPDATE ... RETURNING` there today.
 - Performance numbers are early signal, not production contracts.
 
 ## Direction
 
-### Just Finished: TDD the Verified Surface
+### Just Finished: Verified SQL Surface and Hot Path Sweep
 
 The SQL surface has been checked and locked in with tests against the main use
 cases that motivate the project: ad-hoc SQL inspection, managed subscribers,
 streaming pipeline consumers, catalog/schema replication, replay/backfill, and
-operational diagnostics.
+operational diagnostics. The `v0.3.2` sweep also tightened the single-round hot
+path and release packaging.
 
 Decisions from this pass:
 
@@ -60,12 +71,19 @@ Decisions from this pass:
 - Do not expose an extension-owned sink failure queue. The extension provides
   at-least-once replay mechanics; clients and sinks own idempotency, retries,
   validation, quarantine policy, and external side-effect semantics.
+- Keep `UPDATE ... RETURNING` gated to DuckDB metadata catalogs until
+  DuckDB's SQLite/PostgreSQL scanners support it for attached tables.
+- Push schema-change filtering into SQL where possible and keep the
+  fast/slow-path asymmetry documented.
+- Track both non-empty and empty `cdc_window` behaviour in the benchmark
+  harness so optimisations do not only target the happy path.
 
 ### Now: Python Client
 
 The next chapter is the first client, because it is the shortest path from the
 SQL extension to people actually trying the project in scripts, notebooks, and
-small services.
+small services. The SQL layer should now be stable enough to support that
+client without inventing a second cursor model.
 
 Likely work:
 

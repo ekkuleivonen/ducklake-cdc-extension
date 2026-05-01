@@ -3,10 +3,11 @@
 A DuckDB extension that adds a row-level change-data-capture cursor on top
 of [DuckLake](https://ducklake.select).
 
-> **Status: early community release (`v0.2.0`).** The SQL extension is
-> published through DuckDB community extensions, and the core cursor / DDL /
-> DML surface is usable today. Catalog coverage is smoke-tested across DuckDB,
-> SQLite, and PostgreSQL, but this is still an early project: there are no
+> **Status: early SQL release (`v0.3.2`).** The core cursor / DDL / DML
+> surface is usable today, with catalog smoke coverage across DuckDB, SQLite,
+> and PostgreSQL. `v0.3.2` is tagged in this repository; DuckDB community
+> extension distribution is green and waiting on upstream merge, after which
+> users can install with `INSTALL ducklake_cdc FROM community`. There are no
 > language clients or reference sinks yet. See [`docs/roadmap.md`](./docs/roadmap.md)
 > for direction and [`docs/hazard-log.md`](./docs/hazard-log.md) for known risks.
 
@@ -16,20 +17,24 @@ of [DuckLake](https://ducklake.select).
   `cdc_ddl`, and the `cdc_consumer_*` lifecycle, all enforced by an
   owner-token lease for single-reader-per-consumer.
 - Stateless sugar — `cdc_recent_changes`, `cdc_recent_ddl`,
-  `cdc_schema_diff` — for ad-hoc exploration without creating a consumer.
+  `cdc_schema_diff`, `cdc_range_events`, `cdc_range_ddl`,
+  `cdc_range_changes` — for ad-hoc exploration, bounded replay planning,
+  and export/debug work without moving a consumer cursor.
 - Composed sugar — `cdc_events`, `cdc_changes` — built over the
   primitives, applied with the consumer's subscription routing rules.
-- Observability — `cdc_consumer_stats`, `cdc_audit_recent`.
+- Observability — `cdc_consumer_stats`, `cdc_audit_recent`, `cdc_doctor`.
 - Structured errors and notices: `CDC_GAP`, `CDC_BUSY`,
   `CDC_INCOMPATIBLE_CATALOG`, `CDC_SCHEMA_BOUNDARY`,
   `CDC_WAIT_TIMEOUT_CLAMPED`, `CDC_WAIT_SHARED_CONNECTION` — full list in
   [`docs/errors.md`](./docs/errors.md).
-- Community-extension install: `INSTALL ducklake_cdc FROM community`.
+- Release packaging: tagged GitHub releases, a full DuckDB extension matrix,
+  and a green `duckdb/community-extensions` descriptor PR for `v0.3.2`.
 - DuckDB, SQLite, and PostgreSQL DuckLake catalog smoke coverage in CI.
 - Validated against DuckDB **v1.5.1** and the runtime-installed DuckLake
   extension (see [`docs/development.md`](./docs/development.md)).
-- A bench smoke harness (`bench/runner.py` + `bench/light.yaml`) that
-  reports end-to-end latency, throughput, catalog QPS, and lag drift.
+- A bench smoke harness (`bench/runner.py`, `bench/light.yaml`,
+  `bench/empty-window.yaml`) that reports end-to-end latency, throughput,
+  catalog QPS, empty-window latency, and lag drift.
 
 ## What does *not* work yet
 
@@ -42,8 +47,9 @@ of [DuckLake](https://ducklake.select).
 - **No extension-owned sink failure queue.** Sink retries, idempotency,
   validation, quarantine handling, and exactly-once-ish semantics belong
   in clients and sinks.
-- **No `doctor` command.** Operational diagnostics are still manual SQL
-  via `cdc_consumer_stats` and `cdc_audit_recent`.
+- **Community install is pending upstream merge for `v0.3.2`.** Until
+  `duckdb/community-extensions` merges the descriptor, build locally. After
+  merge, use `INSTALL ducklake_cdc FROM community`.
 - **Performance numbers are early signal.** The light benchmark harness
   exists, but published numbers are not production contracts.
 
@@ -70,7 +76,8 @@ guidance lives in [`docs/development.md`](./docs/development.md).
 
 ```sql
 -- Preconditions: DuckDB v1.5.1 and the official `ducklake`, `parquet`,
--- and `ducklake_cdc` extensions.
+-- and `ducklake_cdc` extensions. `INSTALL ducklake_cdc FROM community`
+-- becomes the normal path once the v0.3.2 community descriptor is merged.
 INSTALL ducklake;
 INSTALL ducklake_cdc FROM community;
 LOAD ducklake;
@@ -128,7 +135,8 @@ SELECT * FROM cdc_wait('lake', 'demo', timeout_ms := 30000);
 
 Operational dashboards read from `cdc_consumer_stats('lake')` (cursor /
 gap / lease columns) and `cdc_audit_recent('lake')` (lifecycle audit
-trail).
+trail). `cdc_doctor('lake')` packages the common read-only health checks
+for SQL users and support reports.
 
 The full primitive + sugar surface, with row shapes and behaviour notes
 per function, is in [`docs/api.md`](./docs/api.md). Known risks and sharp
@@ -163,7 +171,15 @@ rejection flow, not every SQLLogic edge case.
 
 The release flow is described in [`docs/design.md`](./docs/design.md).
 
-Current community release line: `v0.2.0`.
+Current repository release line: `v0.3.2`.
+
+DuckDB community-extension distribution for `v0.3.2` is green and pending
+upstream merge. Once merged, users can install it with:
+
+```sql
+INSTALL ducklake_cdc FROM community;
+LOAD ducklake_cdc;
+```
 
 ## Where to go next
 
