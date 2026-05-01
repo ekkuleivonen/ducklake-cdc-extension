@@ -21,15 +21,15 @@
 
 namespace duckdb_cdc {
 
-// The single supported catalog format version. Probed empirically against
-// the DuckLake commit pinned by DuckDB v1.5.1's bundled extension config.
+// Supported catalog format versions. Probed empirically against the DuckLake
+// extension binaries shipped for the validated DuckDB v1.5.x patch releases.
 // The compatibility check is intentionally narrow: an unrecognised version is
 // loud; a wrong version is silent.
 //
 // Maintenance discipline: when a new DuckLake catalog format is tested
 // against, append the new string to this vector AND add the corresponding
-// row/column to docs/compatibility.md in the same PR.
-const std::vector<std::string> SUPPORTED_DUCKLAKE_CATALOG_VERSIONS = {"0.4"};
+// row/column to docs/development.md in the same PR.
+const std::vector<std::string> SUPPORTED_DUCKLAKE_CATALOG_VERSIONS = {"0.4", "1.0"};
 
 namespace {
 
@@ -75,7 +75,7 @@ std::string BuildIncompatibleMessage(const std::string &catalog_name, const std:
 	    << "' reports catalog format version '" << observed_version << "' but " << EXTENSION_VERSION_LITERAL
 	    << " supports " << SupportedSetForMessage() << ". Either downgrade your DuckLake extension to a version that"
 	    << " writes one of the supported versions, or upgrade ducklake_cdc to a release that supports '"
-	    << observed_version << "'. See docs/compatibility.md for the full matrix.";
+	    << observed_version << "'. See docs/development.md for the full matrix.";
 	return out.str();
 }
 

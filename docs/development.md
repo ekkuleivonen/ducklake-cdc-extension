@@ -12,13 +12,19 @@ The root `Makefile` includes `extension-ci-tools/makefiles/duckdb_extension.Make
 
 ## Supported DuckDB targets
 
-The active development target is **DuckDB v1.5.1**. Keep the version tuple
+The active development target is **DuckDB v1.5.1**, with SQL coverage validated
+across DuckDB **v1.5.0**, **v1.5.1**, and **v1.5.2**. Keep the version tuple
 explicit:
 
 - `duckdb/` submodule: DuckDB `v1.5.1`
 - `extension-ci-tools/` submodule and reusable workflows: `v1.5.1`
 - `extension_config.cmake`: a pinned DuckLake commit known to compile against
   DuckDB `v1.5.1`
+
+Validated 1.5.x DuckLake catalog formats:
+
+- DuckDB `v1.5.0` and `v1.5.1`: DuckLake catalog format `0.4`
+- DuckDB `v1.5.2`: DuckLake catalog format `1.0`
 
 DuckDB extension binaries are version-specific, so "supported" means a full
 tuple has been validated. Do not mark another DuckDB version supported just
