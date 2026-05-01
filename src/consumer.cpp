@@ -120,6 +120,32 @@ std::string ConsumerRowProjection() {
 	       "owner_acquired_at, owner_heartbeat_at, lease_interval_seconds, stop_at_schema_change";
 }
 
+enum class StateBackendKind { DuckDB, SQLite, Postgres, Unknown };
+
+StateBackendKind DetectStateBackend(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto metadata_database = std::string("__ducklake_metadata_") + catalog_name;
+	auto result = conn.Query(
+	    "SELECT type FROM duckdb_databases() WHERE database_name = " + QuoteLiteral(metadata_database) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return StateBackendKind::Unknown;
+	}
+	const auto type = duckdb::StringUtil::Lower(result->GetValue(0, 0).ToString());
+	if (type == "duckdb") {
+		return StateBackendKind::DuckDB;
+	}
+	if (type == "sqlite") {
+		return StateBackendKind::SQLite;
+	}
+	if (type == "postgres" || type == "postgres_scanner") {
+		return StateBackendKind::Postgres;
+	}
+	return StateBackendKind::Unknown;
+}
+
+bool SupportsUpdateReturning(StateBackendKind backend) {
+	return backend == StateBackendKind::DuckDB;
+}
+
 std::string BuildBusyMessage(const std::string &catalog_name, const std::string &consumer_name,
                              const duckdb::Value &owner_token, const duckdb::Value &owner_acquired_at,
                              const duckdb::Value &owner_heartbeat_at, int64_t lease_interval_seconds,
@@ -978,13 +1004,52 @@ bool LeaseExpired(duckdb::Connection &conn, const ConsumerRow &row, int64_t mult
 	       result->GetValue(0, 0).GetValue<bool>();
 }
 
-ConsumerRow TryAcquireLeaseFast(duckdb::Connection &conn, const std::string &catalog_name,
-                                const std::string &consumer_name, const std::string &cached_token) {
+ConsumerRow AcquireLeaseLegacy(duckdb::Connection &conn, const std::string &catalog_name,
+                               const std::string &consumer_name, const std::string &cached_token) {
+	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
+	const auto new_token = GenerateUuid(conn);
+	const auto cached_token_sql = TokenSqlOrNull(cached_token);
+	auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+	const bool expired = LeaseExpired(conn, row);
+	const bool owns_lease =
+	    !row.owner_token.IsNull() && !cached_token.empty() && row.owner_token.ToString() == cached_token;
+	if (!row.owner_token.IsNull() && !expired && !owns_lease) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+	const auto owner_token =
+	    row.owner_token.IsNull() || (expired && !owns_lease) ? new_token : row.owner_token.ToString();
+	if (expired && !owns_lease) {
+		const auto details = "{\"previous_token\":" + JsonValue(row.owner_token) +
+		                     ",\"previous_acquired_at\":" + JsonValue(row.owner_acquired_at) +
+		                     ",\"previous_heartbeat_at\":" + JsonValue(row.owner_heartbeat_at) +
+		                     ",\"lease_interval_seconds\":" + std::to_string(row.lease_interval_seconds) + "}";
+		InsertAuditRow(conn, catalog_name, "lease_force_acquire", consumer_name, row.consumer_id, details);
+	}
+	ExecuteChecked(conn, "UPDATE " + consumers + " SET owner_token = " + TokenSqlOrNull(owner_token) +
+	                         ", owner_acquired_at = CASE WHEN owner_token IS NULL OR epoch(now()) - "
+	                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds THEN "
+	                         "now() ELSE owner_acquired_at::TIMESTAMP WITH TIME ZONE "
+	                         "END, owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
+	                         QuoteLiteral(consumer_name) +
+	                         " AND (owner_token IS NULL OR epoch(now()) - "
+	                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds OR "
+	                         "owner_token = " +
+	                         cached_token_sql + ")");
+	row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+	if (row.owner_token.IsNull() || row.owner_token.ToString() != owner_token) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+	return row;
+}
+
+ConsumerRow AcquireLeaseReturning(duckdb::Connection &conn, const std::string &catalog_name,
+                                  const std::string &consumer_name, const std::string &cached_token) {
 	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
 	const auto cached_token_sql = TokenSqlOrNull(cached_token);
 	auto result =
 	    conn.Query("UPDATE " + consumers +
-	               " SET owner_token = CASE WHEN owner_token IS NULL THEN uuid() ELSE owner_token END, "
+	               " SET owner_token = CASE WHEN owner_token IS NULL THEN CAST(uuid() AS VARCHAR) "
+	               "ELSE CAST(owner_token AS VARCHAR) END, "
 	               "owner_acquired_at = CASE WHEN owner_token IS NULL OR epoch(now()) - "
 	               "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds THEN now() "
 	               "ELSE owner_acquired_at::TIMESTAMP WITH TIME ZONE END, owner_heartbeat_at = now(), updated_at = "
@@ -1003,13 +1068,14 @@ ConsumerRow TryAcquireLeaseFast(duckdb::Connection &conn, const std::string &cat
 
 	const auto previous_token_sql =
 	    TokenSqlOrNull(previous.owner_token.IsNull() ? std::string() : previous.owner_token.ToString());
-	result = conn.Query("UPDATE " + consumers +
-	                    " SET owner_token = uuid(), owner_acquired_at = now(), owner_heartbeat_at = now(), "
-	                    "updated_at = now() WHERE consumer_name = " +
-	                    QuoteLiteral(consumer_name) + " AND owner_token = " + previous_token_sql +
-	                    " AND epoch(now()) - epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > "
-	                    "lease_interval_seconds RETURNING " +
-	                    ConsumerRowProjection());
+	result =
+	    conn.Query("UPDATE " + consumers +
+	               " SET owner_token = CAST(uuid() AS VARCHAR), owner_acquired_at = now(), owner_heartbeat_at = now(), "
+	               "updated_at = now() WHERE consumer_name = " +
+	               QuoteLiteral(consumer_name) + " AND owner_token = " + previous_token_sql +
+	               " AND epoch(now()) - epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > "
+	               "lease_interval_seconds RETURNING " +
+	               ConsumerRowProjection());
 	ThrowIfQueryFailed(result);
 	if (!result || result->RowCount() == 0) {
 		ThrowBusy(conn, catalog_name, consumer_name);
@@ -1022,6 +1088,14 @@ ConsumerRow TryAcquireLeaseFast(duckdb::Connection &conn, const std::string &cat
 	                     ",\"lease_interval_seconds\":" + std::to_string(previous.lease_interval_seconds) + "}";
 	InsertAuditRow(conn, catalog_name, "lease_force_acquire", consumer_name, previous.consumer_id, details);
 	return acquired;
+}
+
+ConsumerRow AcquireLease(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name,
+                         const std::string &cached_token, StateBackendKind backend) {
+	if (SupportsUpdateReturning(backend)) {
+		return AcquireLeaseReturning(conn, catalog_name, consumer_name, cached_token);
+	}
+	return AcquireLeaseLegacy(conn, catalog_name, consumer_name, cached_token);
 }
 
 struct WindowResolution {
@@ -1189,22 +1263,25 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	CheckCatalogOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	const auto backend = DetectStateBackend(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	try {
 		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
-		auto fast_commit = conn.Query(
-		    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
-		    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
-		    " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
-		    " LIMIT 1), owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
-		    QuoteLiteral(data.consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
-		    " AND last_committed_snapshot <= " + std::to_string(data.snapshot_id) + " AND EXISTS (SELECT 1 FROM " +
-		    snapshot_table + " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
-		    ") RETURNING consumer_name, last_committed_snapshot, last_committed_schema_version");
-		ThrowIfQueryFailed(fast_commit);
-		if (fast_commit && fast_commit->RowCount() > 0) {
-			return {fast_commit->GetValue(0, 0), fast_commit->GetValue(1, 0), fast_commit->GetValue(2, 0)};
+		if (SupportsUpdateReturning(backend)) {
+			auto fast_commit = conn.Query(
+			    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
+			    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
+			    " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
+			    " LIMIT 1), owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
+			    QuoteLiteral(data.consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
+			    " AND last_committed_snapshot <= " + std::to_string(data.snapshot_id) + " AND EXISTS (SELECT 1 FROM " +
+			    snapshot_table + " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
+			    ") RETURNING consumer_name, last_committed_snapshot, last_committed_schema_version");
+			ThrowIfQueryFailed(fast_commit);
+			if (fast_commit && fast_commit->RowCount() > 0) {
+				return {fast_commit->GetValue(0, 0), fast_commit->GetValue(1, 0), fast_commit->GetValue(2, 0)};
+			}
 		}
 
 		auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
@@ -1746,9 +1823,10 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	}
 
 	duckdb::Connection conn(*context.db);
+	const auto backend = DetectStateBackend(conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	try {
-		auto row = TryAcquireLeaseFast(conn, data.catalog_name, data.consumer_name, cached_token);
+		auto row = AcquireLease(conn, data.catalog_name, data.consumer_name, cached_token, backend);
 		const auto last_snapshot = row.last_committed_snapshot;
 		const auto stop_at_schema_change = row.stop_at_schema_change;
 		const auto owner_token = row.owner_token.ToString();
