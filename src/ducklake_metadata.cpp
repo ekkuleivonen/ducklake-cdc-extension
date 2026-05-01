@@ -502,4 +502,24 @@ void RowScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 	output.SetCardinality(count);
 }
 
+void MaterializedResultScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input,
+                                   duckdb::DataChunk &output) {
+	auto &state = input.global_state->Cast<MaterializedResultScanState>();
+	if (!state.result || state.offset >= state.result->RowCount()) {
+		return;
+	}
+	duckdb::idx_t count = 0;
+	while (state.offset < state.result->RowCount() && count < STANDARD_VECTOR_SIZE) {
+		if (state.result->ColumnCount() != output.ColumnCount()) {
+			throw duckdb::InternalException("Unaligned materialized query result in table function result");
+		}
+		for (duckdb::idx_t col = 0; col < state.result->ColumnCount(); ++col) {
+			output.SetValue(col, count, state.result->GetValue(col, state.offset));
+		}
+		state.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 } // namespace duckdb_cdc

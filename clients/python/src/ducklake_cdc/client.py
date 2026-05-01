@@ -117,6 +117,8 @@ class CDCClient:
         table_id: int | None = None,
         table_name: str | None = None,
         max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
     ) -> Result:
         return self._table(
             "cdc_changes",
@@ -125,6 +127,8 @@ class CDCClient:
                 "table_id": table_id,
                 "table_name": table_name,
                 "max_snapshots": max_snapshots,
+                "start_snapshot": start_snapshot,
+                "end_snapshot": end_snapshot,
             },
         )
 
@@ -135,6 +139,8 @@ class CDCClient:
         table_id: int | None = None,
         table_name: str | None = None,
         max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
     ) -> list[ChangeRow]:
         return [
             ChangeRow.from_row(row)
@@ -143,6 +149,8 @@ class CDCClient:
                 table_id=table_id,
                 table_name=table_name,
                 max_snapshots=max_snapshots,
+                start_snapshot=start_snapshot,
+                end_snapshot=end_snapshot,
             ).list()
         ]
 

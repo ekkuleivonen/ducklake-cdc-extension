@@ -164,6 +164,21 @@ SELECT count(*) FROM cdc_changes('lake', 'orders_consumer', 'orders');
 ----
 4
 
+# Fast path: callers that already opened a window can pass the resolved
+# snapshot range to cdc_changes so it does not acquire/resolve the same
+# window again. In this fixture snapshots 2 and 3 are the INSERT and UPDATE
+# commits after the consumer started at the CREATE TABLE snapshot.
+query I
+SELECT count(*) FROM cdc_changes(
+  'lake',
+  'orders_consumer',
+  'orders',
+  start_snapshot := 2,
+  end_snapshot := 3
+);
+----
+4
+
 # The schema includes the table's user columns plus our extra columns
 # (snapshot_time, author, commit_message, commit_extra_info, next_snapshot_id).
 query III

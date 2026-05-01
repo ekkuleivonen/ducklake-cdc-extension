@@ -137,6 +137,8 @@ def iter_consumer_batches(
                 consumer_name,
                 table_name=table_name,
                 max_snapshots=max_snapshots,
+                start_snapshot=window.start_snapshot,
+                end_snapshot=window.end_snapshot,
             )
             changes = _timed_retry(stats, "cdc_changes", retry, changes_operation)
             consumed_ns = time.monotonic_ns()

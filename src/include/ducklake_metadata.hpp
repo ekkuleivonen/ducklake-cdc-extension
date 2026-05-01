@@ -22,6 +22,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 #include <string>
 #include <unordered_set>
@@ -154,5 +155,16 @@ struct RowScanState : public duckdb::GlobalTableFunctionState {
 };
 
 void RowScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input, duckdb::DataChunk &output);
+
+//! Result-backed scan glue for table functions that already run an inner
+//! DuckDB query. This avoids copying the entire MaterializedQueryResult into
+//! RowScanState before DuckDB asks the table function for output chunks.
+struct MaterializedResultScanState : public duckdb::GlobalTableFunctionState {
+	duckdb::unique_ptr<duckdb::MaterializedQueryResult> result;
+	duckdb::idx_t offset = 0;
+};
+
+void MaterializedResultScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input,
+                                   duckdb::DataChunk &output);
 
 } // namespace duckdb_cdc
