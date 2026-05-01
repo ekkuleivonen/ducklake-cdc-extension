@@ -386,10 +386,12 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: git push origin "refs/tags/$VERSION"
 
-      - name: Create or fast-forward maintenance branch
+      - name: Create or propose maintenance branch update
         if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH"
@@ -397,8 +399,18 @@ jobs:
               echo "::error::Maintenance branch $BRANCH cannot be fast-forwarded to this release commit."
               exit 1
             fi
-            git push origin "HEAD:refs/heads/$BRANCH"
-            echo "Fast-forwarded maintenance branch $BRANCH to $GITHUB_SHA."
+            update_branch="automation/${BRANCH//\//-}-$VERSION"
+            git push --force-with-lease origin "HEAD:refs/heads/$update_branch"
+            if gh pr list --base "$BRANCH" --head "$update_branch" --state open --json number --jq '.[0].number // empty' | grep -q .; then
+              echo "Maintenance branch update PR already exists for $update_branch -> $BRANCH."
+            else
+              gh pr create \
+                --base "$BRANCH" \
+                --head "$update_branch" \
+                --title "Fast-forward $BRANCH to $VERSION" \
+                --body "Release $VERSION was cut from \`$GITHUB_SHA\`. This PR fast-forwards \`$BRANCH\` to the released commit because the branch is protected and must be updated through a pull request."
+            fi
+            echo "Opened or reused maintenance branch PR for $BRANCH -> $GITHUB_SHA."
           else
             git push origin "HEAD:refs/heads/$BRANCH"
             echo "Created maintenance branch $BRANCH at $GITHUB_SHA."
