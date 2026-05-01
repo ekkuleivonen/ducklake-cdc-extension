@@ -460,7 +460,7 @@ jobs:
   community-pr:
     name: Open community-extensions PR
     needs: release
-    if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' && inputs.skip_community_pr != true && inputs.skip_community_pr != 'true' }}
+    if: ${{ always() && needs.release.result == 'success' && github.event.inputs.dry_run != 'true' && github.event.inputs.skip_community_pr != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check community bot token is configured
