@@ -39,6 +39,8 @@ class FakeCDC:
         *,
         table_name: str,
         max_snapshots: int,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
     ) -> list[ChangeRow]:
         self.calls.append(f"changes:{name}:{table_name}:{max_snapshots}")
         if table_name != "main.orders":
@@ -48,7 +50,8 @@ class FakeCDC:
                 snapshot_id=42,
                 rowid=1,
                 change_type=ChangeType.INSERT,
-                values={"id": 1, "produced_ns": 1},
+                snapshot_time=self.now,
+                values={"id": 1, "produced_ns": 1, "produced_epoch_ns": 1},
             )
         ]
 
@@ -67,11 +70,16 @@ class LoopStats:
         self.table_counts: list[int] = []
         self.change_counts: list[tuple[str | None, int]] = []
         self.commits = 0
-        self.latencies: list[object] = []
+        self.consumers: list[str] = []
+        self.observations: list[tuple[object, str | None, object | None]] = []
+        self.latencies: list[tuple[object, object, object]] = []
 
     def record_operation(self, name: str, elapsed_ms: float) -> None:
         assert elapsed_ms >= 0
         self.operations.append(name)
+
+    def record_consumer(self, consumer_name: str) -> None:
+        self.consumers.append(consumer_name)
 
     def record_wait(self, *, has_snapshot: bool) -> None:
         self.waits.append(has_snapshot)
@@ -94,9 +102,32 @@ class LoopStats:
     def record_commit(self) -> None:
         self.commits += 1
 
+    def record_change_observation(
+        self,
+        *,
+        change_type: object,
+        table_name: str | None = None,
+        values: object | None = None,
+    ) -> None:
+        self.observations.append((change_type, table_name, values))
+
     def record_latency(self, produced_ns: object, *, consumed_ns: int | None = None) -> None:
         assert consumed_ns is not None
-        self.latencies.append(produced_ns)
+        self.latencies.append((produced_ns, None, None))
+
+    def record_change_latency(
+        self,
+        *,
+        change_type: object,
+        produced_ns: object,
+        produced_epoch_ns: object,
+        snapshot_time: object,
+        consumed_ns: int | None = None,
+        consumed_epoch_ns: int | None = None,
+    ) -> None:
+        assert consumed_ns is not None
+        assert consumed_epoch_ns is not None
+        self.latencies.append((produced_ns, produced_epoch_ns, snapshot_time))
 
 
 def test_iter_consumer_batches_yields_committed_batch() -> None:
@@ -141,7 +172,11 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
     assert stats.table_counts == [2]
     assert stats.change_counts == [("main.orders", 1), ("main.users", 0)]
     assert stats.commits == 1
-    assert stats.latencies == [1]
+    assert stats.consumers == ["orders_sink"]
+    assert stats.observations == [
+        (ChangeType.INSERT, "main.orders", {"id": 1, "produced_ns": 1, "produced_epoch_ns": 1})
+    ]
+    assert stats.latencies == [(1, 1, wait_cdc.now)]
     assert "cdc_window_processing" in stats.operations
 
 

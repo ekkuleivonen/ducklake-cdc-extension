@@ -56,41 +56,45 @@ def main() -> None:
     stats = DemoStats()
 
     try:
-        cdc = CDCClient(lake)
-        cdc.load_extension(path=_local_extension_path())
-        ensure_consumer(cdc, start_at=args.start_at)
+        try:
+            cdc = CDCClient(lake)
+            cdc.load_extension(path=_local_extension_path())
+            ensure_consumer(cdc, start_at=args.start_at)
 
-        wait_lake = open_demo_lake(
-            allow_unsigned_extensions=True,
-            catalog=args.catalog,
-            catalog_backend=args.catalog_backend,
-            storage=args.storage,
-        )
-        wait_cdc = CDCClient(wait_lake)
-        wait_cdc.load_extension(path=_local_extension_path())
+            wait_lake = open_demo_lake(
+                allow_unsigned_extensions=True,
+                catalog=args.catalog,
+                catalog_backend=args.catalog_backend,
+                storage=args.storage,
+            )
+            wait_cdc = CDCClient(wait_lake)
+            wait_cdc.load_extension(path=_local_extension_path())
 
-        if args.output_mode == "stdout":
-            print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
-        for batch in stream_changes(
-            cdc,
-            wait_cdc,
-            lake,
-            timeout_ms=args.timeout_ms,
-            max_snapshots=args.max_snapshots,
-            max_windows=args.max_windows,
-            idle_timeout=args.idle_timeout,
-            stats=stats,
-        ):
             if args.output_mode == "stdout":
-                print_batch(batch)
-    except KeyboardInterrupt:
-        pass
+                print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
+            for batch in stream_changes(
+                cdc,
+                wait_cdc,
+                lake,
+                timeout_ms=args.timeout_ms,
+                max_snapshots=args.max_snapshots,
+                max_windows=args.max_windows,
+                idle_timeout=args.idle_timeout,
+                stats=stats,
+            ):
+                if args.output_mode == "stdout":
+                    print_batch(batch)
+        except KeyboardInterrupt:
+            pass
+        except Exception as exc:
+            stats.record_error(exc)
+            raise
     finally:
         if wait_lake is not None:
             wait_lake.close()
         lake.close()
-    stats.finish()
-    emit_summary(stats, output=args.summary_output)
+        stats.finish()
+        emit_summary(stats, output=args.summary_output)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

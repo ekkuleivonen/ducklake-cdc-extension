@@ -130,6 +130,13 @@ std::string ConsumerRowProjection() {
 
 enum class StateBackendKind { DuckDB, SQLite, Postgres, Unknown };
 
+std::mutex BACKEND_CACHE_MUTEX;
+std::unordered_map<std::string, StateBackendKind> BACKEND_CACHE;
+
+std::string BackendCacheKey(duckdb::ClientContext &context, const std::string &catalog_name) {
+	return std::to_string(context.GetConnectionId()) + ":" + catalog_name;
+}
+
 StateBackendKind DetectStateBackend(duckdb::Connection &conn, const std::string &catalog_name) {
 	const auto metadata_database = std::string("__ducklake_metadata_") + catalog_name;
 	auto result = conn.Query(
@@ -148,6 +155,25 @@ StateBackendKind DetectStateBackend(duckdb::Connection &conn, const std::string 
 		return StateBackendKind::Postgres;
 	}
 	return StateBackendKind::Unknown;
+}
+
+StateBackendKind CachedStateBackend(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                    const std::string &catalog_name) {
+	const auto key = BackendCacheKey(context, catalog_name);
+	{
+		std::lock_guard<std::mutex> guard(BACKEND_CACHE_MUTEX);
+		auto entry = BACKEND_CACHE.find(key);
+		if (entry != BACKEND_CACHE.end()) {
+			return entry->second;
+		}
+	}
+
+	const auto backend = DetectStateBackend(conn, catalog_name);
+	if (backend != StateBackendKind::Unknown) {
+		std::lock_guard<std::mutex> guard(BACKEND_CACHE_MUTEX);
+		BACKEND_CACHE[key] = backend;
+	}
+	return backend;
 }
 
 bool SupportsUpdateReturning(StateBackendKind backend) {
@@ -1096,6 +1122,25 @@ ConsumerRow AcquireLease(duckdb::Connection &conn, const std::string &catalog_na
 	return AcquireLeaseLegacy(conn, catalog_name, consumer_name, cached_token);
 }
 
+bool TryUseFreshCachedLease(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name,
+                            const std::string &cached_token, ConsumerRow &row) {
+	if (cached_token.empty()) {
+		return false;
+	}
+	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
+	auto result = conn.Query("SELECT " + ConsumerRowProjection() + " FROM " + consumers + " WHERE consumer_name = " +
+	                         QuoteLiteral(consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
+	                         " AND owner_heartbeat_at IS NOT NULL AND epoch(now()) - "
+	                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) < "
+	                         "lease_interval_seconds / 4.0 LIMIT 1");
+	ThrowIfQueryFailed(result);
+	if (!result || result->RowCount() == 0) {
+		return false;
+	}
+	row = ConsumerRowFromResult(*result, 0);
+	return true;
+}
+
 struct WindowResolution {
 	int64_t current_snapshot;
 	duckdb::Value oldest_snapshot;
@@ -1266,7 +1311,7 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	CheckCatalogOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
-	const auto backend = DetectStateBackend(conn, data.catalog_name);
+	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
@@ -1818,9 +1863,12 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	}
 
 	duckdb::Connection conn(*context.db);
-	const auto backend = DetectStateBackend(conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
-	auto row = AcquireLease(conn, data.catalog_name, data.consumer_name, cached_token, backend);
+	ConsumerRow row;
+	if (!TryUseFreshCachedLease(conn, data.catalog_name, data.consumer_name, cached_token, row)) {
+		const auto backend = CachedStateBackend(context, conn, data.catalog_name);
+		row = AcquireLease(conn, data.catalog_name, data.consumer_name, cached_token, backend);
+	}
 	const auto last_snapshot = row.last_committed_snapshot;
 	const auto stop_at_schema_change = row.stop_at_schema_change;
 	const auto owner_token = row.owner_token.ToString();
@@ -1880,9 +1928,8 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		end_schema_version_for_notice =
 		    RequiredInt64(has_changes ? resolved.end_schema_version : resolved.last_schema_version, "schema_version");
 	}
-	// Emit the CDC_SCHEMA_BOUNDARY notice after COMMIT so a downstream
-	// caller's logging side-effect can never roll back the metadata
-	// write the lease UPDATE just landed.
+	// Emit the CDC_SCHEMA_BOUNDARY notice after window resolution so callers
+	// see the boundary before deciding which DDL/DML paths to drain.
 	if (schema_changes_pending && boundary_next_snapshot != -1 &&
 	    end_schema_version_for_notice != RequiredInt64(boundary_next_schema_version, "schema_version")) {
 		EmitSchemaBoundaryNotice(data.consumer_name, has_changes ? end_snapshot : last_snapshot,

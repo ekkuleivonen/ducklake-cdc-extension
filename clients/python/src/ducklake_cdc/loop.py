@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Protocol, TypeVar
@@ -25,6 +25,8 @@ class ConsumerLoopStats(Protocol):
 
     def record_operation(self, name: str, elapsed_ms: float) -> None: ...
 
+    def record_consumer(self, consumer_name: str) -> None: ...
+
     def record_wait(self, *, has_snapshot: bool) -> None: ...
 
     def record_window(self, *, has_changes: bool) -> None: ...
@@ -39,7 +41,26 @@ class ConsumerLoopStats(Protocol):
 
     def record_commit(self) -> None: ...
 
+    def record_change_observation(
+        self,
+        *,
+        change_type: object,
+        table_name: str | None = None,
+        values: Mapping[str, object] | None = None,
+    ) -> None: ...
+
     def record_latency(self, produced_ns: object, *, consumed_ns: int | None = None) -> None: ...
+
+    def record_change_latency(
+        self,
+        *,
+        change_type: object,
+        produced_ns: object,
+        produced_epoch_ns: object,
+        snapshot_time: object,
+        consumed_ns: int | None = None,
+        consumed_epoch_ns: int | None = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -89,6 +110,8 @@ def iter_consumer_batches(
     table_resolver = _table_resolver(lake=lake, table_names=table_names)
     committed_windows = 0
     last_activity = time.monotonic()
+    if stats is not None:
+        stats.record_consumer(consumer_name)
 
     while True:
         wait = _timed(
@@ -142,10 +165,23 @@ def iter_consumer_batches(
             )
             changes = _timed_retry(stats, "cdc_changes", retry, changes_operation)
             consumed_ns = time.monotonic_ns()
+            consumed_epoch_ns = time.time_ns()
             if stats is not None:
                 stats.record_changes(len(changes), table_name=table_name)
                 for change in changes:
-                    stats.record_latency(change.values.get("produced_ns"), consumed_ns=consumed_ns)
+                    stats.record_change_observation(
+                        change_type=change.change_type,
+                        table_name=table_name,
+                        values=change.values,
+                    )
+                    stats.record_change_latency(
+                        change_type=change.change_type,
+                        produced_ns=change.values.get("produced_ns"),
+                        produced_epoch_ns=change.values.get("produced_epoch_ns"),
+                        snapshot_time=change.snapshot_time,
+                        consumed_ns=consumed_ns,
+                        consumed_epoch_ns=consumed_epoch_ns,
+                    )
             table_changes.append(TableChangeBatch(table_name=table_name, changes=changes))
 
         processing_ms = (time.perf_counter() - processing_started) * 1000.0

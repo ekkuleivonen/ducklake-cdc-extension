@@ -6,6 +6,7 @@ import argparse
 import random
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -62,6 +63,7 @@ class Args:
     profile: str
     batch_min: int
     batch_max: int
+    workers: int
     reset: bool
     catalog: str | None
     catalog_backend: str | None
@@ -91,7 +93,7 @@ def main() -> None:
         print(
             "producer demo: "
             f"{len(tables)} tables, {len(actions)} actions, {len(batches)} commits, "
-            f"{args.duration:g}s {args.profile}"
+            f"{args.duration:g}s {args.profile}, {args.workers} worker(s)"
         )
         run_batches(lake, batches, args)
     finally:
@@ -109,6 +111,15 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
     parser.add_argument("--profile", choices=("flat", "ramp", "variate"), default="flat")
     parser.add_argument("--batch_min", type=positive_int, default=1)
     parser.add_argument("--batch_max", type=positive_int, default=10)
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=1,
+        help=(
+            "number of concurrent producer workers. Values >1 produce inserts, "
+            "updates, then deletes in separate dependency-safe phases"
+        ),
+    )
     parser.add_argument(
         "--reset",
         action="store_true",
@@ -143,6 +154,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         profile=namespace.profile,
         batch_min=namespace.batch_min,
         batch_max=namespace.batch_max,
+        workers=namespace.workers,
         reset=namespace.reset,
         catalog=namespace.catalog,
         catalog_backend=namespace.catalog_backend,
@@ -168,7 +180,15 @@ def create_layout(lake: DuckLake, args: Args) -> list[TableRef]:
                     updated_count INTEGER,
                     deleted BOOLEAN,
                     produced_ns BIGINT,
-                    action_seq BIGINT
+                    produced_epoch_ns BIGINT,
+                    action_seq BIGINT,
+                    benchmark_profile VARCHAR,
+                    benchmark_duration_s DOUBLE,
+                    benchmark_schemas INTEGER,
+                    benchmark_tables INTEGER,
+                    benchmark_workers INTEGER,
+                    benchmark_update_percent DOUBLE,
+                    benchmark_delete_percent DOUBLE
                 )
                 """
             )
@@ -235,10 +255,14 @@ def build_batches(actions: list[Action], args: Args, rng: random.Random) -> list
 
 
 def run_batches(lake: DuckLake, batches: list[list[Action]], args: Args) -> None:
+    if args.workers > 1:
+        run_batches_concurrent(batches, args)
+        return
+
     gaps = schedule_gaps(len(batches), args)
     start = time.monotonic()
     for idx, batch in enumerate(batches):
-        apply_batch(lake, batch)
+        apply_batch(lake, batch, args)
         print(f"commit {idx + 1}/{len(batches)}: {len(batch)} actions")
         if idx < len(gaps):
             time.sleep(gaps[idx])
@@ -246,49 +270,204 @@ def run_batches(lake: DuckLake, batches: list[list[Action]], args: Args) -> None
     print(f"producer demo: completed in {elapsed:.2f}s")
 
 
+def run_batches_concurrent(batches: list[list[Action]], args: Args) -> None:
+    start = time.monotonic()
+    phase_batches_by_kind = {
+        phase: batches_for_phase(batches, phase)
+        for phase in ("insert", "update", "delete")
+    }
+    total_commits = sum(len(phase_batches) for phase_batches in phase_batches_by_kind.values())
+    for phase in ("insert", "update", "delete"):
+        phase_batches = phase_batches_by_kind[phase]
+        if not phase_batches:
+            continue
+        phase_duration = (
+            args.duration * len(phase_batches) / total_commits
+            if total_commits > 0
+            else 0.0
+        )
+        run_phase_concurrent(phase, phase_batches, args, duration=phase_duration)
+    elapsed = time.monotonic() - start
+    print(f"producer demo: completed {total_commits} commits in {elapsed:.2f}s")
+
+
+def run_phase_concurrent(
+    phase: str, batches: list[list[Action]], args: Args, *, duration: float
+) -> None:
+    worker_batches = split_batches_for_phase(batches, phase, args.workers)
+    worker_count = len(worker_batches)
+    print(
+        f"producer demo: {phase} phase, {len(batches)} commits, "
+        f"{worker_count} worker(s), {duration:.2f}s target"
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                run_worker_batches,
+                assigned_batches,
+                args,
+                duration=duration,
+            )
+            for assigned_batches in worker_batches
+            if assigned_batches
+        ]
+        completed = 0
+        for future in as_completed(futures):
+            completed += future.result()
+            print(f"producer demo: {phase} phase progress {completed}/{len(batches)} commits")
+
+
+def run_worker_batches(
+    batches: list[list[Action]], args: Args, *, duration: float
+) -> int:
+    lake = open_demo_lake(
+        catalog=args.catalog,
+        catalog_backend=args.catalog_backend,
+        storage=args.storage,
+    )
+    try:
+        gaps = schedule_gaps_for_count(len(batches), duration, args.profile)
+        for idx, batch in enumerate(batches):
+            apply_batch(lake, batch, args)
+            if idx < len(gaps):
+                time.sleep(gaps[idx])
+        return len(batches)
+    finally:
+        lake.close()
+
+
+def batches_for_phase(batches: list[list[Action]], phase: str) -> list[list[Action]]:
+    phase_batches: list[list[Action]] = []
+    for batch in batches:
+        current: list[Action] = []
+        for action in batch:
+            if action.kind != phase:
+                if current:
+                    phase_batches.append(current)
+                    current = []
+                continue
+            current.append(action)
+        if current:
+            phase_batches.append(current)
+    return phase_batches
+
+
+def split_batches(batches: list[list[Action]], worker_count: int) -> list[list[list[Action]]]:
+    worker_batches: list[list[list[Action]]] = [[] for _ in range(worker_count)]
+    for idx, batch in enumerate(batches):
+        worker_batches[idx % worker_count].append(batch)
+    return worker_batches
+
+
+def split_batches_for_phase(
+    batches: list[list[Action]], phase: str, requested_workers: int
+) -> list[list[list[Action]]]:
+    if phase == "insert":
+        return split_batches(batches, min(requested_workers, len(batches)))
+
+    table_groups: dict[TableRef, list[list[Action]]] = {}
+    for batch in batches:
+        if not batch:
+            continue
+        table_groups.setdefault(batch[0].table, []).append(batch)
+    if not table_groups:
+        return []
+
+    worker_count = min(requested_workers, len(table_groups))
+    worker_batches: list[list[list[Action]]] = [[] for _ in range(worker_count)]
+    for idx, group in enumerate(table_groups.values()):
+        worker_batches[idx % worker_count].extend(group)
+    return [assigned for assigned in worker_batches if assigned]
+
+
 def schedule_gaps(batch_count: int, args: Args) -> list[float]:
-    if batch_count <= 1 or args.duration <= 0:
+    return schedule_gaps_for_count(batch_count, args.duration, args.profile)
+
+
+def schedule_gaps_for_count(batch_count: int, duration: float, profile: str) -> list[float]:
+    if batch_count <= 1 or duration <= 0:
         return [0.0] * max(batch_count - 1, 0)
 
     gap_count = batch_count - 1
-    if args.profile == "flat":
+    if profile == "flat":
         weights = [1.0] * gap_count
-    elif args.profile == "ramp":
+    elif profile == "ramp":
         weights = [float(gap_count - idx) for idx in range(gap_count)]
     else:
         rng = random.Random(RANDOM_SEED + 1)
         weights = [rng.uniform(0.25, 1.75) for _ in range(gap_count)]
 
     total_weight = sum(weights)
-    return [args.duration * weight / total_weight for weight in weights]
+    return [duration * weight / total_weight for weight in weights]
 
 
-def apply_batch(lake: DuckLake, batch: list[Action]) -> None:
+def apply_batch(lake: DuckLake, batch: list[Action], args: Args) -> None:
+    retry_count = 0
     while True:
         try:
             with lake.transaction() as tx:
                 for action in batch:
-                    apply_action(tx, action)
+                    apply_action(tx, action, args)
             return
         except DuckLakeError as exc:
-            if not is_database_locked(exc):
+            if not is_transient_ducklake_conflict(exc):
                 raise
-            time.sleep(0.2)
+            retry_count += 1
+            time.sleep(min(0.2 * retry_count, 2.0))
 
 
-def apply_action(lake: SqlRunner, action: Action) -> None:
+def is_transient_ducklake_conflict(exc: BaseException) -> bool:
+    if is_database_locked(exc):
+        return True
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "transaction conflict" in message or "failed to commit ducklake transaction" in message:
+            return True
+        current = current.__cause__
+    return False
+
+
+def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
     if action.kind == "insert":
+        produced_ns = time.monotonic_ns()
+        produced_epoch_ns = time.time_ns()
         lake.sql(
             f"""
             INSERT INTO {action.table.qualified}
-            VALUES ($id, $payload, 0, false, $produced_ns, $action_seq)
+            VALUES (
+                $id,
+                $payload,
+                0,
+                false,
+                $produced_ns,
+                $produced_epoch_ns,
+                $action_seq,
+                $benchmark_profile,
+                $benchmark_duration_s,
+                $benchmark_schemas,
+                $benchmark_tables,
+                $benchmark_workers,
+                $benchmark_update_percent,
+                $benchmark_delete_percent
+            )
             """,
             id=action.row_id,
             payload=action.payload,
-            produced_ns=time.monotonic_ns(),
+            produced_ns=produced_ns,
+            produced_epoch_ns=produced_epoch_ns,
             action_seq=action.action_seq,
+            benchmark_profile=args.profile,
+            benchmark_duration_s=args.duration,
+            benchmark_schemas=args.schemas,
+            benchmark_tables=args.tables,
+            benchmark_workers=args.workers,
+            benchmark_update_percent=args.update,
+            benchmark_delete_percent=args.delete,
         ).list()
     elif action.kind == "update":
+        produced_ns = time.monotonic_ns()
+        produced_epoch_ns = time.time_ns()
         lake.sql(
             f"""
             UPDATE {action.table.qualified}
@@ -296,13 +475,29 @@ def apply_action(lake: SqlRunner, action: Action) -> None:
                 payload = $payload,
                 updated_count = updated_count + 1,
                 produced_ns = $produced_ns,
-                action_seq = $action_seq
+                produced_epoch_ns = $produced_epoch_ns,
+                action_seq = $action_seq,
+                benchmark_profile = $benchmark_profile,
+                benchmark_duration_s = $benchmark_duration_s,
+                benchmark_schemas = $benchmark_schemas,
+                benchmark_tables = $benchmark_tables,
+                benchmark_workers = $benchmark_workers,
+                benchmark_update_percent = $benchmark_update_percent,
+                benchmark_delete_percent = $benchmark_delete_percent
             WHERE id = $id
             """,
             id=action.row_id,
             payload=action.payload,
-            produced_ns=time.monotonic_ns(),
+            produced_ns=produced_ns,
+            produced_epoch_ns=produced_epoch_ns,
             action_seq=action.action_seq,
+            benchmark_profile=args.profile,
+            benchmark_duration_s=args.duration,
+            benchmark_schemas=args.schemas,
+            benchmark_tables=args.tables,
+            benchmark_workers=args.workers,
+            benchmark_update_percent=args.update,
+            benchmark_delete_percent=args.delete,
         ).list()
     elif action.kind == "delete":
         lake.sql(f"DELETE FROM {action.table.qualified} WHERE id = $id", id=action.row_id).list()

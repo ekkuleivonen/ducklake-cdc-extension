@@ -94,9 +94,10 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 //! defaulting to `DEFAULT_MAX_SNAPSHOTS` when omitted.
 int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input);
 
-//! Run the cdc_window state machine: acquire/extend the consumer's lease,
-//! compute the visible `[start_snapshot, end_snapshot]` range under the
-//! consumer's `stop_at_schema_change` policy, and emit a
+//! Run the cdc_window state machine: reuse a fresh cached lease or
+//! acquire/extend the consumer's lease, compute the visible
+//! `[start_snapshot, end_snapshot]` range under the consumer's
+//! `stop_at_schema_change` policy, and emit a
 //! `CDC_SCHEMA_BOUNDARY` notice if the window straddles a DDL boundary.
 //! Returns the row payload `[start_snapshot, end_snapshot, has_changes,
 //! schema_version, schema_changes_pending]` callers can index directly.
