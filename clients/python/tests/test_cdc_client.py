@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from ducklake import DuckLake
-from ducklake_cdc import CDCClient, Subscription
+from ducklake_cdc import CDCClient
 
 
 class FakeResult:
@@ -63,27 +63,17 @@ def test_client_load_extension_accepts_local_path() -> None:
     assert lake.connection.calls == ["LOAD '/tmp/ducklake_cdc.duckdb_extension'"]
 
 
-def test_consumer_create_returns_subscription_models_and_renders_sql() -> None:
+def test_dml_consumer_create_returns_subscription_models_and_renders_sql() -> None:
     lake = FakeLake()
     cdc = CDCClient(cast(DuckLake, lake))
-    subscription = Subscription.model_validate(
-        {
-            "scope_kind": "table",
-            "schema_name": "main",
-            "table_name": "orders",
-            "event_category": "dml",
-            "change_type": "*",
-        }
-    )
     expected_sql = (
-        "SELECT * FROM cdc_consumer_create('lake', 'orders_sink', start_at := 'now', "
-        "subscriptions := [struct_pack(scope_kind := 'table', schema_name := 'main', "
-        "table_name := 'orders', schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
-        "event_category := 'dml', change_type := '*')], stop_at_schema_change := true)"
+        "SELECT * FROM cdc_dml_consumer_create('lake', 'orders_sink', start_at := 'now', "
+        "table_names := ['orders'], change_types := ['insert'])"
     )
     lake.results[expected_sql] = [
         {
             "consumer_name": "orders_sink",
+            "consumer_kind": "dml",
             "consumer_id": 1,
             "last_committed_snapshot": 7,
             "subscription_id": 1,
@@ -91,13 +81,13 @@ def test_consumer_create_returns_subscription_models_and_renders_sql() -> None:
             "schema_id": 0,
             "table_id": 5,
             "event_category": "dml",
-            "change_type": "*",
+            "change_type": "insert",
             "original_qualified_name": "main.orders",
             "current_qualified_name": "main.orders",
         }
     ]
 
-    rows = cdc.consumer_create("orders_sink", subscriptions=[subscription])
+    rows = cdc.dml_consumer_create("orders_sink", table_names=["orders"], change_types=["insert"])
 
     assert lake.calls == [expected_sql]
     assert rows[0].consumer_name == "orders_sink"
@@ -137,7 +127,7 @@ def test_dynamic_change_methods_return_result_or_change_rows() -> None:
     lake = FakeLake()
     cdc = CDCClient(cast(DuckLake, lake))
     expected_sql = (
-        "SELECT * FROM cdc_changes('lake', 'orders_sink', table_name := 'orders', "
+		"SELECT * FROM cdc_dml_table_changes_read('lake', 'orders_sink', table_name := 'orders', "
         "max_snapshots := 100)"
     )
     lake.results[expected_sql] = [
@@ -152,8 +142,8 @@ def test_dynamic_change_methods_return_result_or_change_rows() -> None:
         }
     ]
 
-    result = cdc.changes("orders_sink", table_name="orders")
-    changes = cdc.changes_rows("orders_sink", table_name="orders")
+    result = cdc.dml_table_changes_read("orders_sink", table_name="orders")
+    changes = cdc.dml_table_changes_read_rows("orders_sink", table_name="orders")
 
     assert result.list()[0]["status"] == "paid"
     assert changes[0].values == {"id": 2, "status": "paid"}

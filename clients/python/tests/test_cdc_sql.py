@@ -1,33 +1,20 @@
-from ducklake_cdc import Subscription
 from ducklake_cdc.sql import table_function_sql
 
 
-def test_subscription_list_renders_duckdb_struct_pack() -> None:
+def test_named_list_arguments_render_duckdb_literals() -> None:
     sql = table_function_sql(
-        "cdc_consumer_create",
+        "cdc_dml_consumer_create",
         "lake",
         "orders_sink",
         named={
-            "subscriptions": [
-                Subscription.model_validate(
-                    {
-                        "scope_kind": "table",
-                        "schema_name": "main",
-                        "table_name": "orders",
-                        "event_category": "dml",
-                        "change_type": "*",
-                    }
-                )
-            ],
-            "stop_at_schema_change": True,
+            "table_names": ["orders"],
+            "change_types": ["insert", "delete"],
         },
     )
 
     assert sql == (
-        "SELECT * FROM cdc_consumer_create('lake', 'orders_sink', "
-        "subscriptions := [struct_pack(scope_kind := 'table', schema_name := 'main', "
-        "table_name := 'orders', schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
-        "event_category := 'dml', change_type := '*')], stop_at_schema_change := true)"
+        "SELECT * FROM cdc_dml_consumer_create('lake', 'orders_sink', "
+        "table_names := ['orders'], change_types := ['insert', 'delete'])"
     )
 
 

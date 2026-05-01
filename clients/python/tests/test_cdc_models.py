@@ -3,9 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-import pytest
-from pydantic import ValidationError
-
 from ducklake_cdc import (
     AuditEntry,
     ChangeRow,
@@ -16,44 +13,14 @@ from ducklake_cdc import (
     DdlEvent,
     DoctorDiagnostic,
     SnapshotEvent,
-    Subscription,
 )
-
-
-def test_subscription_validates_scope_and_ddl_change_type() -> None:
-    subscription = Subscription.model_validate(
-        {
-            "scope_kind": "table",
-            "schema_name": "main",
-            "table_name": "orders",
-            "event_category": "dml",
-            "change_type": "insert",
-        }
-    )
-
-    assert subscription.model_dump() == {
-        "scope_kind": "table",
-        "schema_name": "main",
-        "table_name": "orders",
-        "schema_id": None,
-        "table_id": None,
-        "event_category": "dml",
-        "change_type": "insert",
-    }
-
-    with pytest.raises(ValidationError):
-        Subscription.model_validate({"scope_kind": "catalog", "table_name": "orders"})
-
-    with pytest.raises(ValidationError):
-        Subscription.model_validate(
-            {"scope_kind": "schema", "event_category": "ddl", "change_type": "insert"}
-        )
 
 
 def test_consumer_subscription_matches_create_and_inspection_rows() -> None:
     row = ConsumerSubscription.model_validate(
         {
             "consumer_name": "orders_sink",
+            "consumer_kind": "dml",
             "consumer_id": 1,
             "subscription_id": 2,
             "scope_kind": "table",

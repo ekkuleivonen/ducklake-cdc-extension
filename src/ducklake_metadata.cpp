@@ -400,7 +400,7 @@ int64_t SinceSecondsParameter(duckdb::TableFunctionBindInput &input, int64_t def
 	return entry->second.GetValue<int64_t>();
 }
 
-//! Resolve the start snapshot for stateless `cdc_recent_*` calls. The start
+//! Resolve the start snapshot for bounded stateless query calls. The start
 //! is `MAX(snapshot_id)` whose `snapshot_time <= now() - since_seconds`,
 //! so the returned snapshot is the most-recent commit *before* the cutoff
 //! and the read-out range `[start, current_snapshot()]` covers everything

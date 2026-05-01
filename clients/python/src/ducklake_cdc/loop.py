@@ -116,10 +116,10 @@ def iter_consumer_batches(
     while True:
         wait = _timed(
             stats,
-            "cdc_wait",
+            "cdc_dml_ticks_listen",
             lambda: _run_with_retry(
                 retry,
-                lambda: wait_cdc.wait(consumer_name, timeout_ms=timeout_ms),
+                lambda: wait_cdc.dml_ticks_wait(consumer_name, timeout_ms=timeout_ms),
             ),
         )
         if stats is not None:
@@ -156,14 +156,14 @@ def iter_consumer_batches(
         table_changes: list[TableChangeBatch] = []
         for table_name in resolved_table_names:
             changes_operation = partial(
-                cdc.changes_rows,
+                cdc.dml_table_changes_read_rows,
                 consumer_name,
                 table_name=table_name,
                 max_snapshots=max_snapshots,
                 start_snapshot=window.start_snapshot,
                 end_snapshot=window.end_snapshot,
             )
-            changes = _timed_retry(stats, "cdc_changes", retry, changes_operation)
+            changes = _timed_retry(stats, "cdc_dml_table_changes_read", retry, changes_operation)
             consumed_ns = time.monotonic_ns()
             consumed_epoch_ns = time.time_ns()
             if stats is not None:

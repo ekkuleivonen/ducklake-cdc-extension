@@ -139,14 +139,14 @@ class CDCClient:
     def commit(self, name: str, snapshot: int) -> ConsumerCommit:
         return _model_one(self._table("cdc_commit", name, snapshot), ConsumerCommit)
 
-    def wait(self, name: str, *, timeout_ms: int = 30_000) -> ConsumerWait:
+    def dml_ticks_wait(self, name: str, *, timeout_ms: int = 30_000) -> ConsumerWait:
         notified = self._wait_postgres_notify(name, timeout_ms=timeout_ms)
         if notified is not None:
             return notified
         events = self.dml_ticks_listen(name, timeout_ms=timeout_ms)
         return ConsumerWait(snapshot_id=events[0].snapshot_id if events else None)
 
-    def changes(
+    def dml_table_changes_read(
         self,
         name: str,
         *,
@@ -168,7 +168,7 @@ class CDCClient:
             },
         )
 
-    def changes_rows(
+    def dml_table_changes_read_rows(
         self,
         name: str,
         *,
@@ -180,7 +180,7 @@ class CDCClient:
     ) -> list[ChangeRow]:
         return [
             ChangeRow.from_row(row)
-            for row in self.changes(
+            for row in self.dml_table_changes_read(
                 name,
                 table_id=table_id,
                 table_name=table_name,
@@ -190,15 +190,126 @@ class CDCClient:
             ).list()
         ]
 
-    def ddl(self, name: str, *, max_snapshots: int = 100) -> list[DdlEvent]:
+    def dml_table_changes_listen(
+        self,
+        name: str,
+        *,
+        table_id: int | None = None,
+        table_name: str | None = None,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> Result:
+        return self._table(
+            "cdc_dml_table_changes_listen",
+            name,
+            named={
+                "table_id": table_id,
+                "table_name": table_name,
+                "timeout_ms": timeout_ms,
+                "max_snapshots": max_snapshots,
+                "auto_commit": auto_commit,
+            },
+        )
+
+    def dml_table_changes_listen_rows(
+        self,
+        name: str,
+        *,
+        table_id: int | None = None,
+        table_name: str | None = None,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> list[ChangeRow]:
+        return [
+            ChangeRow.from_row(row)
+            for row in self.dml_table_changes_listen(
+                name,
+                table_id=table_id,
+                table_name=table_name,
+                timeout_ms=timeout_ms,
+                max_snapshots=max_snapshots,
+                auto_commit=auto_commit,
+            ).list()
+        ]
+
+    def dml_changes_read(
+        self,
+        name: str,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+        auto_commit: bool = False,
+    ) -> Result:
+        return self._table(
+            "cdc_dml_changes_read",
+            name,
+            named={
+                "max_snapshots": max_snapshots,
+                "start_snapshot": start_snapshot,
+                "end_snapshot": end_snapshot,
+                "auto_commit": auto_commit,
+            },
+        )
+
+    def dml_changes_listen(
+        self,
+        name: str,
+        *,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> Result:
+        return self._table(
+            "cdc_dml_changes_listen",
+            name,
+            named={
+                "timeout_ms": timeout_ms,
+                "max_snapshots": max_snapshots,
+                "auto_commit": auto_commit,
+            },
+        )
+
+    def ddl_changes_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[DdlEvent]:
         return _model_list(
-            self._table("cdc_ddl_changes_read", name, named={"max_snapshots": max_snapshots}),
+            self._table(
+                "cdc_ddl_changes_read",
+                name,
+                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
+            ),
             DdlEvent,
         )
 
-    def events(self, name: str, *, max_snapshots: int = 100) -> list[SnapshotEvent]:
+    def ddl_changes_listen(
+        self,
+        name: str,
+        *,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> list[DdlEvent]:
         return _model_list(
-            self._table("cdc_dml_ticks_read", name, named={"max_snapshots": max_snapshots}),
+            self._table(
+                "cdc_ddl_changes_listen",
+                name,
+                named={
+                    "timeout_ms": timeout_ms,
+                    "max_snapshots": max_snapshots,
+                    "auto_commit": auto_commit,
+                },
+            ),
+            DdlEvent,
+        )
+
+    def dml_ticks_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[SnapshotEvent]:
+        return _model_list(
+            self._table(
+                "cdc_dml_ticks_read",
+                name,
+                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
+            ),
             SnapshotEvent,
         )
 
@@ -223,36 +334,35 @@ class CDCClient:
             SnapshotEvent,
         )
 
-    def recent_changes(self, table_name: str, *, since_seconds: int = 300) -> Result:
-        return self._table(
-            "cdc_dml_table_changes_query",
-            table_name,
-            named={"since_seconds": since_seconds},
-        )
-
-    def recent_changes_rows(
-        self,
-        table_name: str,
-        *,
-        since_seconds: int = 300,
-    ) -> list[ChangeRow]:
-        return [
-            ChangeRow.from_row(row)
-            for row in self.recent_changes(table_name, since_seconds=since_seconds).list()
-        ]
-
-    def recent_ddl(
-        self,
-        *,
-        since_seconds: int = 86_400,
-        for_table: str | None = None,
-    ) -> list[DdlEvent]:
+    def ddl_ticks_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[SnapshotEvent]:
         return _model_list(
             self._table(
-                "cdc_ddl_changes_query",
-                named={"since_seconds": since_seconds, "for_table": for_table},
+                "cdc_ddl_ticks_read",
+                name,
+                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
             ),
-            DdlEvent,
+            SnapshotEvent,
+        )
+
+    def ddl_ticks_listen(
+        self,
+        name: str,
+        *,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> list[SnapshotEvent]:
+        return _model_list(
+            self._table(
+                "cdc_ddl_ticks_listen",
+                name,
+                named={
+                    "timeout_ms": timeout_ms,
+                    "max_snapshots": max_snapshots,
+                    "auto_commit": auto_commit,
+                },
+            ),
+            SnapshotEvent,
         )
 
     def schema_diff(
@@ -266,29 +376,94 @@ class CDCClient:
             SchemaDiff,
         )
 
-    def range_events(
+    def dml_ticks_query(
         self,
         from_snapshot: int,
         *,
         to_snapshot: int | None = None,
+        table_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
     ) -> list[SnapshotEvent]:
         return _model_list(
-            self._table("cdc_dml_ticks_query", from_snapshot, named={"to_snapshot": to_snapshot}),
+            self._table(
+                "cdc_dml_ticks_query",
+                from_snapshot,
+                named={"to_snapshot": to_snapshot, "table_ids": table_ids, "table_names": table_names},
+            ),
             SnapshotEvent,
         )
 
-    def range_ddl(
+    def ddl_ticks_query(
         self,
         from_snapshot: int,
         *,
         to_snapshot: int | None = None,
+        schemas: list[str] | None = None,
+        schema_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
+        table_ids: list[int] | None = None,
+    ) -> list[SnapshotEvent]:
+        return _model_list(
+            self._table(
+                "cdc_ddl_ticks_query",
+                from_snapshot,
+                named={
+                    "to_snapshot": to_snapshot,
+                    "schemas": schemas,
+                    "schema_ids": schema_ids,
+                    "table_names": table_names,
+                    "table_ids": table_ids,
+                },
+            ),
+            SnapshotEvent,
+        )
+
+    def ddl_changes_query(
+        self,
+        from_snapshot: int,
+        *,
+        to_snapshot: int | None = None,
+        schemas: list[str] | None = None,
+        schema_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
+        table_ids: list[int] | None = None,
     ) -> list[DdlEvent]:
         return _model_list(
-            self._table("cdc_ddl_changes_query", from_snapshot, named={"to_snapshot": to_snapshot}),
+            self._table(
+                "cdc_ddl_changes_query",
+                from_snapshot,
+                named={
+                    "to_snapshot": to_snapshot,
+                    "schemas": schemas,
+                    "schema_ids": schema_ids,
+                    "table_names": table_names,
+                    "table_ids": table_ids,
+                },
+            ),
             DdlEvent,
         )
 
-    def range_changes(
+    def dml_changes_query(
+        self,
+        from_snapshot: int,
+        *,
+        to_snapshot: int | None = None,
+        table_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
+        change_types: list[str] | None = None,
+    ) -> Result:
+        return self._table(
+            "cdc_dml_changes_query",
+            from_snapshot,
+            named={
+                "to_snapshot": to_snapshot,
+                "table_ids": table_ids,
+                "table_names": table_names,
+                "change_types": change_types,
+            },
+        )
+
+    def dml_table_changes_query(
         self,
         from_snapshot: int,
         *,
@@ -306,7 +481,7 @@ class CDCClient:
             },
         )
 
-    def range_changes_rows(
+    def dml_table_changes_query_rows(
         self,
         from_snapshot: int,
         *,
@@ -316,7 +491,7 @@ class CDCClient:
     ) -> list[ChangeRow]:
         return [
             ChangeRow.from_row(row)
-            for row in self.range_changes(
+            for row in self.dml_table_changes_query(
                 from_snapshot,
                 to_snapshot=to_snapshot,
                 table_id=table_id,

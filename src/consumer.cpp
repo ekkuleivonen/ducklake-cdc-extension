@@ -1448,13 +1448,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerHeartbeatInit(duckd
 // listen helper
 //===--------------------------------------------------------------------===//
 
-struct CdcWaitData : public duckdb::TableFunctionData {
+struct ListenWaitData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t timeout_ms;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		auto result = duckdb::make_uniq<CdcWaitData>();
+		auto result = duckdb::make_uniq<ListenWaitData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->timeout_ms = timeout_ms;
@@ -1474,14 +1474,14 @@ int64_t TimeoutMsParameter(duckdb::TableFunctionBindInput &input) {
 	return entry->second.GetValue<int64_t>();
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &context,
-                                                     duckdb::TableFunctionBindInput &input,
-                                                     duckdb::vector<duckdb::LogicalType> &return_types,
-                                                     duckdb::vector<duckdb::string> &names) {
+duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &context,
+                                                        duckdb::TableFunctionBindInput &input,
+                                                        duckdb::vector<duckdb::LogicalType> &return_types,
+                                                        duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 2) {
 		throw duckdb::BinderException("listen helper requires catalog and consumer name");
 	}
-	auto result = duckdb::make_uniq<CdcWaitData>();
+	auto result = duckdb::make_uniq<ListenWaitData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->timeout_ms = TimeoutMsParameter(input);
@@ -1491,7 +1491,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &cont
 	return std::move(result);
 }
 
-std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const CdcWaitData &data) {
+std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 	if (data.timeout_ms < 0) {
 		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
@@ -1526,11 +1526,11 @@ std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const
 	}
 }
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcWaitInit(duckdb::ClientContext &context,
-                                                                 duckdb::TableFunctionInitInput &input) {
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListenWaitInit(duckdb::ClientContext &context,
+                                                                    duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
-	auto &data = input.bind_data->Cast<CdcWaitData>();
-	result->rows.push_back(WaitForSnapshot(context, data));
+	auto &data = input.bind_data->Cast<ListenWaitData>();
+	result->rows.push_back(WaitForNextSnapshot(context, data));
 	return std::move(result);
 }
 
@@ -1978,11 +1978,11 @@ std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                    const std::string &consumer_name, int64_t timeout_ms) {
-	CdcWaitData data;
+	ListenWaitData data;
 	data.catalog_name = catalog_name;
 	data.consumer_name = consumer_name;
 	data.timeout_ms = timeout_ms;
-	return WaitForSnapshot(context, data);
+	return WaitForNextSnapshot(context, data);
 }
 
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
