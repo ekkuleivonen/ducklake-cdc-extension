@@ -46,12 +46,18 @@ struct CdcEventsData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t max_snapshots;
+	bool auto_commit = false;
+	bool listen = false;
+	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<CdcEventsData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->max_snapshots = max_snapshots;
+		result->auto_commit = auto_commit;
+		result->listen = listen;
+		result->timeout_ms = timeout_ms;
 		return std::move(result);
 	}
 
@@ -155,10 +161,12 @@ bool ChangesTouchSubscriptions(duckdb::Connection &conn, const std::string &cata
 	return false;
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBind(duckdb::ClientContext &context,
-                                                       duckdb::TableFunctionBindInput &input,
-                                                       duckdb::vector<duckdb::LogicalType> &return_types,
-                                                       duckdb::vector<duckdb::string> &names) {
+int64_t TimeoutMsParameter(duckdb::TableFunctionBindInput &input);
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBindBase(duckdb::ClientContext &context,
+                                                           duckdb::TableFunctionBindInput &input,
+                                                           duckdb::vector<duckdb::LogicalType> &return_types,
+                                                           duckdb::vector<duckdb::string> &names, bool listen) {
 	if (input.inputs.size() != 2) {
 		throw duckdb::BinderException("cdc_events requires catalog and consumer name");
 	}
@@ -166,6 +174,12 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBind(duckdb::ClientContext &co
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->max_snapshots = MaxSnapshotsParameter(input);
+	result->listen = listen;
+	result->timeout_ms = TimeoutMsParameter(input);
+	auto auto_commit_entry = input.named_parameters.find("auto_commit");
+	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
+		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
+	}
 
 	names = {"snapshot_id",      "snapshot_time",  "changes_made",
 	         "author",           "commit_message", "commit_extra_info",
@@ -176,10 +190,30 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBind(duckdb::ClientContext &co
 	return std::move(result);
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> CdcEventsReadBind(duckdb::ClientContext &context,
+                                                           duckdb::TableFunctionBindInput &input,
+                                                           duckdb::vector<duckdb::LogicalType> &return_types,
+                                                           duckdb::vector<duckdb::string> &names) {
+	return CdcEventsBindBase(context, input, return_types, names, false);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcEventsListenBind(duckdb::ClientContext &context,
+                                                             duckdb::TableFunctionBindInput &input,
+                                                             duckdb::vector<duckdb::LogicalType> &return_types,
+                                                             duckdb::vector<duckdb::string> &names) {
+	return CdcEventsBindBase(context, input, return_types, names, true);
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::ClientContext &context,
                                                                    duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcEventsData>();
+	if (data.listen) {
+		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		if (ready.empty() || ready[0].IsNull()) {
+			return std::move(result);
+		}
+	}
 
 	CdcWindowData window_data;
 	window_data.catalog_name = data.catalog_name;
@@ -238,6 +272,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::Clien
 		row.push_back(duckdb::Value::BOOLEAN(schema_changes_pending));
 		result->rows.push_back(std::move(row));
 	}
+	if (data.auto_commit) {
+		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	}
 	return std::move(result);
 }
 
@@ -257,6 +294,9 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 	int64_t end_snapshot = -1;
 	int64_t probe_schema_version = -1;
 	std::vector<std::string> change_types;
+	bool auto_commit = false;
+	bool listen = false;
+	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
 	// Column names + types belonging to the underlying DuckLake table (the
 	// `<table cols>` segment of `table_changes(...)` output, after the
 	// fixed `(snapshot_id, rowid, change_type)` prefix). Discovered during
@@ -278,6 +318,9 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 		result->end_snapshot = end_snapshot;
 		result->probe_schema_version = probe_schema_version;
 		result->change_types = change_types;
+		result->auto_commit = auto_commit;
+		result->listen = listen;
+		result->timeout_ms = timeout_ms;
 		result->table_column_names = table_column_names;
 		result->table_column_types = table_column_types;
 		return std::move(result);
@@ -357,16 +400,30 @@ void ResolveSingleTableSubscription(const std::vector<ConsumerSubscriptionRow> &
 	table_id = *table_ids.begin();
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &context,
-                                                        duckdb::TableFunctionBindInput &input,
-                                                        duckdb::vector<duckdb::LogicalType> &return_types,
-                                                        duckdb::vector<duckdb::string> &names) {
+int64_t TimeoutMsParameter(duckdb::TableFunctionBindInput &input) {
+	auto entry = input.named_parameters.find("timeout_ms");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return DEFAULT_WAIT_TIMEOUT_MS;
+	}
+	return entry->second.GetValue<int64_t>();
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContext &context,
+                                                            duckdb::TableFunctionBindInput &input,
+                                                            duckdb::vector<duckdb::LogicalType> &return_types,
+                                                            duckdb::vector<duckdb::string> &names, bool listen) {
 	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
-		throw duckdb::BinderException("cdc_changes requires catalog and consumer name");
+		throw duckdb::BinderException("cdc_dml_table_changes_read requires catalog and consumer name");
 	}
 	auto result = duckdb::make_uniq<CdcChangesData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
+	result->listen = listen;
+	result->timeout_ms = TimeoutMsParameter(input);
+	auto auto_commit_entry = input.named_parameters.find("auto_commit");
+	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
+		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
+	}
 	if (input.inputs.size() == 3) {
 		result->table_name = GetStringArg(input.inputs[2], "table");
 	}
@@ -551,10 +608,30 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 	return std::move(result);
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> CdcTableChangesReadBind(duckdb::ClientContext &context,
+                                                                 duckdb::TableFunctionBindInput &input,
+                                                                 duckdb::vector<duckdb::LogicalType> &return_types,
+                                                                 duckdb::vector<duckdb::string> &names) {
+	return CdcChangesBindBase(context, input, return_types, names, false);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcTableChangesListenBind(duckdb::ClientContext &context,
+                                                                   duckdb::TableFunctionBindInput &input,
+                                                                   duckdb::vector<duckdb::LogicalType> &return_types,
+                                                                   duckdb::vector<duckdb::string> &names) {
+	return CdcChangesBindBase(context, input, return_types, names, true);
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::ClientContext &context,
                                                                     duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<MaterializedResultScanState>();
 	auto &data = input.bind_data->Cast<CdcChangesData>();
+	if (data.listen && !data.explicit_window) {
+		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		if (ready.empty() || ready[0].IsNull()) {
+			return std::move(result);
+		}
+	}
 
 	int64_t start_snapshot;
 	int64_t end_snapshot;
@@ -622,6 +699,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "cdc_changes scan failed");
 	}
 	result->result = std::move(rows);
+	if (data.auto_commit && !data.explicit_window) {
+		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	}
 	return std::move(result);
 }
 
@@ -1015,38 +1095,49 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 } // namespace
 
 void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
-	for (const auto &name : {"cdc_events", "ducklake_cdc_events"}) {
+	for (const auto &name : {"cdc_dml_ticks_read", "cdc_dml_ticks_listen"}) {
+		const auto bind =
+		    std::string(name).find("_listen") == std::string::npos ? CdcEventsReadBind : CdcEventsListenBind;
 		duckdb::TableFunction events_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, CdcEventsBind, CdcEventsInit);
+		    RowScanExecute, bind, CdcEventsInit);
 		events_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
+		events_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		events_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(events_function);
 	}
 
-	for (const auto &name : {"cdc_changes", "ducklake_cdc_changes"}) {
+	for (const auto &name : {"cdc_dml_changes_read", "cdc_dml_changes_listen", "cdc_dml_table_changes_read",
+	                         "cdc_dml_table_changes_listen"}) {
+		const auto bind = std::string(name).find("_listen") == std::string::npos ? CdcTableChangesReadBind
+		                                                                         : CdcTableChangesListenBind;
 		duckdb::TableFunction changes_function_new(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    MaterializedResultScanExecute, CdcChangesBind, CdcChangesInit);
+		    MaterializedResultScanExecute, bind, CdcChangesInit);
 		changes_function_new.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
 		changes_function_new.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
 		changes_function_new.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		changes_function_new.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
 		changes_function_new.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;
+		changes_function_new.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		changes_function_new.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(changes_function_new);
 		duckdb::TableFunction changes_function(name,
 		                                       duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
 		                                                                            duckdb::LogicalType::VARCHAR,
 		                                                                            duckdb::LogicalType::VARCHAR},
-		                                       MaterializedResultScanExecute, CdcChangesBind, CdcChangesInit);
+		                                       MaterializedResultScanExecute, bind, CdcChangesInit);
 		changes_function.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
 		changes_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(changes_function);
 	}
 
-	for (const auto &name : {"cdc_recent_changes", "ducklake_cdc_recent_changes"}) {
+	for (const auto &name : {"cdc_dml_changes_query", "cdc_dml_table_changes_query"}) {
 		duckdb::TableFunction recent_changes_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, CdcRecentChangesBind, CdcRecentChangesInit);
@@ -1054,7 +1145,7 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(recent_changes_function);
 	}
 
-	for (const auto &name : {"cdc_range_events", "ducklake_cdc_range_events"}) {
+	for (const auto &name : {"cdc_dml_ticks_query"}) {
 		duckdb::TableFunction range_events_function_2(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
 		    RowScanExecute, CdcRangeEventsBind, CdcRangeEventsInit);
@@ -1069,7 +1160,7 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(range_events_function_3);
 	}
 
-	for (const auto &name : {"cdc_range_changes", "ducklake_cdc_range_changes"}) {
+	for (const auto &name : {"cdc_dml_changes_query", "cdc_dml_table_changes_query"}) {
 		duckdb::TableFunction range_changes_function_2(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
 		    RowScanExecute, CdcRangeChangesBind, CdcRangeChangesInit);

@@ -109,22 +109,24 @@ std::string TokenSqlOrNull(const std::string &token) {
 ConsumerRow ConsumerRowFromResult(duckdb::MaterializedQueryResult &result, duckdb::idx_t row_index) {
 	ConsumerRow row;
 	row.consumer_name = result.GetValue(0, row_index).ToString();
-	row.consumer_id = result.GetValue(1, row_index).GetValue<int64_t>();
-	auto snapshot_value = result.GetValue(2, row_index);
+	row.consumer_kind = result.GetValue(1, row_index).ToString();
+	row.consumer_id = result.GetValue(2, row_index).GetValue<int64_t>();
+	auto snapshot_value = result.GetValue(3, row_index);
 	row.last_committed_snapshot = snapshot_value.IsNull() ? -1 : snapshot_value.GetValue<int64_t>();
-	auto schema_value = result.GetValue(3, row_index);
+	auto schema_value = result.GetValue(4, row_index);
 	row.last_committed_schema_version = schema_value.IsNull() ? -1 : schema_value.GetValue<int64_t>();
-	row.owner_token = result.GetValue(4, row_index);
-	row.owner_acquired_at = result.GetValue(5, row_index);
-	row.owner_heartbeat_at = result.GetValue(6, row_index);
-	row.lease_interval_seconds = result.GetValue(7, row_index).GetValue<int64_t>();
-	const auto stop_value = result.GetValue(8, row_index);
+	row.owner_token = result.GetValue(5, row_index);
+	row.owner_acquired_at = result.GetValue(6, row_index);
+	row.owner_heartbeat_at = result.GetValue(7, row_index);
+	row.lease_interval_seconds = result.GetValue(8, row_index).GetValue<int64_t>();
+	const auto stop_value = result.GetValue(9, row_index);
 	row.stop_at_schema_change = stop_value.IsNull() ? true : stop_value.GetValue<bool>();
 	return row;
 }
 
 std::string ConsumerRowProjection() {
-	return "consumer_name, consumer_id, last_committed_snapshot, last_committed_schema_version, owner_token, "
+	return "consumer_name, consumer_kind, consumer_id, last_committed_snapshot, last_committed_schema_version, "
+	       "owner_token, "
 	       "owner_acquired_at, owner_heartbeat_at, lease_interval_seconds, stop_at_schema_change";
 }
 
@@ -293,18 +295,28 @@ void InsertAuditRow(duckdb::Connection &conn, const std::string &catalog_name, c
 struct ConsumerCreateData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
+	std::string consumer_kind;
 	std::string start_at;
-	bool subscriptions_specified = false;
-	duckdb::Value subscriptions;
-	bool stop_at_schema_change = true;
+	duckdb::Value schemas;
+	duckdb::Value schema_ids;
+	duckdb::Value table_names;
+	duckdb::Value table_ids;
+	duckdb::Value change_types;
+	duckdb::Value metadata;
+	bool stop_at_schema_change = false;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<ConsumerCreateData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
+		result->consumer_kind = consumer_kind;
 		result->start_at = start_at;
-		result->subscriptions_specified = subscriptions_specified;
-		result->subscriptions = subscriptions;
+		result->schemas = schemas;
+		result->schema_ids = schema_ids;
+		result->table_names = table_names;
+		result->table_ids = table_ids;
+		result->change_types = change_types;
+		result->metadata = metadata;
 		result->stop_at_schema_change = stop_at_schema_change;
 		return std::move(result);
 	}
@@ -312,16 +324,6 @@ struct ConsumerCreateData : public duckdb::TableFunctionData {
 	bool Equals(const duckdb::FunctionData &other) const override {
 		return this == &other;
 	}
-};
-
-struct RawSubscriptionInput {
-	std::string scope_kind;
-	duckdb::Value schema_name;
-	duckdb::Value table_name;
-	duckdb::Value schema_id;
-	duckdb::Value table_id;
-	duckdb::Value event_category;
-	duckdb::Value change_type;
 };
 
 struct ResolvedSubscriptionInput {
@@ -341,49 +343,18 @@ std::string StartAtParameter(duckdb::TableFunctionBindInput &input) {
 	return entry->second.GetValue<std::string>();
 }
 
-duckdb::Value NamedParameterValue(duckdb::TableFunctionBindInput &input, const std::string &name, bool &specified) {
-	specified = false;
+duckdb::Value NamedParameterValue(duckdb::TableFunctionBindInput &input, const std::string &name) {
 	auto entry = input.named_parameters.find(name);
 	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
 		return duckdb::Value();
 	}
-	specified = true;
 	return entry->second;
 }
 
-std::string ValueStringOrEmpty(const duckdb::Value &value) {
-	return value.IsNull() ? std::string() : value.ToString();
-}
-
-duckdb::Value StructChild(const duckdb::Value &value, const std::string &field_name) {
-	const auto &children = duckdb::StructValue::GetChildren(value);
-	const auto &type = value.type();
-	for (duckdb::idx_t i = 0; i < duckdb::StructType::GetChildCount(type) && i < children.size(); ++i) {
-		if (duckdb::StructType::GetChildName(type, i) == field_name) {
-			return children[i];
-		}
-	}
-	return duckdb::Value();
-}
-
-duckdb::unique_ptr<duckdb::FunctionData> ConsumerCreateBind(duckdb::ClientContext &context,
-                                                            duckdb::TableFunctionBindInput &input,
-                                                            duckdb::vector<duckdb::LogicalType> &return_types,
-                                                            duckdb::vector<duckdb::string> &names) {
-	if (input.inputs.size() != 2) {
-		throw duckdb::BinderException("cdc_consumer_create requires catalog and consumer name");
-	}
-	auto result = duckdb::make_uniq<ConsumerCreateData>();
-	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
-	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
-	result->start_at = StartAtParameter(input);
-	result->subscriptions = NamedParameterValue(input, "subscriptions", result->subscriptions_specified);
-	auto stop_entry = input.named_parameters.find("stop_at_schema_change");
-	if (stop_entry != input.named_parameters.end() && !stop_entry->second.IsNull()) {
-		result->stop_at_schema_change = stop_entry->second.GetValue<bool>();
-	}
-
+void ConsumerCreateReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types,
+                               duckdb::vector<duckdb::string> &names) {
 	names = {"consumer_name",
+	         "consumer_kind",
 	         "consumer_id",
 	         "last_committed_snapshot",
 	         "subscription_id",
@@ -394,10 +365,50 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerCreateBind(duckdb::ClientContex
 	         "change_type",
 	         "original_qualified_name",
 	         "current_qualified_name"};
-	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> DdlConsumerCreateBind(duckdb::ClientContext &context,
+                                                               duckdb::TableFunctionBindInput &input,
+                                                               duckdb::vector<duckdb::LogicalType> &return_types,
+                                                               duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2) {
+		throw duckdb::BinderException("cdc_ddl_consumer_create requires catalog and consumer name");
+	}
+	auto result = duckdb::make_uniq<ConsumerCreateData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
+	result->consumer_kind = "ddl";
+	result->start_at = StartAtParameter(input);
+	result->schemas = NamedParameterValue(input, "schemas");
+	result->schema_ids = NamedParameterValue(input, "schema_ids");
+	result->table_names = NamedParameterValue(input, "table_names");
+	result->table_ids = NamedParameterValue(input, "table_ids");
+	result->metadata = NamedParameterValue(input, "metadata");
+	ConsumerCreateReturnTypes(return_types, names);
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> DmlConsumerCreateBind(duckdb::ClientContext &context,
+                                                               duckdb::TableFunctionBindInput &input,
+                                                               duckdb::vector<duckdb::LogicalType> &return_types,
+                                                               duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2) {
+		throw duckdb::BinderException("cdc_dml_consumer_create requires catalog and consumer name");
+	}
+	auto result = duckdb::make_uniq<ConsumerCreateData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
+	result->consumer_kind = "dml";
+	result->start_at = StartAtParameter(input);
+	result->table_names = NamedParameterValue(input, "table_names");
+	result->table_ids = NamedParameterValue(input, "table_ids");
+	result->change_types = NamedParameterValue(input, "change_types");
+	result->metadata = NamedParameterValue(input, "metadata");
+	ConsumerCreateReturnTypes(return_types, names);
 	return std::move(result);
 }
 
@@ -474,150 +485,6 @@ bool ResolveTableByIdAt(duckdb::Connection &conn, const std::string &catalog_nam
 	return true;
 }
 
-std::vector<std::pair<std::string, std::string>> ExpandedEventChangePairs(const std::string &consumer_name,
-                                                                          const std::string &event_category,
-                                                                          const std::string &change_type) {
-	static const std::unordered_set<std::string> EVENTS = {"*", "dml", "ddl"};
-	static const std::unordered_set<std::string> CHANGES = {"*", "insert", "update_preimage", "update_postimage",
-	                                                        "delete"};
-	if (event_category.empty() || EVENTS.find(event_category) == EVENTS.end()) {
-		throw duckdb::InvalidInputException("cdc_consumer_create: consumer '%s' has invalid event_category '%s'",
-		                                    consumer_name, event_category);
-	}
-	if (change_type.empty() || CHANGES.find(change_type) == CHANGES.end()) {
-		throw duckdb::InvalidInputException("cdc_consumer_create: consumer '%s' has invalid change_type '%s'",
-		                                    consumer_name, change_type);
-	}
-	std::vector<std::pair<std::string, std::string>> pairs;
-	auto add_dml = [&]() {
-		if (change_type == "*") {
-			for (const auto &kind : {"insert", "update_preimage", "update_postimage", "delete"}) {
-				pairs.emplace_back("dml", kind);
-			}
-		} else {
-			pairs.emplace_back("dml", change_type);
-		}
-	};
-	if (event_category == "dml") {
-		add_dml();
-	} else if (event_category == "ddl") {
-		if (change_type != "*") {
-			throw duckdb::InvalidInputException("cdc_consumer_create: DDL subscriptions require change_type '*' ");
-		}
-		pairs.emplace_back("ddl", "*");
-	} else {
-		if (change_type != "*") {
-			throw duckdb::InvalidInputException(
-			    "cdc_consumer_create: wildcard event_category requires change_type '*'");
-		}
-		add_dml();
-		pairs.emplace_back("ddl", "*");
-	}
-	return pairs;
-}
-
-std::vector<ResolvedSubscriptionInput> ResolveSubscriptions(duckdb::Connection &conn, const std::string &catalog_name,
-                                                            const std::string &consumer_name,
-                                                            const duckdb::Value &subscriptions_value,
-                                                            int64_t snapshot_id) {
-	if (subscriptions_value.IsNull()) {
-		throw duckdb::InvalidInputException("cdc_consumer_create requires subscriptions");
-	}
-	std::vector<ResolvedSubscriptionInput> resolved;
-	for (const auto &child : duckdb::ListValue::GetChildren(subscriptions_value)) {
-		RawSubscriptionInput raw;
-		raw.scope_kind = ValueStringOrEmpty(StructChild(child, "scope_kind"));
-		raw.schema_name = StructChild(child, "schema_name");
-		raw.table_name = StructChild(child, "table_name");
-		raw.schema_id = StructChild(child, "schema_id");
-		raw.table_id = StructChild(child, "table_id");
-		raw.event_category = StructChild(child, "event_category");
-		raw.change_type = StructChild(child, "change_type");
-		if (raw.scope_kind != "catalog" && raw.scope_kind != "schema" && raw.scope_kind != "table") {
-			throw duckdb::InvalidInputException("cdc_consumer_create: invalid scope_kind '%s'", raw.scope_kind);
-		}
-		const auto event_category = ValueStringOrEmpty(raw.event_category);
-		const auto change_type = ValueStringOrEmpty(raw.change_type);
-		duckdb::Value schema_id;
-		duckdb::Value table_id;
-		std::string current_name;
-		if (raw.scope_kind == "catalog") {
-			if (!raw.schema_name.IsNull() || !raw.table_name.IsNull() || !raw.schema_id.IsNull() ||
-			    !raw.table_id.IsNull()) {
-				throw duckdb::InvalidInputException(
-				    "cdc_consumer_create: catalog subscription cannot specify identity");
-			}
-		} else if (raw.scope_kind == "schema") {
-			if (!raw.table_name.IsNull() || !raw.table_id.IsNull() ||
-			    (!raw.schema_name.IsNull() && !raw.schema_id.IsNull())) {
-				throw duckdb::InvalidInputException("cdc_consumer_create: schema subscription has invalid identity");
-			}
-			int64_t sid = 0;
-			std::string sname;
-			if (!raw.schema_name.IsNull()) {
-				sname = raw.schema_name.ToString();
-				if (!ResolveSchemaByNameAt(conn, catalog_name, sname, snapshot_id, sid)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: schema identity '%s' is not live", sname);
-				}
-			} else if (!raw.schema_id.IsNull()) {
-				sid = raw.schema_id.GetValue<int64_t>();
-				if (!ResolveSchemaByIdAt(conn, catalog_name, sid, snapshot_id, sname)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: schema identity %lld is not live",
-					                                    static_cast<long long>(sid));
-				}
-			} else {
-				throw duckdb::InvalidInputException("cdc_consumer_create: schema subscription requires identity");
-			}
-			schema_id = duckdb::Value::BIGINT(sid);
-			current_name = sname;
-		} else {
-			if ((!raw.table_name.IsNull() && !raw.table_id.IsNull()) ||
-			    (!raw.schema_name.IsNull() && !raw.table_id.IsNull())) {
-				throw duckdb::InvalidInputException("cdc_consumer_create: table subscription has conflicting identity");
-			}
-			int64_t sid = 0;
-			int64_t tid = 0;
-			if (!raw.table_name.IsNull()) {
-				const auto qualified = QualifyTableInput(raw.table_name.ToString(), raw.schema_name);
-				if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, sid, tid)) {
-					throw duckdb::InvalidInputException("cdc_consumer_create: table identity '%s' is not live",
-					                                    qualified);
-				}
-				current_name = qualified;
-			} else if (!raw.table_id.IsNull()) {
-				tid = raw.table_id.GetValue<int64_t>();
-				if (!ResolveTableByIdAt(conn, catalog_name, tid, snapshot_id, sid, current_name)) {
-					const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
-					if (!ResolveTableByIdAt(conn, catalog_name, tid, current_snapshot, sid, current_name)) {
-						throw duckdb::InvalidInputException("cdc_consumer_create: table identity %lld is not live",
-						                                    static_cast<long long>(tid));
-					}
-				}
-			} else {
-				throw duckdb::InvalidInputException("cdc_consumer_create: table subscription requires identity");
-			}
-			schema_id = duckdb::Value::BIGINT(sid);
-			table_id = duckdb::Value::BIGINT(tid);
-		}
-		const auto original_name = OptionalQualifiedName(raw.scope_kind, raw.schema_name, raw.table_name, raw.schema_id,
-		                                                 raw.table_id, current_name);
-		for (const auto &pair : ExpandedEventChangePairs(consumer_name, event_category, change_type)) {
-			ResolvedSubscriptionInput out;
-			out.scope_kind = raw.scope_kind;
-			out.schema_id = schema_id;
-			out.table_id = table_id;
-			out.event_category = pair.first;
-			out.change_type = pair.second;
-			out.original_qualified_name = original_name;
-			resolved.push_back(std::move(out));
-		}
-	}
-	if (resolved.empty()) {
-		throw duckdb::InvalidInputException("cdc_consumer_create requires non-empty subscriptions");
-	}
-	return resolved;
-}
-
 std::string SubscriptionJsonArray(const std::vector<ResolvedSubscriptionInput> &subscriptions) {
 	std::ostringstream out;
 	out << "[";
@@ -642,6 +509,164 @@ std::string SubscriptionJsonArray(const std::vector<ResolvedSubscriptionInput> &
 	return out.str();
 }
 
+std::vector<std::string> StringListParameter(const duckdb::Value &value) {
+	std::vector<std::string> out;
+	if (value.IsNull()) {
+		return out;
+	}
+	for (const auto &child : duckdb::ListValue::GetChildren(value)) {
+		if (!child.IsNull()) {
+			out.push_back(child.GetValue<std::string>());
+		}
+	}
+	return out;
+}
+
+std::vector<int64_t> Int64ListParameter(const duckdb::Value &value) {
+	std::vector<int64_t> out;
+	if (value.IsNull()) {
+		return out;
+	}
+	for (const auto &child : duckdb::ListValue::GetChildren(value)) {
+		if (!child.IsNull()) {
+			out.push_back(child.GetValue<int64_t>());
+		}
+	}
+	return out;
+}
+
+std::vector<std::string> DmlChangeTypeList(const duckdb::Value &value) {
+	auto requested = StringListParameter(value);
+	if (requested.empty()) {
+		requested.push_back("*");
+	}
+	std::vector<std::string> out;
+	for (const auto &change_type : requested) {
+		if (change_type == "*") {
+			for (const auto &kind : {"insert", "update_preimage", "update_postimage", "delete"}) {
+				out.push_back(kind);
+			}
+			continue;
+		}
+		if (change_type != "insert" && change_type != "update_preimage" && change_type != "update_postimage" &&
+		    change_type != "delete") {
+			throw duckdb::InvalidInputException("cdc_dml_consumer_create: invalid change_type '%s'", change_type);
+		}
+		out.push_back(change_type);
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return out;
+}
+
+void AddResolvedSubscription(std::vector<ResolvedSubscriptionInput> &out, const std::string &scope_kind,
+                             const duckdb::Value &schema_id, const duckdb::Value &table_id,
+                             const std::string &event_category, const std::string &change_type,
+                             const duckdb::Value &original_name) {
+	ResolvedSubscriptionInput sub;
+	sub.scope_kind = scope_kind;
+	sub.schema_id = schema_id;
+	sub.table_id = table_id;
+	sub.event_category = event_category;
+	sub.change_type = change_type;
+	sub.original_qualified_name = original_name;
+	out.push_back(std::move(sub));
+}
+
+std::vector<ResolvedSubscriptionInput> ResolveDmlCreateSubscriptions(duckdb::Connection &conn,
+                                                                     const std::string &catalog_name,
+                                                                     const ConsumerCreateData &data,
+                                                                     int64_t snapshot_id) {
+	std::vector<ResolvedSubscriptionInput> out;
+	const auto change_types = DmlChangeTypeList(data.change_types);
+	for (const auto &table_name : StringListParameter(data.table_names)) {
+		const auto qualified = QualifyTableInput(table_name, duckdb::Value());
+		int64_t schema_id = 0;
+		int64_t table_id = 0;
+		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
+			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live", qualified);
+		}
+		for (const auto &change_type : change_types) {
+			AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id),
+			                        "dml", change_type, duckdb::Value(qualified));
+		}
+	}
+	for (const auto &table_id : Int64ListParameter(data.table_ids)) {
+		int64_t schema_id = 0;
+		std::string current_name;
+		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, current_name)) {
+			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
+			                                    static_cast<long long>(table_id));
+		}
+		for (const auto &change_type : change_types) {
+			AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id),
+			                        "dml", change_type, duckdb::Value(current_name));
+		}
+	}
+	if (out.empty()) {
+		throw duckdb::InvalidInputException("cdc_dml_consumer_create requires table_names or table_ids");
+	}
+	return out;
+}
+
+std::vector<ResolvedSubscriptionInput> ResolveDdlCreateSubscriptions(duckdb::Connection &conn,
+                                                                     const std::string &catalog_name,
+                                                                     const ConsumerCreateData &data,
+                                                                     int64_t snapshot_id) {
+	std::vector<ResolvedSubscriptionInput> out;
+	for (const auto &schema_name : StringListParameter(data.schemas)) {
+		int64_t schema_id = 0;
+		if (!ResolveSchemaByNameAt(conn, catalog_name, schema_name, snapshot_id, schema_id)) {
+			throw duckdb::InvalidInputException("cdc_ddl_consumer_create: schema identity '%s' is not live",
+			                                    schema_name);
+		}
+		AddResolvedSubscription(out, "schema", duckdb::Value::BIGINT(schema_id), duckdb::Value(), "ddl", "*",
+		                        duckdb::Value(schema_name));
+	}
+	for (const auto &schema_id : Int64ListParameter(data.schema_ids)) {
+		std::string schema_name;
+		if (!ResolveSchemaByIdAt(conn, catalog_name, schema_id, snapshot_id, schema_name)) {
+			throw duckdb::InvalidInputException("cdc_ddl_consumer_create: schema_id %lld is not live",
+			                                    static_cast<long long>(schema_id));
+		}
+		AddResolvedSubscription(out, "schema", duckdb::Value::BIGINT(schema_id), duckdb::Value(), "ddl", "*",
+		                        duckdb::Value(schema_name));
+	}
+	for (const auto &table_name : StringListParameter(data.table_names)) {
+		const auto qualified = QualifyTableInput(table_name, duckdb::Value());
+		int64_t schema_id = 0;
+		int64_t table_id = 0;
+		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
+			throw duckdb::InvalidInputException("cdc_ddl_consumer_create: table identity '%s' is not live", qualified);
+		}
+		AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id), "ddl",
+		                        "*", duckdb::Value(qualified));
+	}
+	for (const auto &table_id : Int64ListParameter(data.table_ids)) {
+		int64_t schema_id = 0;
+		std::string current_name;
+		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, current_name)) {
+			throw duckdb::InvalidInputException("cdc_ddl_consumer_create: table_id %lld is not live",
+			                                    static_cast<long long>(table_id));
+		}
+		AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id), "ddl",
+		                        "*", duckdb::Value(current_name));
+	}
+	if (out.empty()) {
+		AddResolvedSubscription(out, "catalog", duckdb::Value(), duckdb::Value(), "ddl", "*", duckdb::Value());
+	}
+	return out;
+}
+
+std::vector<ResolvedSubscriptionInput> ResolveCreateSubscriptions(duckdb::Connection &conn,
+                                                                  const std::string &catalog_name,
+                                                                  const ConsumerCreateData &data, int64_t snapshot_id) {
+	if (data.consumer_kind == "dml") {
+		return ResolveDmlCreateSubscriptions(conn, catalog_name, data, snapshot_id);
+	}
+	return ResolveDdlCreateSubscriptions(conn, catalog_name, data, snapshot_id);
+}
+
 std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const ConsumerCreateData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
@@ -653,19 +678,15 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 	const auto actor_sql = "current_user";
 	int64_t resolved_snapshot = ResolveCreateSnapshot(conn, data.catalog_name, data.start_at);
 	int64_t schema_version = ResolveSchemaVersion(conn, data.catalog_name, resolved_snapshot);
-	if (!data.subscriptions_specified) {
-		throw duckdb::InvalidInputException("cdc_consumer_create requires subscriptions");
-	}
-	const auto subscriptions =
-	    ResolveSubscriptions(conn, data.catalog_name, data.consumer_name, data.subscriptions, resolved_snapshot);
+	const auto subscriptions = ResolveCreateSubscriptions(conn, data.catalog_name, data, resolved_snapshot);
 
 	// Audit details JSON stays append-only — every key from the create
 	// call lands here (resolved snapshot included so a later
 	// cdc_consumer_reset retains forensic continuity even if the
 	// consumer is dropped/recreated under the same name).
 	std::ostringstream details;
-	details << "{\"start_at\":\"" << JsonEscape(data.start_at)
-	        << "\",\"start_at_resolved_snapshot\":" << resolved_snapshot;
+	details << "{\"consumer_kind\":\"" << JsonEscape(data.consumer_kind) << "\",\"start_at\":\""
+	        << JsonEscape(data.start_at) << "\",\"start_at_resolved_snapshot\":" << resolved_snapshot;
 	details << ",\"subscriptions\":" << SubscriptionJsonArray(subscriptions);
 	details << ",\"stop_at_schema_change\":" << (data.stop_at_schema_change ? "true" : "false");
 	details << "}";
@@ -681,13 +702,14 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		auto next_id_result = conn.Query("SELECT COALESCE(MAX(consumer_id), 0) + 1 FROM " + consumers);
 		int64_t consumer_id = SingleInt64(*next_id_result, "next consumer_id");
 		ExecuteChecked(conn, "INSERT INTO " + consumers +
-		                         " (consumer_name, consumer_id, last_committed_snapshot, "
+		                         " (consumer_name, consumer_kind, consumer_id, last_committed_snapshot, "
 		                         "last_committed_schema_version, created_at, created_by, updated_at, "
-		                         "lease_interval_seconds, stop_at_schema_change) VALUES (" +
-		                         quoted_name + ", " + std::to_string(consumer_id) + ", " +
-		                         std::to_string(resolved_snapshot) + ", " + std::to_string(schema_version) +
-		                         ", now(), " + actor_sql + ", now(), 60, " +
-		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ")");
+		                         "lease_interval_seconds, stop_at_schema_change, metadata) VALUES (" +
+		                         quoted_name + ", " + QuoteLiteral(data.consumer_kind) + ", " +
+		                         std::to_string(consumer_id) + ", " + std::to_string(resolved_snapshot) + ", " +
+		                         std::to_string(schema_version) + ", now(), " + actor_sql + ", now(), 60, " +
+		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", " + JsonValue(data.metadata) +
+		                         ")");
 		for (size_t i = 0; i < subscriptions.size(); ++i) {
 			const auto &sub = subscriptions[i];
 			ExecuteChecked(conn, "INSERT INTO " + subscriptions_table +
@@ -709,6 +731,7 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		const auto decorated = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 		if (decorated.empty()) {
 			return {duckdb::Value(data.consumer_name),
+			        duckdb::Value(data.consumer_kind),
 			        duckdb::Value::BIGINT(consumer_id),
 			        duckdb::Value::BIGINT(resolved_snapshot),
 			        duckdb::Value(),
@@ -722,6 +745,7 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		}
 		const auto &sub = decorated[0];
 		return {duckdb::Value(data.consumer_name),
+		        duckdb::Value(data.consumer_kind),
 		        duckdb::Value::BIGINT(consumer_id),
 		        duckdb::Value::BIGINT(resolved_snapshot),
 		        duckdb::Value::BIGINT(sub.subscription_id),
@@ -1518,6 +1542,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcWaitInit(duckdb::ClientC
 
 void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
 	names = {"consumer_name",
+	         "consumer_kind",
 	         "consumer_id",
 	         "subscription_count",
 	         "subscriptions_active",
@@ -1535,12 +1560,12 @@ void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, 
 	         "updated_at",
 	         "metadata"};
 	return_types = {
-	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,
 	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ,
-	    duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
-	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
 }
 
 struct ConsumerListData : public duckdb::TableFunctionData {
@@ -1578,7 +1603,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
-	auto query = "SELECT consumer_name, consumer_id, stop_at_schema_change, "
+	auto query = "SELECT consumer_name, consumer_kind, consumer_id, stop_at_schema_change, "
 	             "last_committed_snapshot, last_committed_schema_version, owner_token, owner_acquired_at, "
 	             "owner_heartbeat_at, lease_interval_seconds, created_at, created_by, updated_at, metadata FROM " +
 	             StateTable(conn, data.catalog_name, CONSUMERS_TABLE) + " ORDER BY consumer_id ASC";
@@ -1604,12 +1629,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 		std::vector<duckdb::Value> row;
 		row.push_back(query_result->GetValue(0, row_idx));
 		row.push_back(query_result->GetValue(1, row_idx));
+		row.push_back(query_result->GetValue(2, row_idx));
 		row.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(subscriptions.size())));
 		row.push_back(duckdb::Value::BIGINT(active));
 		row.push_back(duckdb::Value::BIGINT(renamed));
 		row.push_back(duckdb::Value::BIGINT(dropped));
 		for (duckdb::idx_t col_idx = 0; col_idx < query_result->ColumnCount(); ++col_idx) {
-			if (col_idx < 2) {
+			if (col_idx < 3) {
 				continue;
 			}
 			row.push_back(query_result->GetValue(col_idx, row_idx));
@@ -1653,6 +1679,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerSubscriptionsBind(duckdb::Clien
 		result->consumer_name = entry->second.GetValue<std::string>();
 	}
 	names = {"consumer_name",
+	         "consumer_kind",
 	         "consumer_id",
 	         "subscription_id",
 	         "scope_kind",
@@ -1663,10 +1690,10 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerSubscriptionsBind(duckdb::Clien
 	         "original_qualified_name",
 	         "current_qualified_name",
 	         "status"};
-	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,
+	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
 	return std::move(result);
 }
 
@@ -1678,11 +1705,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerSubscriptionsInit(d
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	duckdb::Connection conn(*context.db);
 	for (const auto &sub : LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name)) {
-		result->rows.push_back({duckdb::Value(sub.consumer_name), duckdb::Value::BIGINT(sub.consumer_id),
-		                        duckdb::Value::BIGINT(sub.subscription_id), duckdb::Value(sub.scope_kind),
-		                        sub.schema_id, sub.table_id, duckdb::Value(sub.event_category),
-		                        duckdb::Value(sub.change_type), sub.original_qualified_name, sub.current_qualified_name,
-		                        duckdb::Value(sub.status)});
+		result->rows.push_back({duckdb::Value(sub.consumer_name), duckdb::Value(sub.consumer_kind),
+		                        duckdb::Value::BIGINT(sub.consumer_id), duckdb::Value::BIGINT(sub.subscription_id),
+		                        duckdb::Value(sub.scope_kind), sub.schema_id, sub.table_id,
+		                        duckdb::Value(sub.event_category), duckdb::Value(sub.change_type),
+		                        sub.original_qualified_name, sub.current_qualified_name, duckdb::Value(sub.status)});
 	}
 	return std::move(result);
 }
@@ -1759,7 +1786,7 @@ LoadConsumerSubscriptions(duckdb::Connection &conn, const std::string &catalog_n
 	const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
 	std::ostringstream query;
 	query << "SELECT c.consumer_name, c.consumer_id, s.subscription_id, s.scope_kind, s.schema_id, s.table_id, "
-	      << "s.event_category, s.change_type, s.original_qualified_name FROM "
+	      << "s.event_category, s.change_type, s.original_qualified_name, c.consumer_kind FROM "
 	      << StateTable(conn, catalog_name, CONSUMERS_TABLE) << " c JOIN "
 	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE) << " s ON s.consumer_id = c.consumer_id";
 	if (!consumer_name.empty()) {
@@ -1774,6 +1801,7 @@ LoadConsumerSubscriptions(duckdb::Connection &conn, const std::string &catalog_n
 	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
 		ConsumerSubscriptionRow row;
 		row.consumer_name = result->GetValue(0, i).ToString();
+		row.consumer_kind = result->GetValue(9, i).ToString();
 		row.consumer_id = result->GetValue(1, i).GetValue<int64_t>();
 		row.subscription_id = result->GetValue(2, i).GetValue<int64_t>();
 		row.scope_kind = result->GetValue(3, i).ToString();
@@ -1941,27 +1969,51 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	        duckdb::Value::BOOLEAN(schema_changes_pending)};
 }
 
-void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
-	duckdb::child_list_t<duckdb::LogicalType> subscription_fields;
-	subscription_fields.emplace_back("scope_kind", duckdb::LogicalType::VARCHAR);
-	subscription_fields.emplace_back("schema_name", duckdb::LogicalType::VARCHAR);
-	subscription_fields.emplace_back("table_name", duckdb::LogicalType::VARCHAR);
-	subscription_fields.emplace_back("schema_id", duckdb::LogicalType::BIGINT);
-	subscription_fields.emplace_back("table_id", duckdb::LogicalType::BIGINT);
-	subscription_fields.emplace_back("event_category", duckdb::LogicalType::VARCHAR);
-	subscription_fields.emplace_back("change_type", duckdb::LogicalType::VARCHAR);
-	const auto subscriptions_type = duckdb::LogicalType::LIST(duckdb::LogicalType::STRUCT(subscription_fields));
-	for (const auto &name : {"cdc_consumer_create", "ducklake_cdc_consumer_create"}) {
-		duckdb::TableFunction create_function(
-		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, ConsumerCreateBind, ConsumerCreateInit);
-		create_function.named_parameters["start_at"] = duckdb::LogicalType::VARCHAR;
-		create_function.named_parameters["subscriptions"] = subscriptions_type;
-		create_function.named_parameters["stop_at_schema_change"] = duckdb::LogicalType::BOOLEAN;
-		loader.RegisterFunction(create_function);
-	}
+std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                  const std::string &consumer_name, int64_t snapshot_id) {
+	CdcCommitData data;
+	data.catalog_name = catalog_name;
+	data.consumer_name = consumer_name;
+	data.snapshot_id = snapshot_id;
+	return CommitWindow(context, data);
+}
 
-	for (const auto &name : {"cdc_consumer_reset", "ducklake_cdc_consumer_reset"}) {
+std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                   const std::string &consumer_name, int64_t timeout_ms) {
+	CdcWaitData data;
+	data.catalog_name = catalog_name;
+	data.consumer_name = consumer_name;
+	data.timeout_ms = timeout_ms;
+	return WaitForSnapshot(context, data);
+}
+
+void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
+	const auto varchar_list = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+	const auto bigint_list = duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT);
+	duckdb::TableFunction ddl_create_function(
+	    "cdc_ddl_consumer_create",
+	    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+	    RowScanExecute, DdlConsumerCreateBind, ConsumerCreateInit);
+	ddl_create_function.named_parameters["start_at"] = duckdb::LogicalType::VARCHAR;
+	ddl_create_function.named_parameters["schemas"] = varchar_list;
+	ddl_create_function.named_parameters["schema_ids"] = bigint_list;
+	ddl_create_function.named_parameters["table_names"] = varchar_list;
+	ddl_create_function.named_parameters["table_ids"] = bigint_list;
+	ddl_create_function.named_parameters["metadata"] = duckdb::LogicalType::VARCHAR;
+	loader.RegisterFunction(ddl_create_function);
+
+	duckdb::TableFunction dml_create_function(
+	    "cdc_dml_consumer_create",
+	    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+	    RowScanExecute, DmlConsumerCreateBind, ConsumerCreateInit);
+	dml_create_function.named_parameters["start_at"] = duckdb::LogicalType::VARCHAR;
+	dml_create_function.named_parameters["table_names"] = varchar_list;
+	dml_create_function.named_parameters["table_ids"] = bigint_list;
+	dml_create_function.named_parameters["change_types"] = varchar_list;
+	dml_create_function.named_parameters["metadata"] = duckdb::LogicalType::VARCHAR;
+	loader.RegisterFunction(dml_create_function);
+
+	for (const auto &name : {"cdc_consumer_reset"}) {
 		duckdb::TableFunction reset_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, ConsumerResetBind, ConsumerResetInit);
@@ -1969,28 +2021,28 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(reset_function);
 	}
 
-	for (const auto &name : {"cdc_consumer_drop", "ducklake_cdc_consumer_drop"}) {
+	for (const auto &name : {"cdc_consumer_drop"}) {
 		duckdb::TableFunction drop_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, ConsumerDropBind, ConsumerDropInit);
 		loader.RegisterFunction(drop_function);
 	}
 
-	for (const auto &name : {"cdc_consumer_force_release", "ducklake_cdc_consumer_force_release"}) {
+	for (const auto &name : {"cdc_consumer_force_release"}) {
 		duckdb::TableFunction force_release_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, ConsumerForceReleaseBind, ConsumerForceReleaseInit);
 		loader.RegisterFunction(force_release_function);
 	}
 
-	for (const auto &name : {"cdc_consumer_heartbeat", "ducklake_cdc_consumer_heartbeat"}) {
+	for (const auto &name : {"cdc_consumer_heartbeat"}) {
 		duckdb::TableFunction heartbeat_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, ConsumerHeartbeatBind, ConsumerHeartbeatInit);
 		loader.RegisterFunction(heartbeat_function);
 	}
 
-	for (const auto &name : {"cdc_window", "ducklake_cdc_window"}) {
+	for (const auto &name : {"cdc_window"}) {
 		duckdb::TableFunction window_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, CdcWindowBind, CdcWindowInit);
@@ -1998,7 +2050,7 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(window_function);
 	}
 
-	for (const auto &name : {"cdc_commit", "ducklake_cdc_commit"}) {
+	for (const auto &name : {"cdc_commit"}) {
 		duckdb::TableFunction commit_function(name,
 		                                      duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
 		                                                                           duckdb::LogicalType::VARCHAR,
@@ -2007,21 +2059,13 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(commit_function);
 	}
 
-	for (const auto &name : {"cdc_wait", "ducklake_cdc_wait"}) {
-		duckdb::TableFunction wait_function(
-		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, CdcWaitBind, CdcWaitInit);
-		wait_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
-		loader.RegisterFunction(wait_function);
-	}
-
-	for (const auto &name : {"cdc_consumer_list", "ducklake_cdc_consumer_list"}) {
+	for (const auto &name : {"cdc_list_consumers"}) {
 		duckdb::TableFunction list_function(name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
 		                                    RowScanExecute, ConsumerListBind, ConsumerListInit);
 		loader.RegisterFunction(list_function);
 	}
 
-	for (const auto &name : {"cdc_consumer_subscriptions", "ducklake_cdc_consumer_subscriptions"}) {
+	for (const auto &name : {"cdc_list_subscriptions"}) {
 		duckdb::TableFunction subscriptions_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR}, RowScanExecute,
 		    ConsumerSubscriptionsBind, ConsumerSubscriptionsInit);

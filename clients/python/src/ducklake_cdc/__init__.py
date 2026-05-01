@@ -35,7 +35,6 @@ from ducklake_cdc.models import (
     DoctorDiagnostic,
     SchemaDiff,
     SnapshotEvent,
-    Subscription,
 )
 
 __all__ = [
@@ -65,7 +64,6 @@ __all__ = [
     "SchemaDiff",
     "ScopeKind",
     "SnapshotEvent",
-    "Subscription",
     "SubscriptionStatus",
     "TableChangeBatch",
     "__version__",

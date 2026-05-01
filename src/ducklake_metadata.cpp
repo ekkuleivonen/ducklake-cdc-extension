@@ -424,6 +424,7 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
 	       " ("
 	       "consumer_name VARCHAR, "
+	       "consumer_kind VARCHAR NOT NULL, "
 	       "consumer_id BIGINT NOT NULL, "
 	       "stop_at_schema_change BOOLEAN NOT NULL, "
 	       "last_committed_snapshot BIGINT, "

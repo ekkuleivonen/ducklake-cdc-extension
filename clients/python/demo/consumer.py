@@ -24,7 +24,6 @@ from ducklake import DuckLake
 from ducklake_cdc import (
     CDCClient,
     ConsumerBatch,
-    Subscription,
     iter_consumer_batches,
 )
 
@@ -59,7 +58,7 @@ def main() -> None:
         try:
             cdc = CDCClient(lake)
             cdc.load_extension(path=_local_extension_path())
-            ensure_consumer(cdc, start_at=args.start_at)
+            table_names = ensure_consumer(cdc, lake=lake, start_at=args.start_at)
 
             wait_lake = open_demo_lake(
                 allow_unsigned_extensions=True,
@@ -75,7 +74,7 @@ def main() -> None:
             for batch in stream_changes(
                 cdc,
                 wait_cdc,
-                lake,
+                table_names=table_names,
                 timeout_ms=args.timeout_ms,
                 max_snapshots=args.max_snapshots,
                 max_windows=args.max_windows,
@@ -148,20 +147,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def ensure_consumer(cdc: CDCClient, *, start_at: str) -> None:
-    subscription = Subscription.model_validate(
-        {
-            "scope_kind": "catalog",
-            "event_category": "*",
-            "change_type": "*",
-        }
-    )
+def ensure_consumer(cdc: CDCClient, *, lake: DuckLake, start_at: str) -> list[str]:
+    table_names = [f"{table.schema_name}.{table.name}" for table in lake.tables()]
+
     def create() -> None:
-        cdc.consumer_create(
+        cdc.dml_consumer_create(
             CONSUMER_NAME,
-            subscriptions=[subscription],
+            table_names=table_names,
             start_at=int(start_at) if start_at.isdigit() else start_at,
-            stop_at_schema_change=False,
         )
 
     try:
@@ -173,13 +166,14 @@ def ensure_consumer(cdc: CDCClient, *, start_at: str) -> None:
             create()
         except Exception:
             raise
+    return table_names
 
 
 def stream_changes(
     cdc: CDCClient,
     wait_cdc: CDCClient,
-    lake: DuckLake,
     *,
+    table_names: Sequence[str],
     timeout_ms: int,
     max_snapshots: int,
     max_windows: int,
@@ -190,7 +184,7 @@ def stream_changes(
         cdc,
         wait_cdc,
         CONSUMER_NAME,
-        lake=lake,
+        table_names=table_names,
         timeout_ms=timeout_ms,
         max_snapshots=max_snapshots,
         max_windows=max_windows,

@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ducklake_cdc.enums import (
     ChangeType,
@@ -25,39 +25,11 @@ class CDCModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, use_enum_values=True)
 
 
-class Subscription(CDCModel):
-    """Input model for `cdc_consumer_create(..., subscriptions := ...)`."""
-
-    scope_kind: ScopeKind
-    schema_name: str | None = None
-    table_name: str | None = None
-    schema_id: int | None = None
-    table_id: int | None = None
-    event_category: EventCategory = EventCategory.ALL
-    change_type: ChangeType = ChangeType.ALL
-
-    @model_validator(mode="after")
-    def _validate_scope(self) -> Subscription:
-        if self.scope_kind == ScopeKind.CATALOG and any(
-            value is not None
-            for value in (self.schema_name, self.table_name, self.schema_id, self.table_id)
-        ):
-            raise ValueError("catalog subscriptions must not set schema or table fields")
-        if self.scope_kind == ScopeKind.SCHEMA and self.table_id is not None:
-            raise ValueError("schema subscriptions must not set table_id")
-        if self.scope_kind == ScopeKind.TABLE and not (
-            self.table_id is not None or self.table_name is not None
-        ):
-            raise ValueError("table subscriptions require table_id or table_name")
-        if self.event_category == EventCategory.DDL and self.change_type != ChangeType.ALL:
-            raise ValueError("DDL subscriptions must use change_type='*'")
-        return self
-
-
 class ConsumerSubscription(CDCModel):
     """Normalized subscription row from create/subscription inspection calls."""
 
     consumer_name: str
+    consumer_kind: str
     consumer_id: int
     last_committed_snapshot: int | None = None
     subscription_id: int
@@ -96,6 +68,7 @@ class ConsumerForceRelease(CDCModel):
 
 class ConsumerListEntry(CDCModel):
     consumer_name: str
+    consumer_kind: str
     consumer_id: int
     subscription_count: int
     subscriptions_active: int
@@ -195,6 +168,7 @@ class SchemaDiff(CDCModel):
 
 class ConsumerStats(CDCModel):
     consumer_name: str
+    consumer_kind: str | None = None
     consumer_id: int
     last_committed_snapshot: int
     current_snapshot: int

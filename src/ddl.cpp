@@ -1110,12 +1110,18 @@ struct CdcDdlData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t max_snapshots;
+	bool auto_commit = false;
+	bool listen = false;
+	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<CdcDdlData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->max_snapshots = max_snapshots;
+		result->auto_commit = auto_commit;
+		result->listen = listen;
+		result->timeout_ms = timeout_ms;
 		return std::move(result);
 	}
 
@@ -1124,10 +1130,18 @@ struct CdcDdlData : public duckdb::TableFunctionData {
 	}
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcDdlBind(duckdb::ClientContext &context,
-                                                    duckdb::TableFunctionBindInput &input,
-                                                    duckdb::vector<duckdb::LogicalType> &return_types,
-                                                    duckdb::vector<duckdb::string> &names) {
+int64_t DdlTimeoutMsParameter(duckdb::TableFunctionBindInput &input) {
+	auto entry = input.named_parameters.find("timeout_ms");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return DEFAULT_WAIT_TIMEOUT_MS;
+	}
+	return entry->second.GetValue<int64_t>();
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcDdlBindBase(duckdb::ClientContext &context,
+                                                        duckdb::TableFunctionBindInput &input,
+                                                        duckdb::vector<duckdb::LogicalType> &return_types,
+                                                        duckdb::vector<duckdb::string> &names, bool listen) {
 	if (input.inputs.size() != 2) {
 		throw duckdb::BinderException("cdc_ddl requires catalog and consumer name");
 	}
@@ -1135,6 +1149,12 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcDdlBind(duckdb::ClientContext &conte
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->max_snapshots = MaxSnapshotsParameter(input);
+	result->listen = listen;
+	result->timeout_ms = DdlTimeoutMsParameter(input);
+	auto auto_commit_entry = input.named_parameters.find("auto_commit");
+	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
+		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
+	}
 
 	names = {"snapshot_id", "snapshot_time", "event_kind",  "object_kind", "schema_id",
 	         "schema_name", "object_id",     "object_name", "details"};
@@ -1144,10 +1164,30 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcDdlBind(duckdb::ClientContext &conte
 	return std::move(result);
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> CdcDdlReadBind(duckdb::ClientContext &context,
+                                                        duckdb::TableFunctionBindInput &input,
+                                                        duckdb::vector<duckdb::LogicalType> &return_types,
+                                                        duckdb::vector<duckdb::string> &names) {
+	return CdcDdlBindBase(context, input, return_types, names, false);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcDdlListenBind(duckdb::ClientContext &context,
+                                                          duckdb::TableFunctionBindInput &input,
+                                                          duckdb::vector<duckdb::LogicalType> &return_types,
+                                                          duckdb::vector<duckdb::string> &names) {
+	return CdcDdlBindBase(context, input, return_types, names, true);
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientContext &context,
                                                                 duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcDdlData>();
+	if (data.listen) {
+		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		if (ready.empty() || ready[0].IsNull()) {
+			return std::move(result);
+		}
+	}
 
 	CdcWindowData window_data;
 	window_data.catalog_name = data.catalog_name;
@@ -1181,6 +1221,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	end_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	ExtractDdlRows(conn, data.catalog_name, start_snapshot, end_snapshot, std::string(), result->rows);
 	ApplyDdlSubscriptionFilter(result->rows, subscriptions);
+	if (data.auto_commit) {
+		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	}
 	return std::move(result);
 }
 
@@ -1653,15 +1696,19 @@ bool ChangesTouchConsumerTables(duckdb::Connection &conn, const std::string &cat
 }
 
 void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
-	for (const auto &name : {"cdc_ddl", "ducklake_cdc_ddl"}) {
+	for (const auto &name :
+	     {"cdc_ddl_changes_read", "cdc_ddl_changes_listen", "cdc_ddl_ticks_read", "cdc_ddl_ticks_listen"}) {
+		const auto bind = std::string(name).find("_listen") == std::string::npos ? CdcDdlReadBind : CdcDdlListenBind;
 		duckdb::TableFunction ddl_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, CdcDdlBind, CdcDdlInit);
+		    RowScanExecute, bind, CdcDdlInit);
 		ddl_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
+		ddl_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		ddl_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(ddl_function);
 	}
 
-	for (const auto &name : {"cdc_recent_ddl", "ducklake_cdc_recent_ddl"}) {
+	for (const auto &name : {"cdc_ddl_changes_query"}) {
 		duckdb::TableFunction recent_ddl_function(name,
 		                                          duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
 		                                          RowScanExecute, CdcRecentDdlBind, CdcRecentDdlInit);
@@ -1670,7 +1717,7 @@ void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(recent_ddl_function);
 	}
 
-	for (const auto &name : {"cdc_range_ddl", "ducklake_cdc_range_ddl"}) {
+	for (const auto &name : {"cdc_ddl_changes_query", "cdc_ddl_ticks_query"}) {
 		duckdb::TableFunction range_ddl_function_2(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
 		    RowScanExecute, CdcRangeDdlBind, CdcRangeDdlInit);
@@ -1685,7 +1732,7 @@ void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(range_ddl_function_3);
 	}
 
-	for (const auto &name : {"cdc_schema_diff", "ducklake_cdc_schema_diff"}) {
+	for (const auto &name : {"cdc_schema_diff"}) {
 		duckdb::TableFunction schema_diff_function(
 		    name,
 		    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,

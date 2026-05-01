@@ -25,7 +25,6 @@ from ducklake_cdc.models import (
     DoctorDiagnostic,
     SchemaDiff,
     SnapshotEvent,
-    Subscription,
 )
 from ducklake_cdc.sql import SqlValue, scalar_function_sql, table_function_sql
 
@@ -55,22 +54,53 @@ class CDCClient:
     def version(self) -> str:
         return str(self.lake.sql(scalar_function_sql("cdc_version")).scalar())
 
-    def consumer_create(
+    def ddl_consumer_create(
         self,
         name: str,
         *,
-        subscriptions: list[Subscription],
+        schemas: list[str] | None = None,
+        schema_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
+        table_ids: list[int] | None = None,
         start_at: str | int = "now",
-        stop_at_schema_change: bool = True,
+        metadata: str | None = None,
     ) -> list[ConsumerSubscription]:
         return _model_list(
             self._table(
-                "cdc_consumer_create",
+                "cdc_ddl_consumer_create",
                 name,
                 named={
                     "start_at": start_at,
-                    "subscriptions": subscriptions,
-                    "stop_at_schema_change": stop_at_schema_change,
+                    "schemas": schemas,
+                    "schema_ids": schema_ids,
+                    "table_names": table_names,
+                    "table_ids": table_ids,
+                    "metadata": metadata,
+                },
+            ),
+            ConsumerSubscription,
+        )
+
+    def dml_consumer_create(
+        self,
+        name: str,
+        *,
+        table_names: list[str] | None = None,
+        table_ids: list[int] | None = None,
+        change_types: list[str] | None = None,
+        start_at: str | int = "now",
+        metadata: str | None = None,
+    ) -> list[ConsumerSubscription]:
+        return _model_list(
+            self._table(
+                "cdc_dml_consumer_create",
+                name,
+                named={
+                    "start_at": start_at,
+                    "table_names": table_names,
+                    "table_ids": table_ids,
+                    "change_types": change_types,
+                    "metadata": metadata,
                 },
             ),
             ConsumerSubscription,
@@ -92,11 +122,11 @@ class CDCClient:
         return _model_one(self._table("cdc_consumer_force_release", name), ConsumerForceRelease)
 
     def consumer_list(self) -> list[ConsumerListEntry]:
-        return _model_list(self._table("cdc_consumer_list"), ConsumerListEntry)
+        return _model_list(self._table("cdc_list_consumers"), ConsumerListEntry)
 
     def consumer_subscriptions(self, name: str | None = None) -> list[ConsumerSubscription]:
         return _model_list(
-            self._table("cdc_consumer_subscriptions", named={"name": name}),
+            self._table("cdc_list_subscriptions", named={"name": name}),
             ConsumerSubscription,
         )
 
@@ -113,10 +143,8 @@ class CDCClient:
         notified = self._wait_postgres_notify(name, timeout_ms=timeout_ms)
         if notified is not None:
             return notified
-        return _model_one(
-            self._table("cdc_wait", name, named={"timeout_ms": timeout_ms}),
-            ConsumerWait,
-        )
+        events = self.dml_ticks_listen(name, timeout_ms=timeout_ms)
+        return ConsumerWait(snapshot_id=events[0].snapshot_id if events else None)
 
     def changes(
         self,
@@ -129,7 +157,7 @@ class CDCClient:
         end_snapshot: int | None = None,
     ) -> Result:
         return self._table(
-            "cdc_changes",
+            "cdc_dml_table_changes_read",
             name,
             named={
                 "table_id": table_id,
@@ -164,19 +192,40 @@ class CDCClient:
 
     def ddl(self, name: str, *, max_snapshots: int = 100) -> list[DdlEvent]:
         return _model_list(
-            self._table("cdc_ddl", name, named={"max_snapshots": max_snapshots}),
+            self._table("cdc_ddl_changes_read", name, named={"max_snapshots": max_snapshots}),
             DdlEvent,
         )
 
     def events(self, name: str, *, max_snapshots: int = 100) -> list[SnapshotEvent]:
         return _model_list(
-            self._table("cdc_events", name, named={"max_snapshots": max_snapshots}),
+            self._table("cdc_dml_ticks_read", name, named={"max_snapshots": max_snapshots}),
+            SnapshotEvent,
+        )
+
+    def dml_ticks_listen(
+        self,
+        name: str,
+        *,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> list[SnapshotEvent]:
+        return _model_list(
+            self._table(
+                "cdc_dml_ticks_listen",
+                name,
+                named={
+                    "timeout_ms": timeout_ms,
+                    "max_snapshots": max_snapshots,
+                    "auto_commit": auto_commit,
+                },
+            ),
             SnapshotEvent,
         )
 
     def recent_changes(self, table_name: str, *, since_seconds: int = 300) -> Result:
         return self._table(
-            "cdc_recent_changes",
+            "cdc_dml_table_changes_query",
             table_name,
             named={"since_seconds": since_seconds},
         )
@@ -200,7 +249,7 @@ class CDCClient:
     ) -> list[DdlEvent]:
         return _model_list(
             self._table(
-                "cdc_recent_ddl",
+                "cdc_ddl_changes_query",
                 named={"since_seconds": since_seconds, "for_table": for_table},
             ),
             DdlEvent,
@@ -224,7 +273,7 @@ class CDCClient:
         to_snapshot: int | None = None,
     ) -> list[SnapshotEvent]:
         return _model_list(
-            self._table("cdc_range_events", from_snapshot, named={"to_snapshot": to_snapshot}),
+            self._table("cdc_dml_ticks_query", from_snapshot, named={"to_snapshot": to_snapshot}),
             SnapshotEvent,
         )
 
@@ -235,7 +284,7 @@ class CDCClient:
         to_snapshot: int | None = None,
     ) -> list[DdlEvent]:
         return _model_list(
-            self._table("cdc_range_ddl", from_snapshot, named={"to_snapshot": to_snapshot}),
+            self._table("cdc_ddl_changes_query", from_snapshot, named={"to_snapshot": to_snapshot}),
             DdlEvent,
         )
 
@@ -248,7 +297,7 @@ class CDCClient:
         table_name: str | None = None,
     ) -> Result:
         return self._table(
-            "cdc_range_changes",
+            "cdc_dml_table_changes_query",
             from_snapshot,
             named={
                 "to_snapshot": to_snapshot,
@@ -289,7 +338,7 @@ class CDCClient:
     ) -> list[AuditEntry]:
         return _model_list(
             self._table(
-                "cdc_audit_recent",
+                "cdc_audit_events",
                 named={"since_seconds": since_seconds, "consumer": consumer},
             ),
             AuditEntry,
@@ -305,15 +354,13 @@ class CDCClient:
         self,
         function_name: str,
         *args: SqlValue,
-        named: dict[str, SqlValue | list[Subscription]] | None = None,
+        named: dict[str, SqlValue | list[str] | list[int]] | None = None,
     ) -> Result:
         return self.lake.sql(table_function_sql(function_name, self.catalog, *args, named=named))
 
     def _wait_once(self, name: str) -> ConsumerWait:
-        return _model_one(
-            self._table("cdc_wait", name, named={"timeout_ms": 0}),
-            ConsumerWait,
-        )
+        events = self.dml_ticks_listen(name, timeout_ms=0)
+        return ConsumerWait(snapshot_id=events[0].snapshot_id if events else None)
 
     def _wait_postgres_notify(self, name: str, *, timeout_ms: int) -> ConsumerWait | None:
         if timeout_ms < 0:
