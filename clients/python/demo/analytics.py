@@ -231,7 +231,6 @@ def summary_table(summary: Mapping[str, Any]) -> str:
         rows.append(("tables_per_window_p95", format_float(table_counts["p95"])))
     if isinstance(rows_per_table, Mapping):
         rows.append(("rows_per_table_call_p95", format_float(rows_per_table["p95"])))
-
     operation_ms = summary["operation_ms"]
     if isinstance(operation_ms, Mapping):
         for name, metrics in operation_ms.items():

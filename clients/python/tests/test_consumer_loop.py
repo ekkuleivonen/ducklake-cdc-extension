@@ -11,8 +11,6 @@ from ducklake_cdc.models import (
     ConsumerCommit,
     ConsumerWait,
     ConsumerWindow,
-    DdlEvent,
-    SnapshotEvent,
 )
 
 
@@ -34,22 +32,6 @@ class FakeCDC:
             schema_version=1,
             schema_changes_pending=False,
         )
-
-    def ddl(self, name: str, *, max_snapshots: int) -> list[DdlEvent]:
-        self.calls.append(f"ddl:{name}:{max_snapshots}")
-        return []
-
-    def events(self, name: str, *, max_snapshots: int) -> list[SnapshotEvent]:
-        self.calls.append(f"events:{name}:{max_snapshots}")
-        return [
-            SnapshotEvent(
-                snapshot_id=42,
-                snapshot_time=self.now,
-                changes_made="table:main.orders",
-                schema_version=1,
-                schema_changes_pending=False,
-            )
-        ]
 
     def changes_rows(
         self,
@@ -138,6 +120,8 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
     assert len(batches) == 1
     assert batches[0].window.end_snapshot == 42
     assert batches[0].commit.committed_snapshot == 42
+    assert batches[0].ddl_events == []
+    assert batches[0].snapshot_events == []
     assert batches[0].change_count == 1
     assert [table.table_name for table in batches[0].table_changes] == [
         "main.orders",
@@ -146,16 +130,14 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
     assert wait_cdc.calls == ["wait:orders_sink:25"]
     assert cdc.calls == [
         "window:orders_sink:10",
-        "ddl:orders_sink:10",
-        "events:orders_sink:10",
         "changes:orders_sink:main.orders:10",
         "changes:orders_sink:main.users:10",
         "commit:orders_sink:42",
     ]
     assert stats.waits == [True]
     assert stats.windows == [True]
-    assert stats.ddl_counts == [0]
-    assert stats.event_counts == [1]
+    assert stats.ddl_counts == []
+    assert stats.event_counts == []
     assert stats.table_counts == [2]
     assert stats.change_counts == [("main.orders", 1), ("main.users", 0)]
     assert stats.commits == 1
@@ -184,4 +166,6 @@ def test_iter_consumer_batches_applies_retry_policy() -> None:
         )
     )
 
-    assert retry_calls == 6
+    assert retry_calls == 4
+
+

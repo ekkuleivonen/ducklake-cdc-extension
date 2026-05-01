@@ -21,7 +21,12 @@ from common import (
 )
 
 from ducklake import DuckLake
-from ducklake_cdc import CDCClient, ConsumerBatch, Subscription, iter_consumer_batches
+from ducklake_cdc import (
+    CDCClient,
+    ConsumerBatch,
+    Subscription,
+    iter_consumer_batches,
+)
 
 CONSUMER_NAME = "stdout_demo"
 DEFAULT_CDC_EXTENSION = (

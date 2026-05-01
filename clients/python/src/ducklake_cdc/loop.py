@@ -107,14 +107,12 @@ def iter_consumer_batches(
             continue
         last_activity = time.monotonic()
 
-        window = _timed(
-            stats,
-            "cdc_window",
-            lambda: _run_with_retry(
-                retry,
-                lambda: cdc.window(consumer_name, max_snapshots=max_snapshots),
-            ),
+        window_operation = partial(
+            cdc.window,
+            consumer_name,
+            max_snapshots=max_snapshots,
         )
+        window = _timed_retry(stats, "cdc_window", retry, window_operation)
         if stats is not None:
             stats.record_window(has_changes=window.has_changes)
         if not window.has_changes:
@@ -122,28 +120,6 @@ def iter_consumer_batches(
             continue
 
         processing_started = time.perf_counter()
-        ddl_events = _timed(
-            stats,
-            "cdc_ddl",
-            lambda: _run_with_retry(
-                retry,
-                lambda: cdc.ddl(consumer_name, max_snapshots=max_snapshots),
-            ),
-        )
-        if stats is not None:
-            stats.record_ddl(len(ddl_events))
-
-        snapshot_events = _timed(
-            stats,
-            "cdc_events",
-            lambda: _run_with_retry(
-                retry,
-                lambda: cdc.events(consumer_name, max_snapshots=max_snapshots),
-            ),
-        )
-        if stats is not None:
-            stats.record_events(len(snapshot_events))
-
         resolved_table_names = list(
             _timed(
                 stats,
@@ -170,12 +146,12 @@ def iter_consumer_batches(
                     stats.record_latency(change.values.get("produced_ns"), consumed_ns=consumed_ns)
             table_changes.append(TableChangeBatch(table_name=table_name, changes=changes))
 
+        processing_ms = (time.perf_counter() - processing_started) * 1000.0
         if stats is not None:
             stats.record_operation(
                 "cdc_window_processing",
-                (time.perf_counter() - processing_started) * 1000.0,
+                processing_ms,
             )
-
         end_snapshot = window.end_snapshot
         commit_operation = partial(cdc.commit, consumer_name, end_snapshot)
         commit = _timed_retry(stats, "cdc_commit", retry, commit_operation)
@@ -184,8 +160,8 @@ def iter_consumer_batches(
 
         yield ConsumerBatch(
             window=window,
-            ddl_events=ddl_events,
-            snapshot_events=snapshot_events,
+            ddl_events=[],
+            snapshot_events=[],
             table_changes=table_changes,
             commit=commit,
         )
