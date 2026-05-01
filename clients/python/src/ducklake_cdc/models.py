@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -108,6 +109,10 @@ class ChangeRow(CDCModel):
     start_snapshot: int | None = None
     end_snapshot: int | None = None
     snapshot_id: int
+    schema_id: int | None = None
+    schema_name: str | None = None
+    table_id: int | None = None
+    table_name: str | None = None
     rowid: int | None = None
     change_type: ChangeType
     snapshot_time: datetime | None = None
@@ -122,7 +127,21 @@ class ChangeRow(CDCModel):
         fixed_keys = set(cls.model_fields)
         values = {key: value for key, value in row.items() if key not in fixed_keys}
         fixed = {key: value for key, value in row.items() if key in fixed_keys}
+        if "values" in fixed:
+            values = parse_values_payload(fixed.pop("values"))
         return cls(**fixed, values=values)
+
+
+def parse_values_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"expected DML values payload to be a JSON object, got {type(value).__name__}")
 
 
 class DdlEvent(CDCModel):

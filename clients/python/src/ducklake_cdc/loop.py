@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Protocol, TypeVar
 
-from ducklake import DuckLake
 from ducklake_cdc.client import CDCClient
 from ducklake_cdc.models import ChangeRow, ConsumerCommit, ConsumerWindow, DdlEvent, SnapshotEvent
 
 T = TypeVar("T")
-TableNameResolver = Callable[[], Iterable[str]]
 
 
 class RetryPolicy(Protocol):
@@ -88,16 +86,12 @@ class ConsumerBatch:
 
 def iter_consumer_batches(
     cdc: CDCClient,
-    wait_cdc: CDCClient,
     consumer_name: str,
     *,
-    lake: DuckLake | None = None,
-    table_names: Iterable[str] | TableNameResolver | None = None,
     timeout_ms: int = 1_000,
     max_snapshots: int = 100,
     max_windows: int = 0,
     idle_timeout: float = 5.0,
-    idle_sleep_seconds: float = 0.05,
     retry: RetryPolicy | None = None,
     stats: ConsumerLoopStats | None = None,
 ) -> Iterator[ConsumerBatch]:
@@ -107,73 +101,48 @@ def iter_consumer_batches(
     choose whether to print, buffer, or sink the returned batches.
     """
 
-    table_resolver = _table_resolver(lake=lake, table_names=table_names)
     committed_windows = 0
     last_activity = time.monotonic()
     if stats is not None:
         stats.record_consumer(consumer_name)
 
     while True:
-        ticks = _timed(
-            stats,
-            "cdc_dml_ticks_listen",
-            lambda: _run_with_retry(
-                retry,
-                lambda: wait_cdc.dml_ticks_listen(consumer_name, timeout_ms=timeout_ms),
-            ),
+        changes_operation = partial(
+            cdc.dml_changes_listen_rows,
+            consumer_name,
+            timeout_ms=timeout_ms,
+            max_snapshots=max_snapshots,
         )
+        changes = _timed_retry(stats, "cdc_dml_changes_listen", retry, changes_operation)
+        consumed_ns = time.monotonic_ns()
+        consumed_epoch_ns = time.time_ns()
         if stats is not None:
-            stats.record_wait(has_snapshot=bool(ticks))
-        if not ticks:
+            stats.record_wait(has_snapshot=bool(changes))
+            stats.record_window(has_changes=bool(changes))
+        if not changes:
             if idle_timeout and time.monotonic() - last_activity >= idle_timeout:
                 return
             continue
         last_activity = time.monotonic()
 
-        # The listen call resolves a CDC window and acquires the consumer lease.
-        # Continue lease-bound operations on that same connection until commit.
-        window_operation = partial(
-            wait_cdc.window,
-            consumer_name,
-            max_snapshots=max_snapshots,
-        )
-        window = _timed_retry(stats, "cdc_window", retry, window_operation)
-        if stats is not None:
-            stats.record_window(has_changes=window.has_changes)
-        if not window.has_changes:
-            time.sleep(idle_sleep_seconds)
-            continue
-
         processing_started = time.perf_counter()
-        resolved_table_names = list(
-            _timed(
-                stats,
-                "lake_tables",
-                lambda: _run_with_retry(retry, table_resolver),
-            )
-        )
+        changes_by_table: dict[str, list[ChangeRow]] = {}
+        for change in changes:
+            table_name = change.table_name or "<unknown>"
+            changes_by_table.setdefault(table_name, []).append(change)
+        table_changes = [
+            TableChangeBatch(table_name=table_name, changes=table_rows)
+            for table_name, table_rows in changes_by_table.items()
+        ]
         if stats is not None:
-            stats.record_tables(len(resolved_table_names))
-
-        table_changes: list[TableChangeBatch] = []
-        for table_name in resolved_table_names:
-            changes_operation = partial(
-                cdc.dml_table_changes_read_rows,
-                consumer_name,
-                table_name=table_name,
-                max_snapshots=max_snapshots,
-                start_snapshot=window.start_snapshot,
-                end_snapshot=window.end_snapshot,
-            )
-            changes = _timed_retry(stats, "cdc_dml_table_changes_read", retry, changes_operation)
-            consumed_ns = time.monotonic_ns()
-            consumed_epoch_ns = time.time_ns()
+            stats.record_tables(len(table_changes))
+        for table in table_changes:
             if stats is not None:
-                stats.record_changes(len(changes), table_name=table_name)
-                for change in changes:
+                stats.record_changes(len(table.changes), table_name=table.table_name)
+                for change in table.changes:
                     stats.record_change_observation(
                         change_type=change.change_type,
-                        table_name=table_name,
+                        table_name=table.table_name,
                         values=change.values,
                     )
                     stats.record_change_latency(
@@ -184,7 +153,6 @@ def iter_consumer_batches(
                         consumed_ns=consumed_ns,
                         consumed_epoch_ns=consumed_epoch_ns,
                     )
-            table_changes.append(TableChangeBatch(table_name=table_name, changes=changes))
 
         processing_ms = (time.perf_counter() - processing_started) * 1000.0
         if stats is not None:
@@ -192,11 +160,25 @@ def iter_consumer_batches(
                 "cdc_window_processing",
                 processing_ms,
             )
-        end_snapshot = window.end_snapshot
-        commit_operation = partial(wait_cdc.commit, consumer_name, end_snapshot)
+        start_snapshot = min(
+            change.start_snapshot if change.start_snapshot is not None else change.snapshot_id
+            for change in changes
+        )
+        end_snapshot = max(
+            change.end_snapshot if change.end_snapshot is not None else change.snapshot_id
+            for change in changes
+        )
+        commit_operation = partial(cdc.commit, consumer_name, end_snapshot)
         commit = _timed_retry(stats, "cdc_commit", retry, commit_operation)
         if stats is not None:
             stats.record_commit()
+        window = ConsumerWindow(
+            start_snapshot=start_snapshot,
+            end_snapshot=end_snapshot,
+            has_changes=True,
+            schema_version=commit.schema_version,
+            schema_changes_pending=False,
+        )
 
         yield ConsumerBatch(
             window=window,
@@ -209,25 +191,6 @@ def iter_consumer_batches(
         committed_windows += 1
         if max_windows and committed_windows >= max_windows:
             return
-
-
-def _table_resolver(
-    *,
-    lake: DuckLake | None,
-    table_names: Iterable[str] | TableNameResolver | None,
-) -> TableNameResolver:
-    if callable(table_names):
-        return table_names
-    if table_names is not None:
-        names = tuple(table_names)
-        return lambda: names
-    if lake is None:
-        raise ValueError("pass either lake or table_names")
-
-    def resolve_from_lake() -> Iterable[str]:
-        return (f"{table.schema_name}.{table.name}" for table in lake.tables())
-
-    return resolve_from_lake
 
 
 def _timed(

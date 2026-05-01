@@ -45,30 +45,18 @@ def main() -> None:
         catalog_backend=args.catalog_backend,
         storage=args.storage,
     )
-    wait_lake: DuckLake | None = None
     stats = DemoStats()
 
     try:
         try:
             cdc = CDCClient(lake)
             cdc.load_extension(path=_local_extension_path())
-            table_names = ensure_consumer(cdc, lake=lake, start_at=args.start_at)
-
-            wait_lake = open_demo_lake(
-                allow_unsigned_extensions=True,
-                catalog=args.catalog,
-                catalog_backend=args.catalog_backend,
-                storage=args.storage,
-            )
-            wait_cdc = CDCClient(wait_lake)
-            wait_cdc.load_extension(path=_local_extension_path())
+            ensure_consumer(cdc, lake=lake, start_at=args.start_at)
 
             if args.output_mode == "stdout":
                 print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
             for batch in stream_changes(
                 cdc,
-                wait_cdc,
-                table_names=table_names,
                 timeout_ms=args.timeout_ms,
                 max_snapshots=args.max_snapshots,
                 max_windows=args.max_windows,
@@ -83,8 +71,6 @@ def main() -> None:
             stats.record_error(exc)
             raise
     finally:
-        if wait_lake is not None:
-            wait_lake.close()
         lake.close()
         stats.finish()
         emit_summary(stats, output=args.summary_output)
@@ -176,9 +162,7 @@ def parse_snapshot_arg(value: str) -> str | int:
 
 def stream_changes(
     cdc: CDCClient,
-    wait_cdc: CDCClient,
     *,
-    table_names: Sequence[str],
     timeout_ms: int,
     max_snapshots: int,
     max_windows: int,
@@ -187,9 +171,7 @@ def stream_changes(
 ) -> Iterator[ConsumerBatch]:
     return iter_consumer_batches(
         cdc,
-        wait_cdc,
         CONSUMER_NAME,
-        table_names=table_names,
         timeout_ms=timeout_ms,
         max_snapshots=max_snapshots,
         max_windows=max_windows,
