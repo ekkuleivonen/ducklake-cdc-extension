@@ -63,15 +63,25 @@ def attached_pair(
     backend: Backend,
 ) -> Iterator[tuple[duckdb.DuckDBPyConnection, duckdb.DuckDBPyConnection]]:
     a = connect()
-    b = connect()
+    b: duckdb.DuckDBPyConnection | None = None
     try:
-        for con in (a, b):
-            load_extensions(con, backend)
-            con.execute(backend.attach_sql)
+        load_extensions(a, backend)
+        a.execute(backend.attach_sql)
+
+        # `cursor()` gives us a second DuckDB connection against the same
+        # database, matching the C++ multiconnection smoke. Attaching the same
+        # embedded DuckLake metadata file from two independent Python databases
+        # trips DuckDB's unique file-handle guard.
+        b = a.cursor()
+        load_extensions(b, backend)
+        has_lake = b.execute("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'lake'").fetchone()[0]
+        if has_lake == 0:
+            b.execute(backend.attach_sql)
         yield a, b
     finally:
+        if b is not None:
+            b.close()
         a.close()
-        b.close()
 
 
 def reset_postgres_catalog(dsn: str) -> None:
