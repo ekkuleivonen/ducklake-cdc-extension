@@ -93,7 +93,7 @@ jobs:
     # an already-cut release. The matrix already ran when the tag was
     # created; re-running here would burn ~30 minutes of Actions time
     # for no new signal.
-    if: ${{ !inputs.community_pr_only }}
+    if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1
     with:
       duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
@@ -125,7 +125,7 @@ jobs:
     # ccache and complete in ~5-10 minutes.
     name: Sanitiser smoke (ASan + UBSan, no-DuckLake set)
     needs: resolve-duckdb-version
-    if: ${{ !inputs.community_pr_only }}
+    if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
@@ -213,7 +213,7 @@ jobs:
     #   * both the matrix and sanitiser gates succeeded (normal release / dry run), OR
     #   * we're in community_pr_only mode and both gates were intentionally
     #     skipped (their result is "skipped", not "success").
-    if: ${{ always() && ((needs.full-matrix-build.result == 'success' && needs.sanitiser-smoke.result == 'success') || (inputs.community_pr_only && needs.full-matrix-build.result == 'skipped' && needs.sanitiser-smoke.result == 'skipped')) }}
+    if: ${{ always() && ((needs.full-matrix-build.result == 'success' && needs.sanitiser-smoke.result == 'success') || ((inputs.community_pr_only == true || inputs.community_pr_only == 'true') && needs.full-matrix-build.result == 'skipped' && needs.sanitiser-smoke.result == 'skipped')) }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ inputs.version }}
@@ -232,7 +232,7 @@ jobs:
           fi
 
       - name: Validate trigger ref
-        if: ${{ !inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           REF: ${{ github.ref }}
         run: |
@@ -257,7 +257,7 @@ jobs:
           submodules: recursive
 
       - name: Validate version matches branch policy
-        if: ${{ !inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           REF: ${{ github.ref }}
           VERSION: ${{ inputs.version }}
@@ -304,7 +304,7 @@ jobs:
           fi
 
       - name: Verify tag does not already exist
-        if: ${{ !inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -319,7 +319,7 @@ jobs:
 
       - name: Resolve existing release tag
         id: existing_tag
-        if: ${{ inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only == true || inputs.community_pr_only == 'true' }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -331,7 +331,7 @@ jobs:
           echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Verify day-to-day CI is green at the release SHA
-        if: ${{ !inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
@@ -373,7 +373,7 @@ jobs:
 
       - name: Create annotated tag
         id: tag
-        if: ${{ !inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -381,15 +381,17 @@ jobs:
           echo "sha=$(git rev-list -n 1 "$VERSION")" >> "$GITHUB_OUTPUT"
 
       - name: Push tag
-        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' && inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           VERSION: ${{ inputs.version }}
         run: git push origin "refs/tags/$VERSION"
 
-      - name: Create or fast-forward maintenance branch
-        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
+      - name: Create or propose maintenance branch update
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' && inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           BRANCH: ${{ steps.branch.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
         run: |
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH"
@@ -397,15 +399,25 @@ jobs:
               echo "::error::Maintenance branch $BRANCH cannot be fast-forwarded to this release commit."
               exit 1
             fi
-            git push origin "HEAD:refs/heads/$BRANCH"
-            echo "Fast-forwarded maintenance branch $BRANCH to $GITHUB_SHA."
+            update_branch="automation/${BRANCH//\//-}-$VERSION"
+            git push --force-with-lease origin "HEAD:refs/heads/$update_branch"
+            if gh pr list --base "$BRANCH" --head "$update_branch" --state open --json number --jq '.[0].number // empty' | grep -q .; then
+              echo "Maintenance branch update PR already exists for $update_branch -> $BRANCH."
+            else
+              gh pr create \
+                --base "$BRANCH" \
+                --head "$update_branch" \
+                --title "Fast-forward $BRANCH to $VERSION" \
+                --body "Release $VERSION was cut from \`$GITHUB_SHA\`. This PR fast-forwards \`$BRANCH\` to the released commit because the branch is protected and must be updated through a pull request."
+            fi
+            echo "Opened or reused maintenance branch PR for $BRANCH -> $GITHUB_SHA."
           else
             git push origin "HEAD:refs/heads/$BRANCH"
             echo "Created maintenance branch $BRANCH at $GITHUB_SHA."
           fi
 
       - name: Create GitHub Release with auto-generated notes
-        if: ${{ !inputs.dry_run && !inputs.community_pr_only }}
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' && inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
@@ -417,7 +429,7 @@ jobs:
             --generate-notes
 
       - name: Dry-run summary
-        if: ${{ inputs.dry_run }}
+        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
         env:
           VERSION: ${{ inputs.version }}
           BRANCH: ${{ steps.branch.outputs.name }}
@@ -433,7 +445,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Community PR retry summary
-        if: ${{ inputs.community_pr_only }}
+        if: ${{ inputs.community_pr_only == true || inputs.community_pr_only == 'true' }}
         env:
           VERSION: ${{ inputs.version }}
           RELEASE_SHA: ${{ steps.existing_tag.outputs.sha }}
@@ -448,7 +460,7 @@ jobs:
   community-pr:
     name: Open community-extensions PR
     needs: release
-    if: ${{ !inputs.dry_run && !inputs.skip_community_pr }}
+    if: ${{ always() && needs.release.result == 'success' && github.event.inputs.dry_run != 'true' && github.event.inputs.skip_community_pr != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check community bot token is configured
