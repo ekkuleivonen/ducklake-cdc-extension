@@ -108,6 +108,9 @@ class ConsumerWait(CDCModel):
 class ChangeRow(CDCModel):
     """Dynamic DML row with user table columns collected in `values`."""
 
+    consumer_name: str | None = None
+    start_snapshot: int | None = None
+    end_snapshot: int | None = None
     snapshot_id: int
     rowid: int | None = None
     change_type: ChangeType
@@ -127,6 +130,9 @@ class ChangeRow(CDCModel):
 
 
 class DdlEvent(CDCModel):
+    consumer_name: str | None = None
+    start_snapshot: int | None = None
+    end_snapshot: int | None = None
     snapshot_id: int
     snapshot_time: datetime
     event_kind: DdlEventKind
@@ -139,15 +145,24 @@ class DdlEvent(CDCModel):
 
 
 class SnapshotEvent(CDCModel):
+    consumer_name: str | None = None
+    start_snapshot: int | None = None
+    end_snapshot: int | None = None
     snapshot_id: int
     snapshot_time: datetime
-    changes_made: str
+    changes_made: str | None = None
     author: str | None = None
     commit_message: str | None = None
     commit_extra_info: str | None = None
     next_snapshot_id: int | None = None
     schema_version: int
-    schema_changes_pending: bool
+    schema_changes_pending: bool | None = None
+    schema_ids: list[int] | None = None
+    table_ids: list[int] | None = None
+    insert_count: int | None = None
+    update_count: int | None = None
+    delete_count: int | None = None
+    change_count: int | None = None
 
 
 class SchemaDiff(CDCModel):

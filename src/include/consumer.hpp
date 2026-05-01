@@ -6,7 +6,7 @@
 // Consumer lifecycle + cursor primitives. This module owns the consumer
 // state machine: create / reset / drop / list / force-release / heartbeat,
 // and the cursor primitives that read+advance under a single-reader lease
-// (cdc_window, cdc_commit, cdc_wait). It also owns the in-process token
+// (cdc_window, cdc_commit, listen calls). It also owns the in-process token
 // cache, the audit log writer, and the lease/wait/schema-boundary notice
 // helpers - everything that defines what "owning a consumer" means.
 //
@@ -26,7 +26,7 @@ namespace duckdb_cdc {
 
 //! Single row from the `__ducklake_cdc_consumers` state table, normalised
 //! into typed fields. Routing intent lives in
-//! `__ducklake_cdc_consumer_subscriptions`, not on this row.
+//! `__ducklake_cdc_list_subscriptions`, not on this row.
 struct ConsumerRow {
 	std::string consumer_name;
 	std::string consumer_kind;
@@ -40,7 +40,7 @@ struct ConsumerRow {
 	bool stop_at_schema_change = true;
 };
 
-//! One durable row from `__ducklake_cdc_consumer_subscriptions`.
+//! One durable row from `__ducklake_cdc_list_subscriptions`.
 struct ConsumerSubscriptionRow {
 	std::string consumer_name;
 	std::string consumer_kind;
@@ -112,8 +112,8 @@ std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &contex
                                                    const std::string &consumer_name, int64_t timeout_ms);
 
 //! Register all consumer-lifecycle and cursor table functions:
-//! cdc_consumer_create / reset / drop / force_release / heartbeat / list,
-//! plus cdc_window / cdc_commit / cdc_wait. Called once at extension load.
+//! cdc_ddl_consumer_create/cdc_dml_consumer_create / reset / drop / force_release / heartbeat / list,
+//! plus cdc_window / cdc_commit / listen calls. Called once at extension load.
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader);
 
 } // namespace duckdb_cdc

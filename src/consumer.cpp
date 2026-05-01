@@ -6,7 +6,7 @@
 // Implementation of the consumer state machine: lifecycle (create / reset /
 // drop / list / force-release / heartbeat), the in-process token cache,
 // the audit log writer, and the cursor primitives (cdc_window /
-// cdc_commit / cdc_wait). The schema-boundary policy lives here too: a
+// cdc_commit / listen calls). The schema-boundary policy lives here too: a
 // `cdc_window` call consults `SnapshotIsExternalSchemaChange` /
 // `NextExternalSchemaChangeSnapshot` (facts in `ducklake_metadata.cpp`)
 // and *decides* whether to truncate the visible window, then emits the
@@ -65,7 +65,7 @@ namespace {
 //===--------------------------------------------------------------------===//
 // Process-wide caches: owner-token (cdc_window/commit/heartbeat lease
 // continuity per (connection, catalog, consumer)) and the per-connection
-// shared-connection warning latch (cdc_wait).
+// shared-connection warning latch (listen calls).
 //===--------------------------------------------------------------------===//
 
 std::mutex TOKEN_CACHE_MUTEX;
@@ -230,19 +230,17 @@ void EmitSchemaBoundaryNotice(const std::string &consumer_name, int64_t end_snap
 }
 
 //! `CDC_WAIT_TIMEOUT_CLAMPED` notice. Per ADR 0011 and `docs/errors.md`,
-//! `cdc_wait` clamps `timeout_ms` to the session-wide hard cap; this
+//! Listen functions clamp `timeout_ms` to the session-wide hard cap; this
 //! notice exists so the caller can tell the difference between "I asked
 //! for 30 minutes and got NULL because nothing happened" vs "I asked
 //! for 30 minutes and got NULL after 5 because the cap clamped me".
-//! Includes the `SET ducklake_cdc_wait_max_timeout_ms = ...` recovery
-//! line verbatim per the docs/errors.md contract.
+//! Includes the requested and effective timeout so clients can surface a clear
+//! operator message.
 void EmitWaitTimeoutClampedNotice(int64_t requested_ms, int64_t cap_ms) {
 	std::ostringstream out;
-	out << "CDC_WAIT_TIMEOUT_CLAMPED: cdc_wait was called with timeout_ms => " << requested_ms
+	out << "CDC_WAIT_TIMEOUT_CLAMPED: a listen function was called with timeout_ms => " << requested_ms
 	    << " but the session cap is " << cap_ms << " (5 minutes); the call will return after at most " << cap_ms
-	    << "ms. To raise the cap for this session: SET ducklake_cdc_wait_max_timeout_ms = " << requested_ms
-	    << "; Caps above 1 hour mean a single connection is blocked for that long; prefer shorter "
-	       "waits with re-polling for long-lived consumers.";
+	    << "ms. Prefer shorter waits with re-polling for long-lived consumers.";
 	duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, out.str());
 }
 
@@ -251,8 +249,8 @@ void EmitWaitTimeoutClampedNotice(int64_t requested_ms, int64_t cap_ms) {
 //! lets us reliably detect when a connection is "shared" with other
 //! query-issuing call sites (prepared statements, cursors, pooled
 //! handles), so per the roadmap item this fires unconditionally on
-//! first `cdc_wait` per connection. The warning is informational
-//! ("if you're calling cdc_wait on a shared connection, here is why
+//! first listen function per connection. The warning is informational
+//! ("if you're calling a listen function on a shared connection, here is why
 //! that is a foot gun") and only emits once so SQL-CLI and notebook
 //! users are not spammed.
 void MaybeEmitWaitSharedConnectionWarning(duckdb::ClientContext &context, int64_t timeout_ms) {
@@ -265,10 +263,10 @@ void MaybeEmitWaitSharedConnectionWarning(duckdb::ClientContext &context, int64_
 		WAIT_WARNED_CONNECTIONS.insert(connection_id);
 	}
 	std::ostringstream out;
-	out << "CDC_WAIT_SHARED_CONNECTION: cdc_wait holds this DuckDB connection for up to " << timeout_ms
+	out << "CDC_WAIT_SHARED_CONNECTION: listen calls hold this DuckDB connection for up to " << timeout_ms
 	    << "ms. Calling it from a connection that also serves other queries (a pool handle, a "
 	       "shared notebook session, an HTTP request handler) can starve them. Hold a dedicated "
-	       "connection for cdc_wait. SQL-CLI users must do this themselves. See docs/api.md#cdc_wait.";
+	       "connection for listen calls. SQL-CLI users must do this themselves. See docs/api.md.";
 	duckdb::Printer::Print(duckdb::OutputStream::STREAM_STDERR, out.str());
 }
 
@@ -289,7 +287,7 @@ void InsertAuditRow(duckdb::Connection &conn, const std::string &catalog_name, c
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_consumer_create
+// cdc_ddl_consumer_create/cdc_dml_consumer_create
 //===--------------------------------------------------------------------===//
 
 struct ConsumerCreateData : public duckdb::TableFunctionData {
@@ -1447,7 +1445,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerHeartbeatInit(duckd
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_wait
+// listen helper
 //===--------------------------------------------------------------------===//
 
 struct CdcWaitData : public duckdb::TableFunctionData {
@@ -1481,7 +1479,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &cont
                                                      duckdb::vector<duckdb::LogicalType> &return_types,
                                                      duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 2) {
-		throw duckdb::BinderException("cdc_wait requires catalog and consumer name");
+		throw duckdb::BinderException("listen helper requires catalog and consumer name");
 	}
 	auto result = duckdb::make_uniq<CdcWaitData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
@@ -1496,7 +1494,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &cont
 std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const CdcWaitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 	if (data.timeout_ms < 0) {
-		throw duckdb::InvalidInputException("cdc_wait timeout_ms must be >= 0");
+		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
 	}
 	const auto timeout_ms = std::min<int64_t>(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
 	if (data.timeout_ms > HARD_WAIT_TIMEOUT_MS) {
@@ -1537,7 +1535,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcWaitInit(duckdb::ClientC
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_consumer_list
+// cdc_list_consumers
 //===--------------------------------------------------------------------===//
 
 void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
@@ -1587,7 +1585,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerListBind(duckdb::ClientContext 
                                                           duckdb::vector<duckdb::LogicalType> &return_types,
                                                           duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 1) {
-		throw duckdb::BinderException("cdc_consumer_list requires catalog");
+		throw duckdb::BinderException("cdc_list_consumers requires catalog");
 	}
 	auto result = duckdb::make_uniq<ConsumerListData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
@@ -1646,7 +1644,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_consumer_subscriptions
+// cdc_list_subscriptions
 //===--------------------------------------------------------------------===//
 
 struct ConsumerSubscriptionsData : public duckdb::TableFunctionData {
@@ -1670,7 +1668,7 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerSubscriptionsBind(duckdb::Clien
                                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                                    duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 1) {
-		throw duckdb::BinderException("cdc_consumer_subscriptions requires catalog");
+		throw duckdb::BinderException("cdc_list_subscriptions requires catalog");
 	}
 	auto result = duckdb::make_uniq<ConsumerSubscriptionsData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");

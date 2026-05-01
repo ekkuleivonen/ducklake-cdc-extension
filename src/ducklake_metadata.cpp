@@ -28,7 +28,7 @@ namespace duckdb_cdc {
 //===--------------------------------------------------------------------===//
 
 const char *const CONSUMERS_TABLE = "__ducklake_cdc_consumers";
-const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_consumer_subscriptions";
+const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_list_subscriptions";
 const char *const AUDIT_TABLE = "__ducklake_cdc_audit";
 const char *const STATE_SCHEMA = "__ducklake_cdc";
 
@@ -238,7 +238,8 @@ int64_t ResolveSnapshot(duckdb::Connection &conn, const std::string &catalog_nam
 }
 
 int64_t ResolveCreateSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &start_at) {
-	return ResolveSnapshot(conn, catalog_name, start_at, "start_at", "cdc_consumer_create", false);
+	return ResolveSnapshot(conn, catalog_name, start_at, "start_at", "cdc_ddl_consumer_create/cdc_dml_consumer_create",
+	                       false);
 }
 
 int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalog_name,

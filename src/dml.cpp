@@ -3,16 +3,9 @@
 //
 // dml.cpp
 //
-// Implementation of the row-level change-event surface: cdc_events,
-// cdc_changes, and cdc_recent_changes. cdc_events and cdc_changes both
-// open the consumer's window via `ReadWindow` from `consumer.cpp`
-// (acquiring the lease for the duration); cdc_recent_changes is
-// stateless and runs `[since_start, current_snapshot]` directly.
-//
-// `cdc_events` defers per-snapshot table-filter decisions to
-// `ChangesTouchConsumerTables` in `ddl.cpp` because that predicate
-// walks DuckLake-emitted change tokens and we don't want token
-// vocabulary leaking into this file.
+// DML stream implementation. The generic DML functions return stable
+// multi-table rows with JSON payload text, while typed table functions expose
+// one subscribed table's native DuckDB columns.
 //===----------------------------------------------------------------------===//
 
 #include "dml.hpp"
@@ -39,25 +32,37 @@ namespace duckdb_cdc {
 namespace {
 
 //===--------------------------------------------------------------------===//
-// cdc_events
+// DML ticks
 //===--------------------------------------------------------------------===//
 
-struct CdcEventsData : public duckdb::TableFunctionData {
+struct DmlTicksData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t max_snapshots;
 	bool auto_commit = false;
 	bool listen = false;
 	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
+	bool explicit_window = false;
+	int64_t start_snapshot = -1;
+	int64_t end_snapshot = -1;
+	bool stateless = false;
+	int64_t from_snapshot = -1;
+	int64_t to_snapshot = -1;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		auto result = duckdb::make_uniq<CdcEventsData>();
+		auto result = duckdb::make_uniq<DmlTicksData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->max_snapshots = max_snapshots;
 		result->auto_commit = auto_commit;
 		result->listen = listen;
 		result->timeout_ms = timeout_ms;
+		result->explicit_window = explicit_window;
+		result->start_snapshot = start_snapshot;
+		result->end_snapshot = end_snapshot;
+		result->stateless = stateless;
+		result->from_snapshot = from_snapshot;
+		result->to_snapshot = to_snapshot;
 		return std::move(result);
 	}
 
@@ -163,14 +168,50 @@ bool ChangesTouchSubscriptions(duckdb::Connection &conn, const std::string &cata
 
 int64_t TimeoutMsParameter(duckdb::TableFunctionBindInput &input);
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBindBase(duckdb::ClientContext &context,
-                                                           duckdb::TableFunctionBindInput &input,
-                                                           duckdb::vector<duckdb::LogicalType> &return_types,
-                                                           duckdb::vector<duckdb::string> &names, bool listen) {
-	if (input.inputs.size() != 2) {
-		throw duckdb::BinderException("cdc_events requires catalog and consumer name");
+duckdb::Value BigIntListValue(const std::vector<int64_t> &values) {
+	duckdb::vector<duckdb::Value> children;
+	children.reserve(values.size());
+	for (const auto value : values) {
+		children.push_back(duckdb::Value::BIGINT(value));
 	}
-	auto result = duckdb::make_uniq<CdcEventsData>();
+	return duckdb::Value::LIST(duckdb::LogicalType::BIGINT, children);
+}
+
+std::pair<std::string, std::string> SplitQualifiedTableName(const std::string &table_name);
+std::string DuckLakeTableChangesCall(const std::string &catalog_name, const std::string &table_name,
+                                     int64_t start_snapshot, int64_t end_snapshot);
+
+void DmlTicksReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names,
+                         bool stateful) {
+	if (stateful) {
+		names = {"consumer_name", "start_snapshot", "end_snapshot"};
+		return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT};
+	} else {
+		names.clear();
+		return_types.clear();
+	}
+	for (const auto &name : {"snapshot_id", "snapshot_time", "schema_version", "table_ids", "insert_count",
+	                         "update_count", "delete_count", "change_count"}) {
+		names.push_back(name);
+	}
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::TIMESTAMP_TZ);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT));
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> DmlTicksBindBase(duckdb::ClientContext &context,
+                                                          duckdb::TableFunctionBindInput &input,
+                                                          duckdb::vector<duckdb::LogicalType> &return_types,
+                                                          duckdb::vector<duckdb::string> &names, bool listen) {
+	if (input.inputs.size() != 2) {
+		throw duckdb::BinderException("cdc_dml_ticks_read/listen requires catalog and consumer name");
+	}
+	auto result = duckdb::make_uniq<DmlTicksData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->max_snapshots = MaxSnapshotsParameter(input);
@@ -180,34 +221,120 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcEventsBindBase(duckdb::ClientContext
 	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
 		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
 	}
+	auto start_snapshot_entry = input.named_parameters.find("start_snapshot");
+	auto end_snapshot_entry = input.named_parameters.find("end_snapshot");
+	const bool has_start_snapshot =
+	    start_snapshot_entry != input.named_parameters.end() && !start_snapshot_entry->second.IsNull();
+	const bool has_end_snapshot =
+	    end_snapshot_entry != input.named_parameters.end() && !end_snapshot_entry->second.IsNull();
+	if (has_start_snapshot != has_end_snapshot) {
+		throw duckdb::BinderException(
+		    "cdc_dml_ticks_read requires both start_snapshot and end_snapshot when either is set");
+	}
+	if (has_start_snapshot) {
+		result->explicit_window = true;
+		result->start_snapshot = start_snapshot_entry->second.GetValue<int64_t>();
+		result->end_snapshot = end_snapshot_entry->second.GetValue<int64_t>();
+	}
 
-	names = {"snapshot_id",      "snapshot_time",  "changes_made",
-	         "author",           "commit_message", "commit_extra_info",
-	         "next_snapshot_id", "schema_version", "schema_changes_pending"};
-	return_types = {duckdb::LogicalType::BIGINT,  duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BOOLEAN};
+	DmlTicksReturnTypes(return_types, names, true);
 	return std::move(result);
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcEventsReadBind(duckdb::ClientContext &context,
-                                                           duckdb::TableFunctionBindInput &input,
-                                                           duckdb::vector<duckdb::LogicalType> &return_types,
-                                                           duckdb::vector<duckdb::string> &names) {
-	return CdcEventsBindBase(context, input, return_types, names, false);
+duckdb::unique_ptr<duckdb::FunctionData> DmlTicksReadBind(duckdb::ClientContext &context,
+                                                          duckdb::TableFunctionBindInput &input,
+                                                          duckdb::vector<duckdb::LogicalType> &return_types,
+                                                          duckdb::vector<duckdb::string> &names) {
+	return DmlTicksBindBase(context, input, return_types, names, false);
 }
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcEventsListenBind(duckdb::ClientContext &context,
-                                                             duckdb::TableFunctionBindInput &input,
-                                                             duckdb::vector<duckdb::LogicalType> &return_types,
-                                                             duckdb::vector<duckdb::string> &names) {
-	return CdcEventsBindBase(context, input, return_types, names, true);
+duckdb::unique_ptr<duckdb::FunctionData> DmlTicksListenBind(duckdb::ClientContext &context,
+                                                            duckdb::TableFunctionBindInput &input,
+                                                            duckdb::vector<duckdb::LogicalType> &return_types,
+                                                            duckdb::vector<duckdb::string> &names) {
+	return DmlTicksBindBase(context, input, return_types, names, true);
 }
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::ClientContext &context,
-                                                                   duckdb::TableFunctionInitInput &input) {
+void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name,
+                       int64_t start_snapshot, int64_t end_snapshot,
+                       const std::vector<ConsumerSubscriptionRow> *subscriptions,
+                       std::vector<std::vector<duckdb::Value>> &out, bool stateful) {
+	auto rows =
+	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, s.schema_version, c.changes_made FROM ") +
+	               MetadataTable(catalog_name, "ducklake_snapshot") + " s JOIN " +
+	               MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	               " c USING (snapshot_id) WHERE s.snapshot_id BETWEEN " + std::to_string(start_snapshot) + " AND " +
+	               std::to_string(end_snapshot) + " ORDER BY s.snapshot_id ASC");
+	if (!rows || rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "DML ticks scan failed");
+	}
+	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
+		const auto snapshot_id = rows->GetValue(0, i).GetValue<int64_t>();
+		const auto changes_value = rows->GetValue(3, i);
+		const auto changes = changes_value.IsNull() ? std::string() : changes_value.ToString();
+		std::unordered_set<int64_t> touched_table_ids;
+		int64_t insert_count = 0;
+		int64_t delete_count = 0;
+		for (const auto &token : SplitEventTokens(changes)) {
+			int64_t table_id = 0;
+			std::string change_type;
+			if (!DmlTokenInfo(token, table_id, change_type)) {
+				continue;
+			}
+			const auto qualified = CurrentQualifiedTableName(conn, catalog_name, table_id, snapshot_id);
+			if (qualified.empty()) {
+				continue;
+			}
+			int64_t schema_id = 0;
+			int64_t ignored_table = 0;
+			ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, ignored_table);
+			if (subscriptions != nullptr) {
+				bool covered = false;
+				for (const auto &subscription : *subscriptions) {
+					if (subscription.event_category == "dml" &&
+					    SubscriptionCoversTable(subscription, schema_id, table_id, "dml")) {
+						covered = true;
+						break;
+					}
+				}
+				if (!covered) {
+					continue;
+				}
+			}
+			touched_table_ids.insert(table_id);
+			if (change_type == "insert") {
+				insert_count++;
+			} else if (change_type == "delete") {
+				delete_count++;
+			}
+		}
+		if (touched_table_ids.empty()) {
+			continue;
+		}
+		std::vector<int64_t> table_ids(touched_table_ids.begin(), touched_table_ids.end());
+		std::sort(table_ids.begin(), table_ids.end());
+		std::vector<duckdb::Value> row;
+		if (stateful) {
+			row.push_back(duckdb::Value(consumer_name));
+			row.push_back(duckdb::Value::BIGINT(start_snapshot));
+			row.push_back(duckdb::Value::BIGINT(end_snapshot));
+		}
+		row.push_back(rows->GetValue(0, i));
+		row.push_back(rows->GetValue(1, i));
+		row.push_back(rows->GetValue(2, i));
+		row.push_back(BigIntListValue(table_ids));
+		row.push_back(duckdb::Value::BIGINT(insert_count));
+		row.push_back(duckdb::Value::BIGINT(0));
+		row.push_back(duckdb::Value::BIGINT(delete_count));
+		row.push_back(duckdb::Value::BIGINT(insert_count + delete_count));
+		out.push_back(std::move(row));
+	}
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::ClientContext &context,
+                                                                  duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
-	auto &data = input.bind_data->Cast<CdcEventsData>();
+	auto &data = input.bind_data->Cast<DmlTicksData>();
 	if (data.listen) {
 		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
 		if (ready.empty() || ready[0].IsNull()) {
@@ -215,63 +342,30 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::Clien
 		}
 	}
 
-	CdcWindowData window_data;
-	window_data.catalog_name = data.catalog_name;
-	window_data.consumer_name = data.consumer_name;
-	window_data.max_snapshots = data.max_snapshots;
-	auto window = ReadWindow(context, window_data);
-	const auto start_snapshot = window[0].GetValue<int64_t>();
-	const auto end_snapshot = window[1].GetValue<int64_t>();
-	const auto has_changes = window[2].GetValue<bool>();
-	const auto schema_version = window[3].GetValue<int64_t>();
-	const auto schema_changes_pending = window[4].GetValue<bool>();
+	duckdb::Connection conn(*context.db);
+	int64_t start_snapshot;
+	int64_t end_snapshot;
+	bool has_changes;
+	if (data.explicit_window) {
+		start_snapshot = data.start_snapshot;
+		end_snapshot = data.end_snapshot;
+		has_changes = end_snapshot >= start_snapshot;
+	} else {
+		CdcWindowData window_data;
+		window_data.catalog_name = data.catalog_name;
+		window_data.consumer_name = data.consumer_name;
+		window_data.max_snapshots = data.max_snapshots;
+		auto window = ReadWindow(context, window_data);
+		start_snapshot = window[0].GetValue<int64_t>();
+		end_snapshot = window[1].GetValue<int64_t>();
+		has_changes = window[2].GetValue<bool>();
+	}
 	if (!has_changes) {
 		return std::move(result);
 	}
-
-	duckdb::Connection conn(*context.db);
 	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
-
-	// Project across the snapshot/changes join. `snapshots()` is the
-	// upstream-typed variant we'd switch to once it is exposed in a way
-	// Phase 1 can rely on; until then we read the same columns directly
-	// from the metadata catalog so the schema is stable across DuckLake
-	// versions in the supported window. `ducklake_snapshot_changes` is the
-	// table that carries the per-snapshot commit metadata (author /
-	// commit_message / commit_extra_info), not `ducklake_snapshot` itself.
-	auto query = std::string("SELECT s.snapshot_id, s.snapshot_time, c.changes_made, c.author, "
-	                         "c.commit_message, c.commit_extra_info FROM ") +
-	             MetadataTable(data.catalog_name, "ducklake_snapshot") + " s JOIN " +
-	             MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
-	             " c USING (snapshot_id) WHERE s.snapshot_id BETWEEN " + std::to_string(start_snapshot) + " AND " +
-	             std::to_string(end_snapshot) + " ORDER BY s.snapshot_id ASC";
-	auto rows = conn.Query(query);
-	if (!rows || rows->HasError()) {
-		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "cdc_events scan failed");
-	}
-	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
-		const auto snapshot_value = rows->GetValue(0, i);
-		if (snapshot_value.IsNull()) {
-			continue;
-		}
-		const auto snapshot_id = snapshot_value.GetValue<int64_t>();
-		const auto changes_value = rows->GetValue(2, i);
-		const auto changes_str = changes_value.IsNull() ? std::string() : changes_value.ToString();
-		if (!ChangesTouchSubscriptions(conn, data.catalog_name, snapshot_id, changes_str, subscriptions)) {
-			continue;
-		}
-		std::vector<duckdb::Value> row;
-		row.push_back(snapshot_value);
-		row.push_back(rows->GetValue(1, i));
-		row.push_back(changes_value);
-		row.push_back(rows->GetValue(3, i));
-		row.push_back(rows->GetValue(4, i));
-		row.push_back(rows->GetValue(5, i));
-		row.push_back(duckdb::Value::BIGINT(end_snapshot));
-		row.push_back(duckdb::Value::BIGINT(schema_version));
-		row.push_back(duckdb::Value::BOOLEAN(schema_changes_pending));
-		result->rows.push_back(std::move(row));
-	}
+	AppendDmlTickRows(conn, data.catalog_name, data.consumer_name, start_snapshot, end_snapshot, &subscriptions,
+	                  result->rows, true);
 	if (data.auto_commit) {
 		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
 	}
@@ -279,7 +373,314 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcEventsInit(duckdb::Clien
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_changes
+// Generic DML changes
+//===--------------------------------------------------------------------===//
+
+struct GenericDmlChangesData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	std::string consumer_name;
+	int64_t max_snapshots;
+	bool explicit_window = false;
+	int64_t start_snapshot = -1;
+	int64_t end_snapshot = -1;
+	bool auto_commit = false;
+	bool listen = false;
+	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
+	bool stateless = false;
+	int64_t from_snapshot = -1;
+	int64_t to_snapshot = -1;
+	std::vector<int64_t> table_ids;
+	std::vector<std::string> table_names;
+	std::vector<std::string> change_types;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<GenericDmlChangesData>();
+		result->catalog_name = catalog_name;
+		result->consumer_name = consumer_name;
+		result->max_snapshots = max_snapshots;
+		result->explicit_window = explicit_window;
+		result->start_snapshot = start_snapshot;
+		result->end_snapshot = end_snapshot;
+		result->auto_commit = auto_commit;
+		result->listen = listen;
+		result->timeout_ms = timeout_ms;
+		result->stateless = stateless;
+		result->from_snapshot = from_snapshot;
+		result->to_snapshot = to_snapshot;
+		result->table_ids = table_ids;
+		result->table_names = table_names;
+		result->change_types = change_types;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+std::vector<std::string> StringListNamedParameter(duckdb::TableFunctionBindInput &input, const std::string &name) {
+	std::vector<std::string> out;
+	auto entry = input.named_parameters.find(name);
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return out;
+	}
+	for (const auto &child : duckdb::ListValue::GetChildren(entry->second)) {
+		if (!child.IsNull()) {
+			out.push_back(child.GetValue<std::string>());
+		}
+	}
+	return out;
+}
+
+std::vector<int64_t> Int64ListNamedParameter(duckdb::TableFunctionBindInput &input, const std::string &name) {
+	std::vector<int64_t> out;
+	auto entry = input.named_parameters.find(name);
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return out;
+	}
+	for (const auto &child : duckdb::ListValue::GetChildren(entry->second)) {
+		if (!child.IsNull()) {
+			out.push_back(child.GetValue<int64_t>());
+		}
+	}
+	return out;
+}
+
+std::vector<std::string> ChangeTypesNamedParameter(duckdb::TableFunctionBindInput &input) {
+	auto values = StringListNamedParameter(input, "change_types");
+	if (values.empty()) {
+		values.push_back("*");
+	}
+	std::vector<std::string> out;
+	for (const auto &value : values) {
+		if (value == "*") {
+			for (const auto &kind : {"insert", "update_preimage", "update_postimage", "delete"}) {
+				out.push_back(kind);
+			}
+		} else {
+			out.push_back(value);
+		}
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return out;
+}
+
+void GenericDmlReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names,
+                           bool stateful) {
+	if (stateful) {
+		names = {"consumer_name", "start_snapshot", "end_snapshot"};
+		return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT};
+	} else {
+		names.clear();
+		return_types.clear();
+	}
+	for (const auto &name : {"snapshot_id", "snapshot_time", "schema_id", "schema_name", "table_id", "table_name",
+	                         "rowid", "change_type", "values", "author", "commit_message", "commit_extra_info"}) {
+		names.push_back(name);
+	}
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::TIMESTAMP_TZ);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::BIGINT);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+	return_types.push_back(duckdb::LogicalType::VARCHAR);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> GenericDmlBindBase(duckdb::ClientContext &context,
+                                                            duckdb::TableFunctionBindInput &input,
+                                                            duckdb::vector<duckdb::LogicalType> &return_types,
+                                                            duckdb::vector<duckdb::string> &names, bool listen) {
+	if (input.inputs.size() != 2) {
+		throw duckdb::BinderException("cdc_dml_changes_read/listen requires catalog and consumer name");
+	}
+	auto result = duckdb::make_uniq<GenericDmlChangesData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
+	result->max_snapshots = MaxSnapshotsParameter(input);
+	result->listen = listen;
+	result->timeout_ms = TimeoutMsParameter(input);
+	result->change_types = ChangeTypesNamedParameter(input);
+	auto auto_commit_entry = input.named_parameters.find("auto_commit");
+	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
+		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
+	}
+	auto start_snapshot_entry = input.named_parameters.find("start_snapshot");
+	auto end_snapshot_entry = input.named_parameters.find("end_snapshot");
+	const bool has_start_snapshot =
+	    start_snapshot_entry != input.named_parameters.end() && !start_snapshot_entry->second.IsNull();
+	const bool has_end_snapshot =
+	    end_snapshot_entry != input.named_parameters.end() && !end_snapshot_entry->second.IsNull();
+	if (has_start_snapshot != has_end_snapshot) {
+		throw duckdb::BinderException(
+		    "cdc_dml_changes_read requires both start_snapshot and end_snapshot when either is set");
+	}
+	if (has_start_snapshot) {
+		result->explicit_window = true;
+		result->start_snapshot = start_snapshot_entry->second.GetValue<int64_t>();
+		result->end_snapshot = end_snapshot_entry->second.GetValue<int64_t>();
+	}
+	GenericDmlReturnTypes(return_types, names, true);
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> GenericDmlReadBind(duckdb::ClientContext &context,
+                                                            duckdb::TableFunctionBindInput &input,
+                                                            duckdb::vector<duckdb::LogicalType> &return_types,
+                                                            duckdb::vector<duckdb::string> &names) {
+	return GenericDmlBindBase(context, input, return_types, names, false);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> GenericDmlListenBind(duckdb::ClientContext &context,
+                                                              duckdb::TableFunctionBindInput &input,
+                                                              duckdb::vector<duckdb::LogicalType> &return_types,
+                                                              duckdb::vector<duckdb::string> &names) {
+	return GenericDmlBindBase(context, input, return_types, names, true);
+}
+
+std::string JsonPayloadExpression(const std::vector<std::string> &column_names) {
+	if (column_names.empty()) {
+		return "'{}'";
+	}
+	std::ostringstream out;
+	out << "json_object(";
+	for (size_t i = 0; i < column_names.size(); ++i) {
+		if (i > 0) {
+			out << ", ";
+		}
+		out << QuoteLiteral(column_names[i]) << ", tc." << QuoteIdentifier(column_names[i]);
+	}
+	out << ")::VARCHAR";
+	return out.str();
+}
+
+void AppendGenericDmlTableRows(duckdb::Connection &conn, const GenericDmlChangesData &data,
+                               const std::string &consumer_name, int64_t start_snapshot, int64_t end_snapshot,
+                               int64_t schema_id, int64_t table_id, const std::string &table_name,
+                               const std::vector<std::string> &change_types,
+                               std::vector<std::vector<duckdb::Value>> &out, bool stateful) {
+	auto probe =
+	    conn.Query("SELECT * FROM " +
+	               DuckLakeTableChangesCall(data.catalog_name, table_name, end_snapshot, end_snapshot) + " LIMIT 0");
+	if (!probe || probe->HasError()) {
+		throw duckdb::InvalidInputException("cdc_dml_changes failed to resolve table '%s'", table_name);
+	}
+	std::vector<std::string> column_names;
+	for (duckdb::idx_t i = 3; i < probe->ColumnCount(); ++i) {
+		column_names.push_back(probe->ColumnName(i));
+	}
+	const auto parts = SplitQualifiedTableName(table_name);
+	std::ostringstream where_clause;
+	if (!change_types.empty()) {
+		where_clause << " WHERE tc.change_type IN (";
+		for (size_t i = 0; i < change_types.size(); ++i) {
+			if (i > 0) {
+				where_clause << ", ";
+			}
+			where_clause << QuoteLiteral(change_types[i]);
+		}
+		where_clause << ")";
+	}
+	auto rows = conn.Query(
+	    std::string("SELECT tc.snapshot_id, s.snapshot_time, tc.rowid, tc.change_type, ") +
+	    JsonPayloadExpression(column_names) + ", c.author, c.commit_message, c.commit_extra_info FROM " +
+	    DuckLakeTableChangesCall(data.catalog_name, table_name, start_snapshot, end_snapshot) + " tc LEFT JOIN " +
+	    MetadataTable(data.catalog_name, "ducklake_snapshot") + " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
+	    MetadataTable(data.catalog_name, "ducklake_snapshot_changes") + " c ON c.snapshot_id = tc.snapshot_id" +
+	    where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC");
+	if (!rows || rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        rows ? rows->GetError() : "cdc_dml_changes scan failed");
+	}
+	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
+		std::vector<duckdb::Value> row;
+		if (stateful) {
+			row.push_back(duckdb::Value(consumer_name));
+			row.push_back(duckdb::Value::BIGINT(start_snapshot));
+			row.push_back(duckdb::Value::BIGINT(end_snapshot));
+		}
+		row.push_back(rows->GetValue(0, row_idx));
+		row.push_back(rows->GetValue(1, row_idx));
+		row.push_back(duckdb::Value::BIGINT(schema_id));
+		row.push_back(duckdb::Value(parts.first));
+		row.push_back(duckdb::Value::BIGINT(table_id));
+		row.push_back(duckdb::Value(table_name));
+		for (duckdb::idx_t col_idx = 2; col_idx < rows->ColumnCount(); ++col_idx) {
+			row.push_back(rows->GetValue(col_idx, row_idx));
+		}
+		out.push_back(std::move(row));
+	}
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> GenericDmlInit(duckdb::ClientContext &context,
+                                                                    duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<GenericDmlChangesData>();
+	if (data.listen && !data.explicit_window) {
+		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		if (ready.empty() || ready[0].IsNull()) {
+			return std::move(result);
+		}
+	}
+	int64_t start_snapshot;
+	int64_t end_snapshot;
+	bool has_changes;
+	if (data.explicit_window) {
+		start_snapshot = data.start_snapshot;
+		end_snapshot = data.end_snapshot;
+		has_changes = end_snapshot >= start_snapshot;
+	} else {
+		CdcWindowData window_data;
+		window_data.catalog_name = data.catalog_name;
+		window_data.consumer_name = data.consumer_name;
+		window_data.max_snapshots = data.max_snapshots;
+		auto window = ReadWindow(context, window_data);
+		start_snapshot = window[0].GetValue<int64_t>();
+		end_snapshot = window[1].GetValue<int64_t>();
+		has_changes = window[2].GetValue<bool>();
+	}
+	if (!has_changes) {
+		return std::move(result);
+	}
+	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	std::unordered_set<int64_t> visited;
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category != "dml" || subscription.table_id.IsNull() || subscription.schema_id.IsNull()) {
+			continue;
+		}
+		const auto table_id = subscription.table_id.GetValue<int64_t>();
+		if (!visited.insert(table_id).second) {
+			continue;
+		}
+		const auto table_name = CurrentQualifiedTableName(conn, data.catalog_name, table_id, end_snapshot);
+		if (table_name.empty()) {
+			continue;
+		}
+		const auto change_types =
+		    MatchingDmlChangeTypes(subscriptions, subscription.schema_id.GetValue<int64_t>(), table_id);
+		AppendGenericDmlTableRows(conn, data, data.consumer_name, start_snapshot, end_snapshot,
+		                          subscription.schema_id.GetValue<int64_t>(), table_id, table_name, change_types,
+		                          result->rows, true);
+	}
+	std::sort(result->rows.begin(), result->rows.end(),
+	          [](const std::vector<duckdb::Value> &lhs, const std::vector<duckdb::Value> &rhs) {
+		          return lhs[3].GetValue<int64_t>() < rhs[3].GetValue<int64_t>();
+	          });
+	if (data.auto_commit && !data.explicit_window) {
+		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	}
+	return std::move(result);
+}
+
+//===--------------------------------------------------------------------===//
+// Typed table DML changes
 //===--------------------------------------------------------------------===//
 
 struct CdcChangesData : public duckdb::TableFunctionData {
@@ -395,7 +796,8 @@ void ResolveSingleTableSubscription(const std::vector<ConsumerSubscriptionRow> &
 		}
 	}
 	if (table_ids.size() != 1) {
-		throw duckdb::InvalidInputException("cdc_changes requires table_id or table_name for multi-table consumers");
+		throw duckdb::InvalidInputException(
+		    "cdc_dml_table_changes_read requires table_id or table_name for multi-table consumers");
 	}
 	table_id = *table_ids.begin();
 }
@@ -439,7 +841,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 	const bool has_end_snapshot =
 	    end_snapshot_entry != input.named_parameters.end() && !end_snapshot_entry->second.IsNull();
 	if (has_start_snapshot != has_end_snapshot) {
-		throw duckdb::BinderException("cdc_changes requires both start_snapshot and end_snapshot when either is set");
+		throw duckdb::BinderException(
+		    "cdc_dml_table_changes_read requires both start_snapshot and end_snapshot when either is set");
 	}
 	if (has_start_snapshot) {
 		result->explicit_window = true;
@@ -485,7 +888,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 		result->table_name =
 		    CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, reference_snapshot);
 		if (result->table_name.empty()) {
-			throw duckdb::InvalidInputException("cdc_changes: table_id %lld is not active",
+			throw duckdb::InvalidInputException("cdc_dml_table_changes_read: table_id %lld is not active",
 			                                    static_cast<long long>(result->table_id));
 		}
 		int64_t ignored_table_id = 0;
@@ -498,18 +901,20 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, reference_snapshot,
 		                             result->schema_id, result->table_id)) {
 			if (OriginalNameWasRenamed(subscriptions, result->table_name)) {
-				throw duckdb::InvalidInputException("cdc_changes: table '%s' was renamed; use the current name",
-				                                    result->table_name);
+				throw duckdb::InvalidInputException(
+				    "cdc_dml_table_changes_read: table '%s' was renamed; use the current name", result->table_name);
 			}
-			throw duckdb::InvalidInputException("cdc_changes failed to resolve table '%s'", result->table_name);
+			throw duckdb::InvalidInputException("cdc_dml_table_changes_read failed to resolve table '%s'",
+			                                    result->table_name);
 		}
 	} else {
 		ResolveSingleTableSubscription(subscriptions, result->schema_id, result->table_id, result->table_name);
 	}
 	const auto matching_change_types = MatchingDmlChangeTypes(subscriptions, result->schema_id, result->table_id);
 	if (matching_change_types.empty() && ConsumerHasDmlSubscriptions(subscriptions)) {
-		throw duckdb::InvalidInputException("cdc_changes: table '%s' is not covered by consumer '%s' subscriptions",
-		                                    result->table_name, result->consumer_name);
+		throw duckdb::InvalidInputException(
+		    "cdc_dml_table_changes_read: table '%s' is not covered by consumer '%s' subscriptions", result->table_name,
+		    result->consumer_name);
 	}
 	result->change_types = matching_change_types;
 	int64_t probe_snapshot;
@@ -569,15 +974,15 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 		    DuckLakeTableChangesCall(result->catalog_name, result->table_name, probe_snapshot, probe_snapshot) +
 		    " LIMIT 0");
 		if (!probe || probe->HasError()) {
-			throw duckdb::InvalidInputException("cdc_changes failed to resolve table '%s' in catalog '%s': %s",
-			                                    result->table_name, result->catalog_name,
-			                                    probe ? probe->GetError()
-			                                          : std::string("table_changes probe returned no result"));
+			throw duckdb::InvalidInputException(
+			    "cdc_dml_table_changes_read failed to resolve table '%s' in catalog '%s': %s", result->table_name,
+			    result->catalog_name,
+			    probe ? probe->GetError() : std::string("table_changes probe returned no result"));
 		}
 		if (probe->ColumnCount() < 3) {
-			throw duckdb::InvalidInputException(
-			    "cdc_changes: unexpected table_changes schema for table '%s' (got %u columns; expected at least 3)",
-			    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
+			throw duckdb::InvalidInputException("cdc_dml_table_changes_read: unexpected table_changes schema for table "
+			                                    "'%s' (got %u columns; expected at least 3)",
+			                                    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
 		}
 		for (duckdb::idx_t i = 3; i < probe->ColumnCount(); ++i) {
 			result->table_column_names.push_back(probe->ColumnName(i));
@@ -590,8 +995,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 		TABLE_CHANGES_SCHEMA_CACHE[schema_cache_key] = std::move(cache_entry);
 	}
 
-	names = {"snapshot_id", "rowid", "change_type"};
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
+	names = {"consumer_name", "start_snapshot", "end_snapshot", "snapshot_id", "rowid", "change_type"};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
 	for (duckdb::idx_t i = 0; i < result->table_column_names.size(); ++i) {
 		names.push_back(result->table_column_names[i]);
 		return_types.push_back(result->table_column_types[i]);
@@ -603,8 +1009,6 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 	return_types.push_back(duckdb::LogicalType::VARCHAR);
 	return_types.push_back(duckdb::LogicalType::VARCHAR);
 	return_types.push_back(duckdb::LogicalType::VARCHAR);
-	names.push_back("next_snapshot_id");
-	return_types.push_back(duckdb::LogicalType::BIGINT);
 	return std::move(result);
 }
 
@@ -668,7 +1072,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	}
 
 	std::ostringstream column_list;
-	column_list << "tc.snapshot_id, tc.rowid, tc.change_type";
+	column_list << QuoteLiteral(data.consumer_name) << " AS consumer_name, " << std::to_string(start_snapshot)
+	            << " AS start_snapshot, " << std::to_string(end_snapshot)
+	            << " AS end_snapshot, tc.snapshot_id, tc.rowid, tc.change_type";
 	for (const auto &col_name : data.table_column_names) {
 		column_list << ", tc." << QuoteIdentifier(col_name);
 	}
@@ -686,8 +1092,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	}
 
 	auto query = std::string("SELECT ") + column_list.str() +
-	             ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info, " +
-	             std::to_string(effective_end_snapshot) + " AS next_snapshot_id FROM " +
+	             ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info FROM " +
 	             DuckLakeTableChangesCall(data.catalog_name, data.table_name, start_snapshot, effective_end_snapshot) +
 	             " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
 	             " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
@@ -696,7 +1101,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	             " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
-		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "cdc_changes scan failed");
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        rows ? rows->GetError() : "cdc_dml_table_changes_read scan failed");
 	}
 	result->result = std::move(rows);
 	if (data.auto_commit && !data.explicit_window) {
@@ -706,7 +1112,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_recent_changes
+// cdc_dml_table_changes_query
 //===--------------------------------------------------------------------===//
 
 struct CdcRecentChangesData : public duckdb::TableFunctionData {
@@ -736,14 +1142,14 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRecentChangesBind(duckdb::ClientCont
                                                               duckdb::vector<duckdb::LogicalType> &return_types,
                                                               duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 2) {
-		throw duckdb::BinderException("cdc_recent_changes requires catalog and table");
+		throw duckdb::BinderException("cdc_dml_table_changes_query requires catalog and table");
 	}
 	auto result = duckdb::make_uniq<CdcRecentChangesData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->table_name = GetStringArg(input.inputs[1], "table");
 	result->since_seconds = SinceSecondsParameter(input, 300);
 	if (result->since_seconds < 0) {
-		throw duckdb::InvalidInputException("cdc_recent_changes since_seconds must be >= 0");
+		throw duckdb::InvalidInputException("cdc_dml_table_changes_query since_seconds must be >= 0");
 	}
 	CheckCatalogOrThrow(context, result->catalog_name);
 
@@ -754,13 +1160,13 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRecentChangesBind(duckdb::ClientCont
 	                        std::to_string(current) + ") LIMIT 0");
 	if (!probe || probe->HasError()) {
 		throw duckdb::InvalidInputException(
-		    "cdc_recent_changes failed to resolve table '%s' in catalog '%s': %s", result->table_name,
+		    "cdc_dml_table_changes_query failed to resolve table '%s' in catalog '%s': %s", result->table_name,
 		    result->catalog_name, probe ? probe->GetError() : std::string("table_changes probe returned no result"));
 	}
 	if (probe->ColumnCount() < 3) {
-		throw duckdb::InvalidInputException(
-		    "cdc_recent_changes: unexpected table_changes schema for table '%s' (got %u columns; expected at least 3)",
-		    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
+		throw duckdb::InvalidInputException("cdc_dml_table_changes_query: unexpected table_changes schema for table "
+		                                    "'%s' (got %u columns; expected at least 3)",
+		                                    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
 	}
 	for (duckdb::idx_t i = 3; i < probe->ColumnCount(); ++i) {
 		result->table_column_names.push_back(probe->ColumnName(i));
@@ -812,7 +1218,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRecentChangesInit(duckdb
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        rows ? rows->GetError() : "cdc_recent_changes scan failed");
+		                        rows ? rows->GetError() : "cdc_dml_table_changes_query scan failed");
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
 		std::vector<duckdb::Value> values;
@@ -859,6 +1265,124 @@ void ValidateRangeBounds(duckdb::Connection &conn, const std::string &catalog_na
 	}
 }
 
+duckdb::unique_ptr<duckdb::FunctionData> GenericDmlQueryBind(duckdb::ClientContext &context,
+                                                             duckdb::TableFunctionBindInput &input,
+                                                             duckdb::vector<duckdb::LogicalType> &return_types,
+                                                             duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException(
+		    "cdc_dml_changes_query requires catalog, from_snapshot, and optional to_snapshot");
+	}
+	auto result = duckdb::make_uniq<GenericDmlChangesData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
+	result->stateless = true;
+	result->table_ids = Int64ListNamedParameter(input, "table_ids");
+	result->table_names = StringListNamedParameter(input, "table_names");
+	result->change_types = ChangeTypesNamedParameter(input);
+	CheckCatalogOrThrow(context, result->catalog_name);
+	duckdb::Connection conn(*context.db);
+	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot,
+	                    "cdc_dml_changes_query");
+	GenericDmlReturnTypes(return_types, names, false);
+	return std::move(result);
+}
+
+std::vector<int64_t> DmlTablesTouchedInRange(duckdb::Connection &conn, const std::string &catalog_name,
+                                             int64_t from_snapshot, int64_t to_snapshot) {
+	std::unordered_set<int64_t> ids;
+	auto rows = conn.Query("SELECT changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	                       " WHERE snapshot_id BETWEEN " + std::to_string(from_snapshot) + " AND " +
+	                       std::to_string(to_snapshot));
+	if (!rows || rows->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "DML table discovery failed");
+	}
+	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
+		const auto value = rows->GetValue(0, i);
+		const auto changes = value.IsNull() ? std::string() : value.ToString();
+		for (const auto &token : SplitEventTokens(changes)) {
+			int64_t table_id = 0;
+			std::string change_type;
+			if (DmlTokenInfo(token, table_id, change_type)) {
+				ids.insert(table_id);
+			}
+		}
+	}
+	std::vector<int64_t> out(ids.begin(), ids.end());
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> GenericDmlQueryInit(duckdb::ClientContext &context,
+                                                                         duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<GenericDmlChangesData>();
+	duckdb::Connection conn(*context.db);
+	std::unordered_set<int64_t> table_ids(data.table_ids.begin(), data.table_ids.end());
+	for (const auto &table_name_input : data.table_names) {
+		auto table_name = table_name_input.find('.') == std::string::npos ? std::string("main.") + table_name_input
+		                                                                  : table_name_input;
+		int64_t schema_id = 0;
+		int64_t table_id = 0;
+		if (!ResolveCurrentTableName(conn, data.catalog_name, table_name, data.to_snapshot, schema_id, table_id)) {
+			throw duckdb::InvalidInputException("cdc_dml_changes_query failed to resolve table '%s'", table_name);
+		}
+		table_ids.insert(table_id);
+	}
+	if (table_ids.empty()) {
+		for (const auto table_id :
+		     DmlTablesTouchedInRange(conn, data.catalog_name, data.from_snapshot, data.to_snapshot)) {
+			table_ids.insert(table_id);
+		}
+	}
+	for (const auto table_id : table_ids) {
+		const auto table_name = CurrentQualifiedTableName(conn, data.catalog_name, table_id, data.to_snapshot);
+		if (table_name.empty()) {
+			continue;
+		}
+		int64_t schema_id = 0;
+		int64_t ignored_table = 0;
+		ResolveCurrentTableName(conn, data.catalog_name, table_name, data.to_snapshot, schema_id, ignored_table);
+		AppendGenericDmlTableRows(conn, data, std::string(), data.from_snapshot, data.to_snapshot, schema_id, table_id,
+		                          table_name, data.change_types, result->rows, false);
+	}
+	std::sort(result->rows.begin(), result->rows.end(),
+	          [](const std::vector<duckdb::Value> &lhs, const std::vector<duckdb::Value> &rhs) {
+		          return lhs[0].GetValue<int64_t>() < rhs[0].GetValue<int64_t>();
+	          });
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> DmlTicksQueryBind(duckdb::ClientContext &context,
+                                                           duckdb::TableFunctionBindInput &input,
+                                                           duckdb::vector<duckdb::LogicalType> &return_types,
+                                                           duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
+		throw duckdb::BinderException("cdc_dml_ticks_query requires catalog, from_snapshot, and optional to_snapshot");
+	}
+	auto result = duckdb::make_uniq<DmlTicksData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
+	result->stateless = true;
+	CheckCatalogOrThrow(context, result->catalog_name);
+	duckdb::Connection conn(*context.db);
+	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_dml_ticks_query");
+	DmlTicksReturnTypes(return_types, names, false);
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksQueryInit(duckdb::ClientContext &context,
+                                                                       duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<DmlTicksData>();
+	duckdb::Connection conn(*context.db);
+	AppendDmlTickRows(conn, data.catalog_name, std::string(), data.from_snapshot, data.to_snapshot, nullptr,
+	                  result->rows, false);
+	return std::move(result);
+}
+
 struct CdcRangeEventsData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	int64_t from_snapshot;
@@ -882,7 +1406,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeEventsBind(duckdb::ClientContex
                                                             duckdb::vector<duckdb::LogicalType> &return_types,
                                                             duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
-		throw duckdb::BinderException("cdc_range_events requires catalog, from_snapshot, and optional to_snapshot");
+		throw duckdb::BinderException("cdc_dml_ticks_query requires catalog, from_snapshot, and optional to_snapshot");
 	}
 	auto result = duckdb::make_uniq<CdcRangeEventsData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
@@ -890,7 +1414,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeEventsBind(duckdb::ClientContex
 	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
-	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_range_events");
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_dml_ticks_query");
 
 	names = {"snapshot_id",      "snapshot_time",  "changes_made",
 	         "author",           "commit_message", "commit_extra_info",
@@ -920,7 +1444,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeEventsInit(duckdb::
 	               " AND " + std::to_string(data.to_snapshot) + " ORDER BY s.snapshot_id ASC");
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        rows ? rows->GetError() : "cdc_range_events scan failed");
+		                        rows ? rows->GetError() : "cdc_dml_ticks_query scan failed");
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
 		std::vector<duckdb::Value> values;
@@ -969,7 +1493,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
                                                              duckdb::vector<duckdb::LogicalType> &return_types,
                                                              duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 2 && input.inputs.size() != 3) {
-		throw duckdb::BinderException("cdc_range_changes requires catalog, from_snapshot, and optional to_snapshot");
+		throw duckdb::BinderException(
+		    "cdc_dml_table_changes_query requires catalog, from_snapshot, and optional to_snapshot");
 	}
 	auto result = duckdb::make_uniq<CdcRangeChangesData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
@@ -977,7 +1502,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
 	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
-	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_range_changes");
+	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot,
+	                    "cdc_dml_table_changes_query");
 
 	auto table_id_entry = input.named_parameters.find("table_id");
 	auto table_name_entry = input.named_parameters.find("table_name");
@@ -986,8 +1512,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
 		result->table_name =
 		    CurrentQualifiedTableName(conn, result->catalog_name, result->table_id, result->to_snapshot);
 		if (result->table_name.empty()) {
-			throw duckdb::InvalidInputException("cdc_range_changes: table_id %lld is not active at to_snapshot",
-			                                    static_cast<long long>(result->table_id));
+			throw duckdb::InvalidInputException(
+			    "cdc_dml_table_changes_query: table_id %lld is not active at to_snapshot",
+			    static_cast<long long>(result->table_id));
 		}
 	} else if (table_name_entry != input.named_parameters.end() && !table_name_entry->second.IsNull()) {
 		result->table_name = table_name_entry->second.GetValue<std::string>();
@@ -998,10 +1525,11 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
 		int64_t schema_id = 0;
 		if (!ResolveCurrentTableName(conn, result->catalog_name, result->table_name, result->to_snapshot, schema_id,
 		                             result->table_id)) {
-			throw duckdb::InvalidInputException("cdc_range_changes failed to resolve table '%s'", result->table_name);
+			throw duckdb::InvalidInputException("cdc_dml_table_changes_query failed to resolve table '%s'",
+			                                    result->table_name);
 		}
 	} else {
-		throw duckdb::BinderException("cdc_range_changes requires table_id or table_name");
+		throw duckdb::BinderException("cdc_dml_table_changes_query requires table_id or table_name");
 	}
 
 	auto probe = conn.Query(
@@ -1010,13 +1538,13 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
 	    " LIMIT 0");
 	if (!probe || probe->HasError()) {
 		throw duckdb::InvalidInputException(
-		    "cdc_range_changes failed to resolve table '%s' in catalog '%s': %s", result->table_name,
+		    "cdc_dml_table_changes_query failed to resolve table '%s' in catalog '%s': %s", result->table_name,
 		    result->catalog_name, probe ? probe->GetError() : std::string("table_changes probe returned no result"));
 	}
 	if (probe->ColumnCount() < 3) {
-		throw duckdb::InvalidInputException(
-		    "cdc_range_changes: unexpected table_changes schema for table '%s' (got %u columns; expected at least 3)",
-		    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
+		throw duckdb::InvalidInputException("cdc_dml_table_changes_query: unexpected table_changes schema for table "
+		                                    "'%s' (got %u columns; expected at least 3)",
+		                                    result->table_name, static_cast<unsigned>(probe->ColumnCount()));
 	}
 	for (duckdb::idx_t i = 3; i < probe->ColumnCount(); ++i) {
 		result->table_column_names.push_back(probe->ColumnName(i));
@@ -1063,7 +1591,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 	auto rows = scan_range(data.from_snapshot);
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        rows ? rows->GetError() : "cdc_range_changes scan failed");
+		                        rows ? rows->GetError() : "cdc_dml_table_changes_query scan failed");
 	}
 	if (rows->RowCount() == 0 && data.allow_history_fallback) {
 		auto begin_result = conn.Query("SELECT COALESCE(min(begin_snapshot), " + std::to_string(data.from_snapshot) +
@@ -1076,7 +1604,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 				rows = scan_range(begin_snapshot);
 				if (!rows || rows->HasError()) {
 					throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-					                        rows ? rows->GetError() : "cdc_range_changes scan failed");
+					                        rows ? rows->GetError() : "cdc_dml_table_changes_query scan failed");
 				}
 			}
 		}
@@ -1097,18 +1625,31 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 	for (const auto &name : {"cdc_dml_ticks_read", "cdc_dml_ticks_listen"}) {
 		const auto bind =
-		    std::string(name).find("_listen") == std::string::npos ? CdcEventsReadBind : CdcEventsListenBind;
+		    std::string(name).find("_listen") == std::string::npos ? DmlTicksReadBind : DmlTicksListenBind;
 		duckdb::TableFunction events_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, bind, CdcEventsInit);
+		    RowScanExecute, bind, DmlTicksInit);
 		events_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		events_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
 		events_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(events_function);
 	}
 
-	for (const auto &name : {"cdc_dml_changes_read", "cdc_dml_changes_listen", "cdc_dml_table_changes_read",
-	                         "cdc_dml_table_changes_listen"}) {
+	for (const auto &name : {"cdc_dml_changes_read", "cdc_dml_changes_listen"}) {
+		const auto bind =
+		    std::string(name).find("_listen") == std::string::npos ? GenericDmlReadBind : GenericDmlListenBind;
+		duckdb::TableFunction changes_function(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+		    RowScanExecute, bind, GenericDmlInit);
+		changes_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
+		loader.RegisterFunction(changes_function);
+	}
+
+	for (const auto &name : {"cdc_dml_table_changes_read", "cdc_dml_table_changes_listen"}) {
 		const auto bind = std::string(name).find("_listen") == std::string::npos ? CdcTableChangesReadBind
 		                                                                         : CdcTableChangesListenBind;
 		duckdb::TableFunction changes_function_new(
@@ -1137,30 +1678,47 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(changes_function);
 	}
 
-	for (const auto &name : {"cdc_dml_changes_query", "cdc_dml_table_changes_query"}) {
-		duckdb::TableFunction recent_changes_function(
-		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    RowScanExecute, CdcRecentChangesBind, CdcRecentChangesInit);
-		recent_changes_function.named_parameters["since_seconds"] = duckdb::LogicalType::BIGINT;
-		loader.RegisterFunction(recent_changes_function);
-	}
-
 	for (const auto &name : {"cdc_dml_ticks_query"}) {
 		duckdb::TableFunction range_events_function_2(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
-		    RowScanExecute, CdcRangeEventsBind, CdcRangeEventsInit);
+		    RowScanExecute, DmlTicksQueryBind, DmlTicksQueryInit);
 		range_events_function_2.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
 		loader.RegisterFunction(range_events_function_2);
 		duckdb::TableFunction range_events_function_3(name,
 		                                              duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR,
 		                                                                                   duckdb::LogicalType::BIGINT,
 		                                                                                   duckdb::LogicalType::BIGINT},
-		                                              RowScanExecute, CdcRangeEventsBind, CdcRangeEventsInit);
+		                                              RowScanExecute, DmlTicksQueryBind, DmlTicksQueryInit);
 		range_events_function_3.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
 		loader.RegisterFunction(range_events_function_3);
 	}
 
-	for (const auto &name : {"cdc_dml_changes_query", "cdc_dml_table_changes_query"}) {
+	for (const auto &name : {"cdc_dml_changes_query"}) {
+		duckdb::TableFunction generic_query_function_2(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
+		    RowScanExecute, GenericDmlQueryBind, GenericDmlQueryInit);
+		generic_query_function_2.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		generic_query_function_2.named_parameters["table_ids"] = duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT);
+		generic_query_function_2.named_parameters["table_names"] =
+		    duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+		generic_query_function_2.named_parameters["change_types"] =
+		    duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+		loader.RegisterFunction(generic_query_function_2);
+		duckdb::TableFunction generic_query_function_3(
+		    name,
+		    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+		                                         duckdb::LogicalType::BIGINT},
+		    RowScanExecute, GenericDmlQueryBind, GenericDmlQueryInit);
+		generic_query_function_3.named_parameters["to_snapshot"] = duckdb::LogicalType::BIGINT;
+		generic_query_function_3.named_parameters["table_ids"] = duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT);
+		generic_query_function_3.named_parameters["table_names"] =
+		    duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+		generic_query_function_3.named_parameters["change_types"] =
+		    duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
+		loader.RegisterFunction(generic_query_function_3);
+	}
+
+	for (const auto &name : {"cdc_dml_table_changes_query"}) {
 		duckdb::TableFunction range_changes_function_2(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
 		    RowScanExecute, CdcRangeChangesBind, CdcRangeChangesInit);
