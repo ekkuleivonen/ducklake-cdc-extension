@@ -214,6 +214,25 @@ bool SupportsUpdateReturning(StateBackendKind backend) {
 	return backend == StateBackendKind::DuckDB;
 }
 
+std::string NativePostgresTable(const std::string &schema_name, const std::string &table_name) {
+	return QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name);
+}
+
+std::string NativePostgresStateTable(const std::string &table_name, bool use_state_schema) {
+	const auto schema_name = use_state_schema ? STATE_SCHEMA : "public";
+	return NativePostgresTable(schema_name, table_name);
+}
+
+std::string NativePostgresMetadataTable(const std::string &table_name) {
+	return NativePostgresTable("public", table_name);
+}
+
+void PostgresExecuteChecked(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
+	auto result = conn.Query("CALL postgres_execute(" + QuoteLiteral("__ducklake_metadata_" + catalog_name) + ", " +
+	                         QuoteLiteral(sql) + ")");
+	ThrowIfQueryFailed(result);
+}
+
 std::string BuildBusyMessage(const std::string &catalog_name, const std::string &consumer_name,
                              const duckdb::Value &owner_token, const duckdb::Value &owner_acquired_at,
                              const duckdb::Value &owner_heartbeat_at, int64_t lease_interval_seconds,
@@ -1356,15 +1375,54 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 	}
 }
 
+duckdb::unique_ptr<duckdb::MaterializedQueryResult>
+VerifyCommittedConsumer(duckdb::Connection &conn, const std::string &consumers, const std::string &consumer_name,
+                        const std::string &cached_token, int64_t snapshot_id) {
+	auto result = conn.Query("SELECT consumer_name, last_committed_snapshot, last_committed_schema_version FROM " +
+	                         consumers + " WHERE consumer_name = " + QuoteLiteral(consumer_name) +
+	                         " AND owner_token = " + TokenSqlOrNull(cached_token) +
+	                         " AND last_committed_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
+	ThrowIfQueryFailed(result);
+	return result;
+}
+
+bool TryCommitPostgresNative(duckdb::Connection &conn, const std::string &catalog_name,
+                             const std::string &consumer_name, const std::string &cached_token, int64_t snapshot_id,
+                             std::vector<duckdb::Value> &out) {
+	if (cached_token.empty()) {
+		return false;
+	}
+	const auto use_state_schema = StateSchemaExists(conn, catalog_name);
+	const auto consumers = NativePostgresStateTable(CONSUMERS_TABLE, use_state_schema);
+	const auto attached_consumers = StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema);
+	const auto snapshot_table = NativePostgresMetadataTable("ducklake_snapshot");
+	const auto snapshot_sql = std::to_string(snapshot_id);
+	const auto update_sql =
+	    "UPDATE " + consumers + " SET last_committed_snapshot = " + snapshot_sql +
+	    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
+	    " WHERE snapshot_id = " + snapshot_sql + " LIMIT 1), owner_heartbeat_at = now(), updated_at = now() " +
+	    "WHERE consumer_name = " + QuoteLiteral(consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
+	    " AND last_committed_snapshot <= " + snapshot_sql + " AND EXISTS (SELECT 1 FROM " + snapshot_table +
+	    " WHERE snapshot_id = " + snapshot_sql + ")";
+	PostgresExecuteChecked(conn, catalog_name, update_sql);
+
+	auto verified = VerifyCommittedConsumer(conn, attached_consumers, consumer_name, cached_token, snapshot_id);
+	if (!verified || verified->RowCount() == 0) {
+		return false;
+	}
+	out = {verified->GetValue(0, 0), verified->GetValue(1, 0), verified->GetValue(2, 0)};
+	return true;
+}
+
 std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
-	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
-	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 	if (SupportsUpdateReturning(backend)) {
+		const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
+		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 		auto fast_commit = conn.Query(
 		    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
 		    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
@@ -1379,6 +1437,13 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 			return {fast_commit->GetValue(0, 0), fast_commit->GetValue(1, 0), fast_commit->GetValue(2, 0)};
 		}
 	}
+	if (backend == StateBackendKind::Postgres) {
+		std::vector<duckdb::Value> committed;
+		if (TryCommitPostgresNative(conn, data.catalog_name, data.consumer_name, cached_token, data.snapshot_id,
+		                            committed)) {
+			return committed;
+		}
+	}
 
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
@@ -1386,6 +1451,7 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	}
 	ValidateCommitSnapshot(conn, data.catalog_name, data.consumer_name, row.last_committed_snapshot, data.snapshot_id);
 	const auto schema_version = ResolveSchemaVersion(conn, data.catalog_name, data.snapshot_id);
+	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	ExecuteChecked(conn, "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
 	                         ", last_committed_schema_version = " + std::to_string(schema_version) +
 	                         ", owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +

@@ -4,7 +4,11 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-echo "pre-commit: running make format-check"
+echo "pre-commit: running make format-fix"
+
+staged_files="$(mktemp)"
+trap 'rm -f "$staged_files"' EXIT
+git diff --cached --name-only --diff-filter=ACMR >"$staged_files"
 
 required_clang_format_version="11.0.1"
 cache_dir="${DUCKLAKE_CDC_HOOK_CACHE:-$repo_root/.cache/pre-commit}"
@@ -57,4 +61,12 @@ if ! clang-format --version | grep -q "$required_clang_format_version"; then
 	exit 1
 fi
 
+make format-fix
+
+if [ -s "$staged_files" ]; then
+	echo "pre-commit: staging formatter updates"
+	xargs git add -- <"$staged_files"
+fi
+
+echo "pre-commit: running make format-check"
 make format-check
