@@ -20,6 +20,7 @@ A DuckDB extension that adds change-data-capture cursors on top of
 - Stateless queries: `cdc_ddl_changes_query`, `cdc_ddl_ticks_query`,
   `cdc_dml_changes_query`, `cdc_dml_ticks_query`, and
   `cdc_dml_table_changes_query`.
+- Schema inspection: `cdc_schema_diff`.
 - Observability: `cdc_version`, `cdc_doctor`, `cdc_list_consumers`,
   `cdc_list_subscriptions`, `cdc_consumer_stats`, and `cdc_audit_events`.
 - A thin Python client in `clients/python`.

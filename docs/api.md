@@ -60,7 +60,8 @@ release.
   [`cdc_dml_changes_query`](#cdc_dml_changes_query),
   [`cdc_ddl_ticks_query`](#cdc_ddl_ticks_query),
   [`cdc_dml_ticks_query`](#cdc_dml_ticks_query),
-  [`cdc_dml_table_changes_query`](#cdc_dml_table_changes_query)
+  [`cdc_dml_table_changes_query`](#cdc_dml_table_changes_query),
+  [`cdc_schema_diff`](#cdc_schema_diff)
 
 ---
 
@@ -797,6 +798,36 @@ stateless sibling of `cdc_dml_table_changes_read`.
 
 Returns the same variable row shape as `cdc_dml_table_changes_read`, without
 `consumer_name`, `start_snapshot`, or `end_snapshot`.
+
+### `cdc_schema_diff`
+
+```sql
+SELECT *
+FROM cdc_schema_diff(catalog, table_name, from_snapshot, to_snapshot);
+```
+
+Returns a per-table column/schema diff over an explicit snapshot range. The
+table name may be unqualified (`orders`, resolved as `main.orders`) or qualified
+(`schema.table`). This function is stateless: it does not create a consumer,
+acquire a lease, or advance a cursor.
+
+Returns:
+
+```text
+snapshot_id BIGINT
+snapshot_time TIMESTAMPTZ
+change_kind VARCHAR
+column_id BIGINT
+old_name VARCHAR
+new_name VARCHAR
+old_type VARCHAR
+new_type VARCHAR
+old_default VARCHAR
+new_default VARCHAR
+old_nullable BOOLEAN
+new_nullable BOOLEAN
+parent_column_id BIGINT
+```
 
 ---
 
