@@ -509,6 +509,9 @@ jobs:
           path = Path(os.environ["DESCRIPTOR"])
           version = os.environ["STRIPPED_VERSION"]
           sha = os.environ["RELEASE_SHA"]
+          community_test_config = (
+              "  test_config: '{\"test_env_variables\":{\"LINUX_CI_IN_DOCKER\":\"0\"}}'"
+          )
 
           text = path.read_text()
           text = re.sub(
@@ -523,6 +526,13 @@ jobs:
               text,
               count=1,
           )
+          if "test_config:" not in text:
+              text = re.sub(
+                  r'(?m)^(\s*requires_toolchains:\s*.*)$',
+                  lambda m: f"{m.group(1)}\n{community_test_config}",
+                  text,
+                  count=1,
+              )
           path.write_text(text)
           PY
           else
@@ -536,6 +546,7 @@ jobs:
             license: Apache-2.0
             excluded_platforms: ""
             requires_toolchains: ""
+            test_config: '{"test_env_variables":{"LINUX_CI_IN_DOCKER":"0"}}'
             maintainers:
               - "$ACTOR"
 
