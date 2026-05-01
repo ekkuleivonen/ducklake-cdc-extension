@@ -1575,6 +1575,12 @@ bool DmlTableChangesMatchSubscriptions(duckdb::Connection &conn, const std::stri
 	if (change_types.empty()) {
 		return false;
 	}
+	const auto dot = qualified_name.find('.');
+	if (dot == std::string::npos) {
+		return false;
+	}
+	const auto schema_name = qualified_name.substr(0, dot);
+	const auto table_name = qualified_name.substr(dot + 1);
 	std::ostringstream filter;
 	filter << " WHERE change_type IN (";
 	for (size_t i = 0; i < change_types.size(); ++i) {
@@ -1584,9 +1590,9 @@ bool DmlTableChangesMatchSubscriptions(duckdb::Connection &conn, const std::stri
 		filter << QuoteLiteral(change_types[i]);
 	}
 	filter << ")";
-	auto rows = conn.Query("SELECT count(*) FROM " + QuoteIdentifier(catalog_name) + ".table_changes(" +
-	                       QuoteLiteral(qualified_name) + ", " + std::to_string(snapshot_id) + ", " +
-	                       std::to_string(snapshot_id) + ")" + filter.str());
+	auto rows = conn.Query("SELECT count(*) FROM ducklake_table_changes(" + QuoteLiteral(catalog_name) + ", " +
+	                       QuoteLiteral(schema_name) + ", " + QuoteLiteral(table_name) + ", " +
+	                       std::to_string(snapshot_id) + ", " + std::to_string(snapshot_id) + ")" + filter.str());
 	if (!rows || rows->HasError() || rows->RowCount() == 0 || rows->GetValue(0, 0).IsNull()) {
 		return false;
 	}

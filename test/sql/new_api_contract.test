@@ -83,6 +83,23 @@ FROM cdc_ddl_ticks_query('lake', 0, schemas := ['aux']);
 ----
 true
 
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'listen_backlog',
+  table_names := ['orders'],
+  start_at := 'now'
+);
+
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'listen_backlog', to_snapshot := 'beginning');
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_ticks_listen('lake', 'listen_backlog', timeout_ms := 0, max_snapshots := 1000);
+----
+true
+
 statement error
 SELECT * FROM cdc_consumer_create('lake', 'legacy');
 ----

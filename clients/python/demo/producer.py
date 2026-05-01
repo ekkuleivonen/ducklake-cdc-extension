@@ -64,7 +64,6 @@ class Args:
     batch_min: int
     batch_max: int
     workers: int
-    reset: bool
     catalog: str | None
     catalog_backend: str | None
     storage: str | None
@@ -74,12 +73,11 @@ def main() -> None:
     args = parse_args()
     rng = random.Random(RANDOM_SEED)
 
-    if args.reset:
-        reset_demo_state(
-            catalog=args.catalog,
-            catalog_backend=args.catalog_backend,
-            storage=args.storage,
-        )
+    reset_demo_state(
+        catalog=args.catalog,
+        catalog_backend=args.catalog_backend,
+        storage=args.storage,
+    )
 
     lake = open_demo_lake(
         catalog=args.catalog,
@@ -121,11 +119,6 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         ),
     )
     parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="reset the demo catalog and local storage before producing",
-    )
-    parser.add_argument(
         "--catalog",
         help=(
             f"DuckLake catalog URL; defaults to ${CATALOG_ENV} or "
@@ -155,7 +148,6 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         batch_min=namespace.batch_min,
         batch_max=namespace.batch_max,
         workers=namespace.workers,
-        reset=namespace.reset,
         catalog=namespace.catalog,
         catalog_backend=namespace.catalog_backend,
         storage=namespace.storage,

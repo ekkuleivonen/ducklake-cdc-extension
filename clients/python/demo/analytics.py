@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 T = TypeVar("T")
 NANOS_PER_MILLISECOND = 1_000_000.0
+CLOCK_SKEW_CLAMP_MS = 5.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class DemoStats:
     consumed_changes: int = 0
     latency_observations: int = 0
     latency_missing_produced_ns: int = 0
+    latency_clock_skew_clamped: int = 0
     table_counts: list[int] = field(default_factory=list)
     rows_per_table: list[int] = field(default_factory=list)
     changes_by_table: dict[str, int] = field(default_factory=dict)
@@ -189,9 +191,14 @@ class DemoStats:
             parsed_epoch_ns = parse_int(produced_epoch_ns)
             snapshot_epoch_ns = datetime_to_epoch_ns(snapshot_time)
             if parsed_epoch_ns is not None and snapshot_epoch_ns is not None:
-                self.producer_to_snapshot_ms.append(
-                    (snapshot_epoch_ns - parsed_epoch_ns) / NANOS_PER_MILLISECOND
-                )
+                producer_to_snapshot_ms = (
+                    snapshot_epoch_ns - parsed_epoch_ns
+                ) / NANOS_PER_MILLISECOND
+                if -CLOCK_SKEW_CLAMP_MS < producer_to_snapshot_ms < 0:
+                    producer_to_snapshot_ms = 0.0
+                    self.latency_clock_skew_clamped += 1
+                if producer_to_snapshot_ms >= 0:
+                    self.producer_to_snapshot_ms.append(producer_to_snapshot_ms)
                 observed_epoch_ns = time.time_ns() if consumed_epoch_ns is None else consumed_epoch_ns
                 self.snapshot_to_consumer_ms.append(
                     (observed_epoch_ns - snapshot_epoch_ns) / NANOS_PER_MILLISECOND
@@ -246,6 +253,7 @@ class DemoStats:
             "changes_by_table": dict(sorted(self.changes_by_table.items())),
             "latency_observations": self.latency_observations,
             "latency_missing_produced_ns": self.latency_missing_produced_ns,
+            "latency_clock_skew_clamped": self.latency_clock_skew_clamped,
             "consumer_count_seen": len(self.consumer_names),
             "schema_count_seen": len(self.schema_names),
             "table_count_seen": len(self.table_names),
@@ -514,6 +522,11 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
                 "count_missing_produced_ns",
                 str(summary.get("latency_missing_produced_ns", 0)),
                 "rows delivered but excluded from latency due to missing timestamp",
+            ),
+            (
+                "count_clock_skew_clamped",
+                str(summary.get("latency_clock_skew_clamped", 0)),
+                "near-zero negative producer->snapshot samples clamped to zero",
             ),
             (
                 "count_stale_latency_rows",

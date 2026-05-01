@@ -16,7 +16,6 @@ from common import (
     DEFAULT_POSTGRES_CATALOG,
     STORAGE_ENV,
     open_demo_lake,
-    reset_demo_state,
     retry_on_lock,
 )
 
@@ -40,11 +39,6 @@ DEFAULT_CDC_EXTENSION = (
 
 def main() -> None:
     args = parse_args()
-    reset_demo_state(
-        catalog=args.catalog,
-        catalog_backend=args.catalog_backend,
-        storage=args.storage,
-    )
     lake = open_demo_lake(
         allow_unsigned_extensions=True,
         catalog=args.catalog,
@@ -141,7 +135,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--start-at",
-        default="now",
+        default="beginning",
         help="'now', 'beginning', 'oldest', or snapshot id",
     )
     return parser.parse_args(argv)
@@ -149,24 +143,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def ensure_consumer(cdc: CDCClient, *, lake: DuckLake, start_at: str) -> list[str]:
     table_names = [f"{table.schema_name}.{table.name}" for table in lake.tables()]
+    if not table_names:
+        raise RuntimeError(
+            "No DuckLake tables found for the DML demo consumer. Run producer.py first, "
+            "or start a DDL consumer that creates table-specific DML consumers after tables appear."
+        )
+
+    if consumer_exists(cdc, CONSUMER_NAME):
+        cdc.consumer_force_release(CONSUMER_NAME)
+        cdc.consumer_drop(CONSUMER_NAME)
 
     def create() -> None:
         cdc.dml_consumer_create(
             CONSUMER_NAME,
             table_names=table_names,
-            start_at=int(start_at) if start_at.isdigit() else start_at,
+            start_at="now",
         )
+        if start_at != "now":
+            cdc.consumer_reset(CONSUMER_NAME, to_snapshot=parse_snapshot_arg(start_at))
 
-    try:
-        create()
-    except Exception:
-        try:
-            cdc.consumer_force_release(CONSUMER_NAME)
-            cdc.consumer_drop(CONSUMER_NAME)
-            create()
-        except Exception:
-            raise
+    create()
     return table_names
+
+
+def consumer_exists(cdc: CDCClient, name: str) -> bool:
+    return any(consumer.consumer_name == name for consumer in cdc.consumer_list())
+
+
+def parse_snapshot_arg(value: str) -> str | int:
+    return int(value) if value.isdigit() else value
 
 
 def stream_changes(
