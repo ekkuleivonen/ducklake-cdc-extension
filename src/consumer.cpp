@@ -1433,7 +1433,9 @@ std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const
 	if (data.timeout_ms > HARD_WAIT_TIMEOUT_MS) {
 		EmitWaitTimeoutClampedNotice(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
 	}
-	MaybeEmitWaitSharedConnectionWarning(context, timeout_ms);
+	if (timeout_ms > 0) {
+		MaybeEmitWaitSharedConnectionWarning(context, timeout_ms);
+	}
 	auto interval_ms = WAIT_INITIAL_INTERVAL_MS;
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
