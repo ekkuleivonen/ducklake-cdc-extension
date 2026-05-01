@@ -85,6 +85,10 @@ jobs:
             --runtime official \
             --cdc-extension build/benchmark/extensions/ducklake_cdc.duckdb_extension \
             --workload bench/light.yaml
+          uv run --locked python bench/runner.py \
+            --runtime official \
+            --cdc-extension build/benchmark/extensions/ducklake_cdc.duckdb_extension \
+            --workload bench/empty-window.yaml
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4

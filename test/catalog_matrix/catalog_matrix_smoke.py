@@ -37,6 +37,15 @@ BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
 DEFAULT_CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
 DEFAULT_BACKENDS = ("duckdb", "sqlite")
 ALL_BACKENDS = ("duckdb", "sqlite", "postgres")
+UPDATE_RETURNING_SUPPORTED = {
+    "duckdb": True,
+    # DuckDB's sqlite_scanner/postgres_scanner currently reject RETURNING for
+    # attached-table UPDATEs. Keep this probe near the backend matrix so the
+    # fast-path gate in consumer.cpp can be widened as soon as scanner support
+    # appears.
+    "sqlite": False,
+    "postgres": False,
+}
 DEFAULT_PG_DSN = "host=127.0.0.1 port=5434 user=ducklake password=ducklake dbname=ducklake"
 
 
@@ -154,6 +163,28 @@ def scalar(conn: duckdb.DuckDBPyConnection, sql: str) -> Any:
     return rows[0][0]
 
 
+def run_update_returning_probe(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
+    require_ok(conn, "CREATE TABLE __ducklake_metadata_lake.returning_probe(id INTEGER, value INTEGER)")
+    require_ok(conn, "INSERT INTO __ducklake_metadata_lake.returning_probe VALUES (1, 10)")
+    sql = "UPDATE __ducklake_metadata_lake.returning_probe " "SET value = value + 1 WHERE id = 1 RETURNING id, value"
+    expected = UPDATE_RETURNING_SUPPORTED[backend]
+    if expected:
+        rows = require_rows(conn, sql)
+        if rows != [(1, 11)]:
+            raise RuntimeError(f"{backend}: UPDATE RETURNING returned unexpected rows: {rows!r}")
+        return
+    try:
+        rows = require_rows(conn, sql)
+    except RuntimeError as exc:
+        if "RETURNING clause not yet supported" in str(exc):
+            return
+        raise
+    raise RuntimeError(
+        f"{backend}: UPDATE RETURNING now works through the attached backend ({rows!r}); "
+        "widen SupportsUpdateReturning and update UPDATE_RETURNING_SUPPORTED"
+    )
+
+
 def run_demo_flow(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
     consumer = f"matrix_demo_{backend}"
     require_ok(conn, "CREATE TABLE lake.orders(id INTEGER, amount INTEGER)")
@@ -250,6 +281,7 @@ def run_backend(name: str, cdc_extension: Path, pg_dsn: str) -> None:
         config = backend_config(name, Path(tmp), pg_dsn)
         print(f"[{name}] demo flow", flush=True)
         with connected(config, cdc_extension) as conn:
+            run_update_returning_probe(conn, name)
             run_demo_flow(conn, name)
     with tempfile.TemporaryDirectory(prefix=f"ducklake_cdc_{name}_lease_") as tmp:
         config = backend_config(name, Path(tmp), pg_dsn)
