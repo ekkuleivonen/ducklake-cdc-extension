@@ -39,6 +39,7 @@ class Backend:
     name: str
     attach_sql: str
     before_attach: tuple[str, ...] = ()
+    optional_before_attach: tuple[str, ...] = ()
 
 
 def sql_quote(value: str | Path) -> str:
@@ -55,6 +56,12 @@ def load_extensions(con: duckdb.DuckDBPyConnection, backend: Backend) -> None:
     con.execute("LOAD parquet")
     for sql in backend.before_attach:
         con.execute(sql)
+    for sql in backend.optional_before_attach:
+        try:
+            con.execute(sql)
+        except duckdb.CatalogException as exc:
+            if "unrecognized configuration parameter" not in str(exc):
+                raise
     con.execute(f"LOAD {sql_quote(CDC_EXTENSION)}")
 
 
@@ -124,6 +131,8 @@ def postgres_backend(workdir: Path, dsn: str) -> Backend:
         before_attach=(
             "INSTALL postgres",
             "LOAD postgres",
+        ),
+        optional_before_attach=(
             "SET pg_pool_max_connections = 64",
             "SET pg_connection_limit = 64",
         ),

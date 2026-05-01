@@ -130,8 +130,10 @@ def iter_consumer_batches(
             continue
         last_activity = time.monotonic()
 
+        # The listen call resolves a CDC window and acquires the consumer lease.
+        # Continue lease-bound operations on that same connection until commit.
         window_operation = partial(
-            cdc.window,
+            wait_cdc.window,
             consumer_name,
             max_snapshots=max_snapshots,
         )
@@ -191,7 +193,7 @@ def iter_consumer_batches(
                 processing_ms,
             )
         end_snapshot = window.end_snapshot
-        commit_operation = partial(cdc.commit, consumer_name, end_snapshot)
+        commit_operation = partial(wait_cdc.commit, consumer_name, end_snapshot)
         commit = _timed_retry(stats, "cdc_commit", retry, commit_operation)
         if stats is not None:
             stats.record_commit()

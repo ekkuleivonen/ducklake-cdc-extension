@@ -167,12 +167,14 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
         "main.orders",
         "main.users",
     ]
-    assert wait_cdc.calls == ["dml_ticks_listen:orders_sink:25"]
-    assert cdc.calls == [
+    assert wait_cdc.calls == [
+        "dml_ticks_listen:orders_sink:25",
         "window:orders_sink:10",
+        "commit:orders_sink:42",
+    ]
+    assert cdc.calls == [
         "dml_table_changes_read:orders_sink:main.orders:10",
         "dml_table_changes_read:orders_sink:main.users:10",
-        "commit:orders_sink:42",
     ]
     assert stats.waits == [True]
     assert stats.windows == [True]
