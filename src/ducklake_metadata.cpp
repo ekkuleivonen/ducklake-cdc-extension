@@ -28,7 +28,7 @@ namespace duckdb_cdc {
 //===--------------------------------------------------------------------===//
 
 const char *const CONSUMERS_TABLE = "__ducklake_cdc_consumers";
-const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_list_subscriptions";
+const char *const CONSUMER_SUBSCRIPTIONS_TABLE = "__ducklake_cdc_consumer_subscriptions";
 const char *const AUDIT_TABLE = "__ducklake_cdc_audit";
 const char *const STATE_SCHEMA = "__ducklake_cdc";
 

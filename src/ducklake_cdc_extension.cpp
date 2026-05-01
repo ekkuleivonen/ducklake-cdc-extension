@@ -38,10 +38,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(cdc_version_function);
 	// Function registration is split across the four CDC domains:
 	//   - consumer: lifecycle (create/reset/drop/list/force_release/
-	//     heartbeat) + cursor primitives (window/commit/wait).
-	//   - ddl: schema-change reads (cdc_ddl_changes_read, cdc_ddl_changes_query, cdc_schema_diff).
-	//   - dml: row-level reads (cdc_dml_ticks_read, cdc_dml_table_changes_read, cdc_dml_table_changes_query).
-	//   - stats: observability (cdc_consumer_stats, cdc_audit_recent).
+	//     heartbeat) + cursor primitives (window/commit).
+	//   - ddl: schema-change reads/listens/queries and cdc_schema_diff.
+	//   - dml: row-level reads/listens/queries and snapshot ticks.
+	//   - stats: observability (cdc_consumer_stats, cdc_audit_events).
 	duckdb_cdc::RegisterConsumerFunctions(loader);
 	duckdb_cdc::RegisterDdlFunctions(loader);
 	duckdb_cdc::RegisterDmlFunctions(loader);

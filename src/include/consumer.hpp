@@ -26,7 +26,7 @@ namespace duckdb_cdc {
 
 //! Single row from the `__ducklake_cdc_consumers` state table, normalised
 //! into typed fields. Routing intent lives in
-//! `__ducklake_cdc_list_subscriptions`, not on this row.
+//! `__ducklake_cdc_consumer_subscriptions`, not on this row.
 struct ConsumerRow {
 	std::string consumer_name;
 	std::string consumer_kind;
@@ -40,7 +40,7 @@ struct ConsumerRow {
 	bool stop_at_schema_change = true;
 };
 
-//! One durable row from `__ducklake_cdc_list_subscriptions`.
+//! One durable row from `__ducklake_cdc_consumer_subscriptions`.
 struct ConsumerSubscriptionRow {
 	std::string consumer_name;
 	std::string consumer_kind;

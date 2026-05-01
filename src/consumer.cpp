@@ -1661,15 +1661,15 @@ bool SnapshotTouchesSubscriptions(duckdb::Connection &conn, const std::string &c
 	return false;
 }
 
-duckdb::Value NextMatchingSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
-                                   const ConsumerRow &consumer,
-                                   const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+std::vector<duckdb::Value> NextMatchingSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                                const ConsumerRow &consumer,
+                                                const std::vector<ConsumerSubscriptionRow> &subscriptions) {
 	auto rows = conn.Query("SELECT snapshot_id, changes_made FROM " +
 	                       MetadataTable(catalog_name, "ducklake_snapshot_changes") + " WHERE snapshot_id > " +
 	                       std::to_string(consumer.last_committed_snapshot) + " ORDER BY snapshot_id ASC");
 	ThrowIfQueryFailed(rows);
 	if (!rows) {
-		return duckdb::Value();
+		return {duckdb::Value(), duckdb::Value()};
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
 		if (rows->GetValue(0, row_idx).IsNull()) {
@@ -1679,10 +1679,11 @@ duckdb::Value NextMatchingSnapshot(duckdb::Connection &conn, const std::string &
 		const auto changes_value = rows->GetValue(1, row_idx);
 		const auto changes_made = changes_value.IsNull() ? std::string() : changes_value.ToString();
 		if (SnapshotTouchesSubscriptions(conn, catalog_name, snapshot_id, changes_made, subscriptions)) {
-			return duckdb::Value::BIGINT(snapshot_id);
+			return {duckdb::Value::BIGINT(snapshot_id),
+			        duckdb::Value::BIGINT(snapshot_id - consumer.last_committed_snapshot)};
 		}
 	}
-	return duckdb::Value();
+	return {duckdb::Value(), duckdb::Value()};
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &context,
@@ -1724,9 +1725,9 @@ std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, c
 			throw duckdb::InterruptException();
 		}
 		const auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		const auto next_matching_snapshot = NextMatchingSnapshot(conn, data.catalog_name, row, subscriptions);
-		if (!next_matching_snapshot.IsNull()) {
-			return {next_matching_snapshot};
+		const auto next_matching = NextMatchingSnapshot(conn, data.catalog_name, row, subscriptions);
+		if (!next_matching.empty() && !next_matching[0].IsNull()) {
+			return next_matching;
 		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline || timeout_ms == 0) {

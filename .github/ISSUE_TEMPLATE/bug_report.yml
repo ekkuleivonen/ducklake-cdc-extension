@@ -15,7 +15,7 @@ body:
     attributes:
       label: Summary
       description: One or two sentences describing what went wrong.
-      placeholder: cdc_window raised CDC_BUSY immediately after cdc_consumer_create on a fresh consumer.
+      placeholder: cdc_window raised CDC_BUSY immediately after cdc_dml_consumer_create on a fresh consumer.
     validations:
       required: true
 

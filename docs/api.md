@@ -104,7 +104,7 @@ schema-boundary hazards.
 
 ```sql
 SELECT *
-FROM cdc_list_consumers(catalog, consumer := NULL);
+FROM cdc_list_consumers(catalog);
 ```
 
 Lists registered consumers and their lease/cursor state.
@@ -116,6 +116,10 @@ consumer_name VARCHAR
 consumer_kind VARCHAR        -- ddl | dml
 consumer_id BIGINT
 subscription_count BIGINT
+subscriptions_active BIGINT
+subscriptions_renamed BIGINT
+subscriptions_dropped BIGINT
+stop_at_schema_change BOOLEAN
 last_committed_snapshot BIGINT
 last_committed_schema_version BIGINT
 owner_token UUID
@@ -132,7 +136,7 @@ metadata VARCHAR
 
 ```sql
 SELECT *
-FROM cdc_list_subscriptions(catalog, consumer := NULL);
+FROM cdc_list_subscriptions(catalog, name := NULL);
 ```
 
 Lists normalized subscription rows. These rows are the durable routing contract.
@@ -151,13 +155,11 @@ subscription_id BIGINT
 scope_kind VARCHAR           -- catalog | schema | table
 schema_id BIGINT
 table_id BIGINT
-schema_name VARCHAR
-table_name VARCHAR
+event_category VARCHAR       -- ddl | dml
+change_type VARCHAR
 original_qualified_name VARCHAR
 current_qualified_name VARCHAR
 status VARCHAR               -- active | renamed | dropped
-created_at TIMESTAMPTZ
-metadata VARCHAR
 ```
 
 ### `cdc_consumer_stats`
@@ -199,8 +201,7 @@ SELECT *
 FROM cdc_audit_events(
   catalog,
   since_seconds := 86400,
-  consumer      := NULL,
-  action        := NULL
+  consumer      := NULL
 );
 ```
 
@@ -370,8 +371,6 @@ window. Repeated calls from the same lease holder return the same window until
 Returns:
 
 ```text
-consumer_name VARCHAR
-consumer_kind VARCHAR
 start_snapshot BIGINT
 end_snapshot BIGINT
 has_changes BOOLEAN

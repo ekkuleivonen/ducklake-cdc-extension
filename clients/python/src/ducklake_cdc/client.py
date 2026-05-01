@@ -106,7 +106,7 @@ class CDCClient:
             ConsumerSubscription,
         )
 
-    def consumer_reset(self, name: str, *, to_snapshot: int | None = None) -> ConsumerReset:
+    def consumer_reset(self, name: str, *, to_snapshot: str | int | None = None) -> ConsumerReset:
         return _model_one(
             self._table("cdc_consumer_reset", name, named={"to_snapshot": to_snapshot}),
             ConsumerReset,
@@ -272,12 +272,25 @@ class CDCClient:
             },
         )
 
-    def ddl_changes_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[DdlEvent]:
+    def ddl_changes_read(
+        self,
+        name: str,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+        auto_commit: bool = False,
+    ) -> list[DdlEvent]:
         return _model_list(
             self._table(
                 "cdc_ddl_changes_read",
                 name,
-                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
+                named={
+                    "max_snapshots": max_snapshots,
+                    "start_snapshot": start_snapshot,
+                    "end_snapshot": end_snapshot,
+                    "auto_commit": auto_commit,
+                },
             ),
             DdlEvent,
         )
@@ -303,12 +316,63 @@ class CDCClient:
             DdlEvent,
         )
 
-    def dml_ticks_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[SnapshotEvent]:
+    def dml_changes_read_rows(
+        self,
+        name: str,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+        auto_commit: bool = False,
+    ) -> list[ChangeRow]:
+        return [
+            ChangeRow.from_row(row)
+            for row in self.dml_changes_read(
+                name,
+                max_snapshots=max_snapshots,
+                start_snapshot=start_snapshot,
+                end_snapshot=end_snapshot,
+                auto_commit=auto_commit,
+            ).list()
+        ]
+
+    def dml_changes_listen_rows(
+        self,
+        name: str,
+        *,
+        timeout_ms: int = 30_000,
+        max_snapshots: int = 100,
+        auto_commit: bool = False,
+    ) -> list[ChangeRow]:
+        return [
+            ChangeRow.from_row(row)
+            for row in self.dml_changes_listen(
+                name,
+                timeout_ms=timeout_ms,
+                max_snapshots=max_snapshots,
+                auto_commit=auto_commit,
+            ).list()
+        ]
+
+    def dml_ticks_read(
+        self,
+        name: str,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+        auto_commit: bool = False,
+    ) -> list[SnapshotEvent]:
         return _model_list(
             self._table(
                 "cdc_dml_ticks_read",
                 name,
-                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
+                named={
+                    "max_snapshots": max_snapshots,
+                    "start_snapshot": start_snapshot,
+                    "end_snapshot": end_snapshot,
+                    "auto_commit": auto_commit,
+                },
             ),
             SnapshotEvent,
         )
@@ -334,12 +398,25 @@ class CDCClient:
             SnapshotEvent,
         )
 
-    def ddl_ticks_read(self, name: str, *, max_snapshots: int = 100, auto_commit: bool = False) -> list[SnapshotEvent]:
+    def ddl_ticks_read(
+        self,
+        name: str,
+        *,
+        max_snapshots: int = 100,
+        start_snapshot: int | None = None,
+        end_snapshot: int | None = None,
+        auto_commit: bool = False,
+    ) -> list[SnapshotEvent]:
         return _model_list(
             self._table(
                 "cdc_ddl_ticks_read",
                 name,
-                named={"max_snapshots": max_snapshots, "auto_commit": auto_commit},
+                named={
+                    "max_snapshots": max_snapshots,
+                    "start_snapshot": start_snapshot,
+                    "end_snapshot": end_snapshot,
+                    "auto_commit": auto_commit,
+                },
             ),
             SnapshotEvent,
         )
@@ -463,6 +540,26 @@ class CDCClient:
             },
         )
 
+    def dml_changes_query_rows(
+        self,
+        from_snapshot: int,
+        *,
+        to_snapshot: int | None = None,
+        table_ids: list[int] | None = None,
+        table_names: list[str] | None = None,
+        change_types: list[str] | None = None,
+    ) -> list[ChangeRow]:
+        return [
+            ChangeRow.from_row(row)
+            for row in self.dml_changes_query(
+                from_snapshot,
+                to_snapshot=to_snapshot,
+                table_ids=table_ids,
+                table_names=table_names,
+                change_types=change_types,
+            ).list()
+        ]
+
     def dml_table_changes_query(
         self,
         from_snapshot: int,
@@ -505,7 +602,7 @@ class CDCClient:
             ConsumerStats,
         )
 
-    def audit_recent(
+    def audit_events(
         self,
         *,
         since_seconds: int = 86_400,

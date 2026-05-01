@@ -1,195 +1,151 @@
 # ducklake-cdc
 
-A DuckDB extension that adds a row-level change-data-capture cursor on top
-of [DuckLake](https://ducklake.select).
+A DuckDB extension that adds change-data-capture cursors on top of
+[DuckLake](https://ducklake.select).
 
-> **Status: early SQL release (`v0.3.2`).** The core cursor / DDL / DML
-> surface is usable today, with catalog smoke coverage across DuckDB, SQLite,
-> and PostgreSQL. `v0.3.2` is tagged in this repository; DuckDB community
-> extension distribution is green and waiting on upstream merge, after which
-> users can install with `INSTALL ducklake_cdc FROM community`. There are no
-> language clients or reference sinks yet. See [`docs/roadmap.md`](./docs/roadmap.md)
-> for direction and [`docs/hazard-log.md`](./docs/hazard-log.md) for known risks.
+> **Status: greenfield CDC contract.** The extension exposes separate DDL and
+> DML consumer streams, explicit read/listen/query modes, durable cursor state,
+> and lightweight tick streams. The API is still pre-adoption, so this repository
+> intentionally removes old SQL names instead of keeping compatibility shims.
 
-## What works today
+## What Works Today
 
-- The cursor primitives — `cdc_window`, `cdc_commit`, `cdc_wait`,
-  `cdc_ddl`, and the `cdc_consumer_*` lifecycle, all enforced by an
-  owner-token lease for single-reader-per-consumer.
-- Stateless sugar — `cdc_recent_changes`, `cdc_recent_ddl`,
-  `cdc_schema_diff`, `cdc_range_events`, `cdc_range_ddl`,
-  `cdc_range_changes` — for ad-hoc exploration, bounded replay planning,
-  and export/debug work without moving a consumer cursor.
-- Composed sugar — `cdc_events`, `cdc_changes` — built over the
-  primitives, applied with the consumer's subscription routing rules.
-- Observability — `cdc_consumer_stats`, `cdc_audit_recent`, `cdc_doctor`.
-- Structured errors and notices: `CDC_GAP`, `CDC_BUSY`,
-  `CDC_INCOMPATIBLE_CATALOG`, `CDC_SCHEMA_BOUNDARY`,
-  `CDC_WAIT_TIMEOUT_CLAMPED`, `CDC_WAIT_SHARED_CONNECTION` — full list in
-  [`docs/errors.md`](./docs/errors.md).
-- Release packaging: tagged GitHub releases, a full DuckDB extension matrix,
-  and a green `duckdb/community-extensions` descriptor PR for `v0.3.2`.
-- DuckDB, SQLite, and PostgreSQL DuckLake catalog smoke coverage in CI.
-- Validated against DuckDB **v1.5.1** and the runtime-installed DuckLake
-  extension (see [`docs/development.md`](./docs/development.md)).
-- A bench smoke harness (`bench/runner.py`, `bench/light.yaml`,
-  `bench/empty-window.yaml`) that reports end-to-end latency, throughput,
-  catalog QPS, empty-window latency, and lag drift.
+- Consumer lifecycle: `cdc_ddl_consumer_create`, `cdc_dml_consumer_create`,
+  `cdc_consumer_reset`, `cdc_consumer_drop`, `cdc_consumer_heartbeat`, and
+  `cdc_consumer_force_release`.
+- Cursor primitives: `cdc_window` and `cdc_commit`.
+- Stateful streams: `cdc_ddl_changes_*`, `cdc_ddl_ticks_*`,
+  `cdc_dml_changes_*`, `cdc_dml_ticks_*`, and typed
+  `cdc_dml_table_changes_*`.
+- Stateless queries: `cdc_ddl_changes_query`, `cdc_ddl_ticks_query`,
+  `cdc_dml_changes_query`, `cdc_dml_ticks_query`, and
+  `cdc_dml_table_changes_query`.
+- Observability: `cdc_version`, `cdc_doctor`, `cdc_list_consumers`,
+  `cdc_list_subscriptions`, `cdc_consumer_stats`, and `cdc_audit_events`.
+- A thin Python client in `clients/python`.
 
-## What does *not* work yet
+The full SQL contract and row shapes are documented in
+[`docs/api.md`](./docs/api.md).
 
-- **No Python client yet.** The `import ducklake_cdc` snippet you may
-  have seen in older drafts is roadmap material.
-- **No reference sinks.** Stdout, file, webhook, Kafka, Redis Streams,
-  and Postgres-mirror sinks are not shipped.
-- **Backend coverage is smoke-level.** DuckDB, SQLite, and PostgreSQL
-  catalog paths are exercised in CI, but not exhaustively certified.
-- **No extension-owned sink failure queue.** Sink retries, idempotency,
-  validation, quarantine handling, and exactly-once-ish semantics belong
-  in clients and sinks.
-- **Community install is pending upstream merge for `v0.3.2`.** Until
-  `duckdb/community-extensions` merges the descriptor, build locally. After
-  merge, use `INSTALL ducklake_cdc FROM community`.
-- **Performance numbers are early signal.** The light benchmark harness
-  exists, but published numbers are not production contracts.
-
-## Build and run
-
-You need a local clone with submodules and a working C++ toolchain:
+## Build
 
 ```bash
 git clone --recursive https://github.com/<this-repo>.git
 cd ducklake-cdc-extension
-make debug
-./build/debug/duckdb -unsigned -c "SELECT cdc_version();"
+make release
+./build/release/duckdb -unsigned -c "SELECT cdc_version();"
 ```
 
-The binary stamp is `git tag --points-at HEAD` if a tag points at the
-build commit, otherwise the short SHA — so an unstable build reports
-something like `ducklake_cdc 7a3b9c1`. Full build / test / sanitiser
-guidance lives in [`docs/development.md`](./docs/development.md).
+Development and test details live in [`docs/development.md`](./docs/development.md).
 
 ## Quickstart
 
-![Producer SQL mutating a DuckLake table](./docs/assets/producer.png)
-![Consumer SQL reading DuckLake CDC events](./docs/assets/consumer.png)
-
 ```sql
--- Preconditions: DuckDB v1.5.1 and the official `ducklake`, `parquet`,
--- and `ducklake_cdc` extensions. `INSTALL ducklake_cdc FROM community`
--- becomes the normal path once the v0.3.2 community descriptor is merged.
 INSTALL ducklake;
-INSTALL ducklake_cdc FROM community;
 LOAD ducklake;
 LOAD parquet;
 LOAD ducklake_cdc;
+
 ATTACH 'ducklake:my.ducklake' AS lake (DATA_PATH 'my_data');
 
 CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
 INSERT INTO lake.orders VALUES (1, 'new');
 
-SELECT * FROM cdc_consumer_create(
+SELECT *
+FROM cdc_dml_consumer_create(
   'lake',
-  'demo',
-  subscriptions := [
-    struct_pack(scope_kind := 'table', schema_name := 'main', table_name := 'orders',
-                schema_id := NULL::BIGINT, table_id := NULL::BIGINT,
-                event_category := 'dml', change_type := '*')
-  ]
+  'orders_sink',
+  table_names := ['main.orders'],
+  change_types := ['insert', 'update_postimage', 'delete'],
+  start_at := 'now'
 );
+
 INSERT INTO lake.orders VALUES (2, 'paid');
 
--- The cursor loop in three primitives. cdc_window and cdc_commit are
--- table functions, and DuckDB table functions do not accept subqueries
--- as arguments, so capture end_snapshot into a session variable first.
-SELECT * FROM cdc_window('lake', 'demo');                         -- acquire single-reader window
-SELECT * FROM cdc_changes('lake', 'demo', 'orders');              -- typed DML rows for the window
+SELECT *
+FROM cdc_dml_table_changes_read(
+  'lake',
+  'orders_sink',
+  table_name := 'main.orders'
+);
 
 SET VARIABLE end_snapshot = (
-  SELECT end_snapshot FROM cdc_window('lake', 'demo')
+  SELECT end_snapshot FROM cdc_window('lake', 'orders_sink')
 );
-SELECT * FROM cdc_commit('lake', 'demo', getvariable('end_snapshot'));
+
+SELECT *
+FROM cdc_commit('lake', 'orders_sink', getvariable('end_snapshot'));
 ```
 
-That is the durable cursor loop: create a named consumer, acquire a
-single-reader window, read typed DML rows via the `cdc_changes` sugar
-(or DuckLake's `lake.table_changes()` directly), then commit the
-returned `end_snapshot`. Consumers that care about schema also call
-`cdc_ddl('lake', 'demo')` between the window and the commit.
-
-For ad-hoc exploration without a cursor, the stateless sugar:
+For low-latency consumers, use the listen variants:
 
 ```sql
-SELECT * FROM cdc_recent_changes('lake', 'orders', since_seconds := 3600);
-SELECT * FROM cdc_recent_ddl('lake', since_seconds := 86400);
-SELECT * FROM cdc_schema_diff('lake', 'orders', /* from */ 0, /* to */ 5);
+SELECT *
+FROM cdc_dml_changes_listen(
+  'lake',
+  'orders_sink',
+  timeout_ms := 30000,
+  auto_commit := false
+);
 ```
 
-Long-poll consumers wrap the loop with `cdc_wait`. It is a table
-function returning one BIGINT row (the new snapshot id, or NULL on
-timeout), so always read it from a `FROM` clause:
+For cache invalidation or orchestration, use ticks:
 
 ```sql
-SELECT * FROM cdc_wait('lake', 'demo', timeout_ms := 30000);
+SELECT *
+FROM cdc_dml_ticks_listen('lake', 'orders_sink', timeout_ms := 30000);
 ```
 
-Operational dashboards read from `cdc_consumer_stats('lake')` (cursor /
-gap / lease columns) and `cdc_audit_recent('lake')` (lifecycle audit
-trail). `cdc_doctor('lake')` packages the common read-only health checks
-for SQL users and support reports.
+DDL consumers are separate:
 
-The full primitive + sugar surface, with row shapes and behaviour notes
-per function, is in [`docs/api.md`](./docs/api.md). Known risks and sharp
-edges are tracked in [`docs/hazard-log.md`](./docs/hazard-log.md).
+```sql
+SELECT *
+FROM cdc_ddl_consumer_create('lake', 'schema_watch', schemas := ['main']);
 
-## Examples
+SELECT *
+FROM cdc_ddl_changes_listen('lake', 'schema_watch', timeout_ms := 30000);
+```
 
-Runnable SQL examples ship under [`examples/`](./examples). Each one is a
-self-contained script you can pipe into `./build/debug/duckdb`:
+## Python
 
-| File | Pattern |
-| --- | --- |
-| `01_basic_consumer.sql` | `cdc_window` + `table_changes` + `cdc_commit` directly |
-| `02_outbox_demo.sql` | `cdc_events` dispatch on `commit_extra_info` |
-| `03_long_poll.sql` | `cdc_wait` for a streaming consumer |
-| `04_schema_change.sql` | `schema_changes_pending`, `cdc_ddl`, schema-boundary flow |
-| `05_recent_changes.sql` | stateless `cdc_recent_changes` / `cdc_recent_ddl` |
-| `06_parallel_readers.sql` | orchestrator + worker fan-out under one lease |
-| `07_ddl_only_consumer.sql` | catalog-scope DDL subscription schema-watcher |
-| `08_cross_schema_window.sql` | `stop_at_schema_change := false` opt-out |
-| `09_lease_recovery.sql` | force-release after a holder dies |
+```python
+from ducklake import DuckLake
+from ducklake_cdc import CDCClient
+
+lake = DuckLake("ducklake:my.ducklake", alias="lake")
+cdc = CDCClient(lake)
+
+cdc.dml_consumer_create(
+    "orders_sink",
+    table_names=["main.orders"],
+    change_types=["insert", "update_postimage", "delete"],
+)
+
+rows = cdc.dml_table_changes_read_rows("orders_sink", table_name="main.orders")
+```
+
+## Tests
+
+The focused new-contract SQL test is:
+
+```bash
+./build/release/test/unittest "test/sql/new_api_contract.test"
+```
+
+`make test_release_default` runs the active default SQL set. Older SQL suites
+that reference removed APIs are intentionally excluded until they are migrated
+or deleted.
 
 ## Backends
 
-DuckLake supports DuckDB, SQLite and PostgreSQL as metadata catalogs.
-This extension has smoke coverage for all three catalog backends in CI.
-Treat SQLite and PostgreSQL support as usable but young: the catalog matrix
-currently proves the main cursor loop, schema-boundary path, and lease
-rejection flow, not every SQLLogic edge case.
+DuckLake supports DuckDB, SQLite, and PostgreSQL metadata catalogs. This project
+has smoke coverage for those backends, but non-DuckDB metadata paths should
+still be treated as young.
 
-## Versioning and releases
+## More
 
-The release flow is described in [`docs/design.md`](./docs/design.md).
-
-Current repository release line: `v0.3.2`.
-
-DuckDB community-extension distribution for `v0.3.2` is green and pending
-upstream merge. Once merged, users can install it with:
-
-```sql
-INSTALL ducklake_cdc FROM community;
-LOAD ducklake_cdc;
-```
-
-## Where to go next
-
-- **What this project intends to become** — [`VISION.md`](./VISION.md).
-- **Roadmap** — [`docs/roadmap.md`](./docs/roadmap.md).
-- **Design notes** — [`docs/design.md`](./docs/design.md).
-- **Public API reference** — [`docs/api.md`](./docs/api.md).
-- **Contributing** — [`CONTRIBUTING.md`](./CONTRIBUTING.md) and
-  [`docs/development.md`](./docs/development.md).
-
-## License
-
-Apache-2.0 (see [`LICENSE`](./LICENSE)).
+- [`docs/api.md`](./docs/api.md) - public SQL contract
+- [`docs/design.md`](./docs/design.md) - state model and design notes
+- [`docs/errors.md`](./docs/errors.md) - structured errors and notices
+- [`docs/hazard-log.md`](./docs/hazard-log.md) - known risks
+- [`VISION.md`](./VISION.md) - product direction

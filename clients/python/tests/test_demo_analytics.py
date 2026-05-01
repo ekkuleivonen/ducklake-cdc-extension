@@ -87,7 +87,7 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["empty_window_ratio"] == 0.5
     assert summary["cdc_dml_ticks_listen_calls"] == 2
     assert summary["cdc_dml_ticks_listen_timeouts"] == 1
-    assert summary["cdc_ddl_changes_read_changes_read_calls"] == 1
+    assert summary["cdc_ddl_changes_read_calls"] == 1
     assert summary["cdc_dml_ticks_read_calls"] == 1
     assert summary["lake_tables_calls"] == 1
     assert summary["cdc_dml_table_changes_read_calls"] == 1

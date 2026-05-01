@@ -48,7 +48,7 @@ class DemoStats:
     cdc_window_calls: int = 0
     cdc_window_non_empty_calls: int = 0
     cdc_window_empty_calls: int = 0
-    cdc_ddl_changes_read_changes_read_calls: int = 0
+    cdc_ddl_changes_read_calls: int = 0
     cdc_dml_ticks_read_calls: int = 0
     lake_tables_calls: int = 0
     cdc_dml_table_changes_read_calls: int = 0
@@ -107,7 +107,7 @@ class DemoStats:
             self.cdc_window_empty_calls += 1
 
     def record_ddl(self, count: int) -> None:
-        self.cdc_ddl_changes_read_changes_read_calls += 1
+        self.cdc_ddl_changes_read_calls += 1
         self.ddl_events += count
 
     def record_events(self, count: int) -> None:
@@ -230,7 +230,7 @@ class DemoStats:
             "cdc_window_non_empty_calls": self.cdc_window_non_empty_calls,
             "cdc_window_empty_calls": self.cdc_window_empty_calls,
             "empty_window_ratio": divide(self.cdc_window_empty_calls, self.cdc_window_calls),
-            "cdc_ddl_changes_read_changes_read_calls": self.cdc_ddl_changes_read_changes_read_calls,
+            "cdc_ddl_changes_read_calls": self.cdc_ddl_changes_read_calls,
             "cdc_dml_ticks_read_calls": self.cdc_dml_ticks_read_calls,
             "lake_tables_calls": self.lake_tables_calls,
             "cdc_dml_table_changes_read_calls": self.cdc_dml_table_changes_read_calls,
@@ -317,7 +317,7 @@ class DemoStats:
         return (
             self.cdc_dml_ticks_listen_calls
             + self.cdc_window_calls
-            + self.cdc_ddl_changes_read_changes_read_calls
+            + self.cdc_ddl_changes_read_calls
             + self.cdc_dml_ticks_read_calls
             + self.lake_tables_calls
             + self.cdc_dml_table_changes_read_calls

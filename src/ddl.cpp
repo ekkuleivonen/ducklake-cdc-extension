@@ -5,9 +5,8 @@
 //
 // Schema-change information surface. Owns:
 //
-//   * Token decoding for `ducklake_snapshot_changes.changes_made` and the
-//     typed `<lake>.snapshots().changes` MAP form (`ChangesTouchConsumerTables`,
-//     plus the Parse* / Lookup* helpers).
+//   * Token decoding for the typed `<lake>.snapshots().changes` MAP form
+//     (Parse* / Lookup* helpers).
 //
 //   * Per-snapshot DDL row extraction (`ExtractDdlRows`,
 //     `AddDdlRowFromMapEntry`, `SortDdlRowsForSnapshot`,
@@ -46,90 +45,14 @@ namespace duckdb_cdc {
 namespace {
 
 //===--------------------------------------------------------------------===//
-// Token-text decoding (cdc_dml_ticks_read filter path + DDL extraction)
+// Token decoding for DDL extraction
 //===--------------------------------------------------------------------===//
-
-std::vector<std::string> SplitChangeTokens(const std::string &changes_made) {
-	std::vector<std::string> tokens;
-	size_t start = 0;
-	while (start < changes_made.size()) {
-		auto comma = changes_made.find(',', start);
-		tokens.push_back(changes_made.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
-		if (comma == std::string::npos) {
-			break;
-		}
-		start = comma + 1;
-	}
-	return tokens;
-}
 
 bool ParseIdToken(const std::string &token, const std::string &prefix, int64_t &id) {
 	if (!StartsWith(token, prefix)) {
 		return false;
 	}
 	return TryParseInt64(token.substr(prefix.size()), id);
-}
-
-std::string UnquoteChangeName(const std::string &quoted) {
-	if (quoted.size() >= 2 && quoted.front() == '"' && quoted.back() == '"') {
-		return quoted.substr(1, quoted.size() - 2);
-	}
-	return quoted;
-}
-
-bool ParseQualifiedNameToken(const std::string &token, const std::string &prefix, std::string &schema_name,
-                             std::string &object_name) {
-	if (!StartsWith(token, prefix)) {
-		return false;
-	}
-	const auto value = token.substr(prefix.size());
-	const auto dot = value.find("\".\"");
-	if (dot == std::string::npos) {
-		return false;
-	}
-	schema_name = UnquoteChangeName(value.substr(0, dot + 1));
-	object_name = UnquoteChangeName(value.substr(dot + 2));
-	return true;
-}
-
-//! Translate a `changes_made` token to the fully-qualified `schema.table`
-//! name as of `snapshot_id`. Returns the empty string for tokens that do
-//! not name a single user table (schema-level DDL, view changes, anything
-//! we can't or shouldn't resolve to a table). Used by `cdc_dml_ticks_read` to
-//! filter snapshots against subscribed table identities.
-std::string TableQualifiedNameForToken(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
-                                       const std::string &token) {
-	std::string schema_name;
-	std::string object_name;
-	if (ParseQualifiedNameToken(token, "created_table:", schema_name, object_name)) {
-		return schema_name + "." + object_name;
-	}
-	if (StartsWith(token, "created_view:") || StartsWith(token, "altered_view:") ||
-	    StartsWith(token, "dropped_view:") || StartsWith(token, "created_schema:") ||
-	    StartsWith(token, "dropped_schema:")) {
-		return std::string();
-	}
-	const std::vector<std::string> id_prefixes = {
-	    "inserted_into_table:", "deleted_from_table:", "tables_inserted_into:", "tables_deleted_from:",
-	    "inlined_insert:",      "inlined_delete:",     "altered_table:",        "dropped_table:",
-	    "compacted_table:",     "merge_adjacent:"};
-	int64_t table_id = 0;
-	for (const auto &prefix : id_prefixes) {
-		if (ParseIdToken(token, prefix, table_id)) {
-			auto result = conn.Query(
-			    "SELECT s.schema_name, t.table_name FROM " + MetadataTable(catalog_name, "ducklake_table") +
-			    " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-			    " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) +
-			    " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
-			    " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
-			if (result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
-			    !result->GetValue(1, 0).IsNull()) {
-				return result->GetValue(0, 0).ToString() + "." + result->GetValue(1, 0).ToString();
-			}
-			return std::string();
-		}
-	}
-	return std::string();
 }
 
 //===--------------------------------------------------------------------===//
@@ -771,11 +694,7 @@ std::string BuildCreatedViewDetails(duckdb::Connection &conn, const std::string 
 //! (DuckDB, SQLite, Postgres) emit identical MAP key sets for every
 //! DDL operation, so this dispatcher is backend-agnostic by
 //! construction. ADR 0008 makes the MAP form the canonical Stage-1
-//! source; the text helpers (`SplitChangeTokens`, `Parse*Token`,
-//! `TableQualifiedNameForToken`) stay alive only for
-//! `ChangesTouchConsumerTables` (per-snapshot consumer-filter
-//! evaluation) and to surface `changes_made` verbatim from
-//! `cdc_dml_ticks_read`.
+//! source for typed DDL rows.
 //!
 //! DML / maintenance MAP keys (`tables_inserted_into`, `inlined_insert`,
 //! `inlined_delete`, `tables_deleted_from`, `merge_adjacent`) are
@@ -1323,10 +1242,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
                                                                 duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcDdlData>();
-	if (data.listen) {
+	auto max_snapshots = data.max_snapshots;
+	if (data.listen && !data.explicit_window) {
 		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
+		}
+		if (ready.size() > 1 && !ready[1].IsNull()) {
+			max_snapshots = std::max<int64_t>(max_snapshots, ready[1].GetValue<int64_t>());
 		}
 	}
 
@@ -1354,7 +1277,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 		CdcWindowData window_data;
 		window_data.catalog_name = data.catalog_name;
 		window_data.consumer_name = data.consumer_name;
-		window_data.max_snapshots = data.max_snapshots;
+		window_data.max_snapshots = max_snapshots;
 		auto window = ReadWindow(context, window_data);
 		start_snapshot = window[0].GetValue<int64_t>();
 		end_snapshot = window[1].GetValue<int64_t>();
@@ -1925,20 +1848,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 //===--------------------------------------------------------------------===//
 // Public surface (declared in ddl.hpp)
 //===--------------------------------------------------------------------===//
-
-bool ChangesTouchConsumerTables(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
-                                const std::string &changes_made, const std::unordered_set<std::string> &filter_tables) {
-	if (filter_tables.empty()) {
-		return true;
-	}
-	for (const auto &token : SplitChangeTokens(changes_made)) {
-		const auto qualified = TableQualifiedNameForToken(conn, catalog_name, snapshot_id, token);
-		if (!qualified.empty() && filter_tables.find(qualified) != filter_tables.end()) {
-			return true;
-		}
-	}
-	return false;
-}
 
 void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
 	for (const auto &name :

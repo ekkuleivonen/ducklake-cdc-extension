@@ -104,6 +104,11 @@ SELECT * FROM cdc_changes('lake', 'legacy', 'orders');
 Catalog Error
 
 statement error
+SELECT * FROM cdc_dml_table_changes_read('lake', 'legacy', 'orders');
+----
+Binder Error
+
+statement error
 SELECT * FROM cdc_ddl('lake', 'legacy');
 ----
 Catalog Error
