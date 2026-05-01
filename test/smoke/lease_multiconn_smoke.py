@@ -116,12 +116,6 @@ std::string QuotePath(const std::string &path) {
 	return result;
 }
 
-std::string CatalogAllSubscription() {
-	return "subscriptions := [struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, "
-	       "table_name := NULL::VARCHAR, schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
-	       "event_category := '*', change_type := '*')]";
-}
-
 int main(int argc, char **argv) {
 	if (argc != 5) {
 		std::cerr << "usage: harness <ducklake-extension> <cdc-extension> <lake-path> <data-path>\n";
@@ -150,7 +144,7 @@ int main(int argc, char **argv) {
 	}
 
 	RequireOk(a, "CREATE TABLE lake.multi_conn_probe(id INTEGER)");
-	RequireOk(a, "SELECT * FROM cdc_consumer_create('lake', 'multi_conn', " + CatalogAllSubscription() + ")");
+	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'multi_conn', table_names := ['multi_conn_probe'])");
 	RequireOk(a, "INSERT INTO lake.multi_conn_probe VALUES (1)");
 	auto window = RequireOk(a, "SELECT * FROM cdc_window('lake', 'multi_conn')");
 	auto &window_result = window->Cast<MaterializedQueryResult>();

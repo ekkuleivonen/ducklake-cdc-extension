@@ -122,12 +122,6 @@ std::string QuotePath(const std::string &path) {
 	return result;
 }
 
-std::string CatalogAllSubscription() {
-	return "subscriptions := [struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, "
-	       "table_name := NULL::VARCHAR, schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
-	       "event_category := '*', change_type := '*')]";
-}
-
 int main(int argc, char **argv) {
 	if (argc != 5) {
 		std::cerr << "usage: harness <ducklake-extension> <cdc-extension> <lake-path> <data-path>\n";
@@ -179,8 +173,8 @@ int main(int argc, char **argv) {
 	// itself; once that succeeds, A's first cdc_window must still
 	// produce a clean window.
 	const auto pin_snapshot = std::to_string(snapshot_ids[1]);
-	RequireOk(a, "SELECT * FROM cdc_consumer_create('lake', 'toctou', start_at = '" + pin_snapshot +
-	                 "', " + CatalogAllSubscription() + ")");
+	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'toctou', start_at := '" + pin_snapshot +
+	                 "', table_names := ['toctou'])");
 
 	auto window_a = RequireOk(a, "SELECT * FROM cdc_window('lake', 'toctou')");
 	if (!window_a->Cast<MaterializedQueryResult>().GetValue(2, 0).GetValue<bool>()) {

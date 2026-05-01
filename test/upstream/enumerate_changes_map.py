@@ -561,7 +561,7 @@ def _project_to_key_sets(result: dict[str, Any]) -> dict[str, list[str]]:
 
     Provenance fields in the committed JSONs intentionally change between
     runs, so the recurring gate compares only the surface consumed by the
-    future cdc_ddl/cdc_events extractors.
+    future DDL/DML extractor work.
     """
     out: dict[str, list[str]] = {}
     for op in result["operations"]:
@@ -690,8 +690,8 @@ def _format_reference_drift(deltas: dict[str, dict[str, dict[str, list[str]]]]) 
             "      uv run python test/upstream/enumerate_changes_map.py \\",
             "          --backends duckdb sqlite postgres --update-docs",
             "    locally, review the resulting diff, and commit the regenerated",
-            "    test/upstream/output/ files plus the docs/api.md splice. The cdc_ddl /",
-            "    cdc_events extractor work item also needs an update; see ADR 0008.",
+            "    test/upstream/output/ files plus the docs/api.md splice. The DDL /",
+            "    DML extractor work item also needs an update; see ADR 0008.",
             "  - If this divergence is unexpected: open a docs/upstream-asks.md",
             "    entry. Backend MAP-key drift between releases is exactly the class",
             "    of upstream behaviour ADR 0008's recurring CI gate exists to surface.",

@@ -1,3 +1,5 @@
 # Python Client Tests
 
-Reserved for future Python client binding tests.
+Reserved for integration-style Python client tests.
+
+The package scaffold and unit tests live under `clients/python/`.

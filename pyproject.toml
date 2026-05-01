@@ -4,6 +4,9 @@ version = "0.0.0"
 description = "DuckLake CDC upstream probes and smoke tests"
 requires-python = ">=3.11"
 dependencies = [
+    "black>=24",
+    "cmake-format>=0.6",
+    "clang-format==11.0.1",
     "duckdb==1.5.1",
     "psycopg[binary]>=3.1",
     "pytz>=2026.1.post1",

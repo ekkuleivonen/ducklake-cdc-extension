@@ -48,9 +48,10 @@ Useful upstream options, in increasing order of ambition:
 
 ## Event-Driven Wait Hooks
 
-`cdc_wait` currently polls DuckLake snapshots. For PostgreSQL-backed catalogs,
-`LISTEN`/`NOTIFY` or an equivalent wakeup channel could make long-polling much
-cheaper and lower latency.
+Stateful `listen` functions need a cheap way to wake when DuckLake commits a
+new snapshot. For PostgreSQL-backed catalogs, `LISTEN`/`NOTIFY` or an
+equivalent wakeup channel could make long-polling much cheaper and lower
+latency.
 
 The ideal upstream support would be a stable callback, table function, or
 notification hook that fires after DuckLake commits a new snapshot. It should

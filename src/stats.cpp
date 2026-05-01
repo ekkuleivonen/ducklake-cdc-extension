@@ -4,10 +4,10 @@
 // stats.cpp
 //
 // Implementation of the observability surface: cdc_consumer_stats and
-// cdc_audit_recent. These functions are read-only views over the same
+// cdc_audit_events. These functions are read-only views over the same
 // state tables `consumer.cpp` writes to: the consumer-state row for
 // stats (cursor / lag / lease / subscription health) and the audit log
-// for cdc_audit_recent.
+// for cdc_audit_events.
 //===----------------------------------------------------------------------===//
 
 #include "stats.hpp"
@@ -63,17 +63,17 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcConsumerStatsBind(duckdb::ClientCont
 		result->consumer_name = entry->second.GetValue<std::string>();
 	}
 
-	names = {"consumer_name",      "consumer_id",          "last_committed_snapshot",   "current_snapshot",
-	         "lag_snapshots",      "lag_seconds",          "oldest_available_snapshot", "gap_distance",
-	         "subscription_count", "subscriptions_active", "subscriptions_renamed",     "subscriptions_dropped",
-	         "owner_token",        "owner_acquired_at",    "owner_heartbeat_at",        "lease_interval_seconds",
-	         "lease_alive"};
-	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::DOUBLE,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	                duckdb::LogicalType::UUID,    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ,
-	                duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
+	names = {"consumer_name",          "consumer_kind",      "consumer_id",          "last_committed_snapshot",
+	         "current_snapshot",       "lag_snapshots",      "lag_seconds",          "oldest_available_snapshot",
+	         "gap_distance",           "subscription_count", "subscriptions_active", "subscriptions_renamed",
+	         "subscriptions_dropped",  "owner_token",        "owner_acquired_at",    "owner_heartbeat_at",
+	         "lease_interval_seconds", "lease_alive"};
+	return_types = {duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::DOUBLE,       duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BIGINT,
+	                duckdb::LogicalType::BIGINT,       duckdb::LogicalType::UUID,    duckdb::LogicalType::TIMESTAMP_TZ,
+	                duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::INTEGER, duckdb::LogicalType::BOOLEAN};
 	return std::move(result);
 }
 
@@ -97,7 +97,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 
 	// Single big projection so the planner JOIN-and-aggregates against
 	// ducklake_snapshot in one pass per consumer.
-	auto query = std::string("SELECT c.consumer_name, c.consumer_id, c.last_committed_snapshot, "
+	auto query = std::string("SELECT c.consumer_name, c.consumer_kind, c.consumer_id, c.last_committed_snapshot, "
 	                         "s.snapshot_time, c.owner_token, c.owner_acquired_at, "
 	                         "c.owner_heartbeat_at, c.lease_interval_seconds FROM ") +
 	             consumers + " c LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
@@ -110,13 +110,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 
 	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
 		const auto consumer_name_value = rows->GetValue(0, i);
-		const auto consumer_id = rows->GetValue(1, i).GetValue<int64_t>();
-		const auto last_committed_snapshot = rows->GetValue(2, i).GetValue<int64_t>();
-		const auto last_snapshot_time = rows->GetValue(3, i);
-		const auto owner_token_value = rows->GetValue(4, i);
-		const auto owner_acquired_value = rows->GetValue(5, i);
-		const auto owner_heartbeat_value = rows->GetValue(6, i);
-		const auto lease_interval = rows->GetValue(7, i).GetValue<int64_t>();
+		const auto consumer_kind_value = rows->GetValue(1, i);
+		const auto consumer_id = rows->GetValue(2, i).GetValue<int64_t>();
+		const auto last_committed_snapshot = rows->GetValue(3, i).GetValue<int64_t>();
+		const auto last_snapshot_time = rows->GetValue(4, i);
+		const auto owner_token_value = rows->GetValue(5, i);
+		const auto owner_acquired_value = rows->GetValue(6, i);
+		const auto owner_heartbeat_value = rows->GetValue(7, i);
+		const auto lease_interval = rows->GetValue(8, i).GetValue<int64_t>();
 
 		const auto lag_snapshots = current_snapshot - last_committed_snapshot;
 		duckdb::Value lag_seconds_value;
@@ -162,6 +163,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 
 		std::vector<duckdb::Value> row;
 		row.push_back(consumer_name_value);
+		row.push_back(consumer_kind_value);
 		row.push_back(duckdb::Value::BIGINT(consumer_id));
 		row.push_back(duckdb::Value::BIGINT(last_committed_snapshot));
 		row.push_back(duckdb::Value::BIGINT(current_snapshot));
@@ -184,16 +186,16 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 }
 
 //===--------------------------------------------------------------------===//
-// cdc_audit_recent
+// cdc_audit_events
 //===--------------------------------------------------------------------===//
 
-struct CdcAuditRecentData : public duckdb::TableFunctionData {
+struct CdcAuditEventsData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t since_seconds;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		auto result = duckdb::make_uniq<CdcAuditRecentData>();
+		auto result = duckdb::make_uniq<CdcAuditEventsData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->since_seconds = since_seconds;
@@ -205,18 +207,18 @@ struct CdcAuditRecentData : public duckdb::TableFunctionData {
 	}
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> CdcAuditRecentBind(duckdb::ClientContext &context,
+duckdb::unique_ptr<duckdb::FunctionData> CdcAuditEventsBind(duckdb::ClientContext &context,
                                                             duckdb::TableFunctionBindInput &input,
                                                             duckdb::vector<duckdb::LogicalType> &return_types,
                                                             duckdb::vector<duckdb::string> &names) {
 	if (input.inputs.size() != 1) {
-		throw duckdb::BinderException("cdc_audit_recent requires catalog");
+		throw duckdb::BinderException("cdc_audit_events requires catalog");
 	}
-	auto result = duckdb::make_uniq<CdcAuditRecentData>();
+	auto result = duckdb::make_uniq<CdcAuditEventsData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->since_seconds = SinceSecondsParameter(input, 86400);
 	if (result->since_seconds < 0) {
-		throw duckdb::InvalidInputException("cdc_audit_recent since_seconds must be >= 0");
+		throw duckdb::InvalidInputException("cdc_audit_events since_seconds must be >= 0");
 	}
 	auto entry = input.named_parameters.find("consumer");
 	if (entry != input.named_parameters.end() && !entry->second.IsNull()) {
@@ -230,10 +232,10 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcAuditRecentBind(duckdb::ClientContex
 	return std::move(result);
 }
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditRecentInit(duckdb::ClientContext &context,
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditEventsInit(duckdb::ClientContext &context,
                                                                         duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
-	auto &data = input.bind_data->Cast<CdcAuditRecentData>();
+	auto &data = input.bind_data->Cast<CdcAuditEventsData>();
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
@@ -248,7 +250,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditRecentInit(duckdb::
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        rows ? rows->GetError() : "cdc_audit_recent scan failed");
+		                        rows ? rows->GetError() : "cdc_audit_events scan failed");
 	}
 	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
 		std::vector<duckdb::Value> row;
@@ -453,22 +455,22 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDoctorInit(duckdb::Clien
 } // namespace
 
 void RegisterStatsFunctions(duckdb::ExtensionLoader &loader) {
-	for (const auto &name : {"cdc_consumer_stats", "ducklake_cdc_consumer_stats"}) {
+	for (const auto &name : {"cdc_consumer_stats"}) {
 		duckdb::TableFunction stats_function(name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
 		                                     RowScanExecute, CdcConsumerStatsBind, CdcConsumerStatsInit);
 		stats_function.named_parameters["consumer"] = duckdb::LogicalType::VARCHAR;
 		loader.RegisterFunction(stats_function);
 	}
 
-	for (const auto &name : {"cdc_audit_recent", "ducklake_cdc_audit_recent"}) {
+	for (const auto &name : {"cdc_audit_events"}) {
 		duckdb::TableFunction audit_function(name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
-		                                     RowScanExecute, CdcAuditRecentBind, CdcAuditRecentInit);
+		                                     RowScanExecute, CdcAuditEventsBind, CdcAuditEventsInit);
 		audit_function.named_parameters["since_seconds"] = duckdb::LogicalType::BIGINT;
 		audit_function.named_parameters["consumer"] = duckdb::LogicalType::VARCHAR;
 		loader.RegisterFunction(audit_function);
 	}
 
-	for (const auto &name : {"cdc_doctor", "ducklake_cdc_doctor"}) {
+	for (const auto &name : {"cdc_doctor"}) {
 		duckdb::TableFunction doctor_function(name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
 		                                      RowScanExecute, CdcDoctorBind, CdcDoctorInit);
 		doctor_function.named_parameters["consumer"] = duckdb::LogicalType::VARCHAR;

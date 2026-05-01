@@ -23,8 +23,8 @@ DuckLake already has snapshots, time travel, commit metadata, and
 - named cursors stored in the DuckLake catalog;
 - read windows and explicit commits;
 - gap detection when maintenance expires snapshots;
-- long-polling with `cdc_wait`;
-- typed DDL events with `cdc_ddl`;
+- long-polling with the `*_listen` functions;
+- typed DDL events with `cdc_ddl_changes_listen` and `cdc_ddl_changes_read`;
 - schema-boundary handling;
 - single-reader enforcement with an owner-token lease;
 - basic consumer stats and audit history.

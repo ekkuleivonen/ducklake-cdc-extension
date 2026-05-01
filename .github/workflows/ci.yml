@@ -143,7 +143,7 @@ jobs:
       - name: Catalog matrix smoke (DuckDB / SQLite / Postgres)
         # Phase 2's portability gate: the Phase 1 cursor-loop semantics must
         # hold against every catalog backend DuckLake supports. The earlier
-        # follow-up flag (post-DDL `cdc_changes` returning the OLD schema
+        # follow-up flag (post-DDL DML reads returning the OLD schema
         # against runtime-installed DuckLake) was a Bind-time probe-snapshot
         # bug — the probe was anchored at `last_committed_snapshot + 1`
         # instead of mirroring `ReadWindow`'s actual end-snapshot computation,

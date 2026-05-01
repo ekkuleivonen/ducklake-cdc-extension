@@ -6,7 +6,7 @@
 // Consumer lifecycle + cursor primitives. This module owns the consumer
 // state machine: create / reset / drop / list / force-release / heartbeat,
 // and the cursor primitives that read+advance under a single-reader lease
-// (cdc_window, cdc_commit, cdc_wait). It also owns the in-process token
+// (cdc_window, cdc_commit, listen calls). It also owns the in-process token
 // cache, the audit log writer, and the lease/wait/schema-boundary notice
 // helpers - everything that defines what "owning a consumer" means.
 //
@@ -29,6 +29,7 @@ namespace duckdb_cdc {
 //! `__ducklake_cdc_consumer_subscriptions`, not on this row.
 struct ConsumerRow {
 	std::string consumer_name;
+	std::string consumer_kind;
 	int64_t consumer_id;
 	int64_t last_committed_snapshot;
 	int64_t last_committed_schema_version;
@@ -42,6 +43,7 @@ struct ConsumerRow {
 //! One durable row from `__ducklake_cdc_consumer_subscriptions`.
 struct ConsumerSubscriptionRow {
 	std::string consumer_name;
+	std::string consumer_kind;
 	int64_t consumer_id;
 	int64_t subscription_id;
 	std::string scope_kind;
@@ -94,17 +96,24 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 //! defaulting to `DEFAULT_MAX_SNAPSHOTS` when omitted.
 int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input);
 
-//! Run the cdc_window state machine: acquire/extend the consumer's lease,
-//! compute the visible `[start_snapshot, end_snapshot]` range under the
-//! consumer's `stop_at_schema_change` policy, and emit a
+//! Run the cdc_window state machine: reuse a fresh cached lease or
+//! acquire/extend the consumer's lease, compute the visible
+//! `[start_snapshot, end_snapshot]` range under the consumer's
+//! `stop_at_schema_change` policy, and emit a
 //! `CDC_SCHEMA_BOUNDARY` notice if the window straddles a DDL boundary.
 //! Returns the row payload `[start_snapshot, end_snapshot, has_changes,
 //! schema_version, schema_changes_pending]` callers can index directly.
 std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data);
 
+std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                  const std::string &consumer_name, int64_t snapshot_id);
+
+std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
+                                                   const std::string &consumer_name, int64_t timeout_ms);
+
 //! Register all consumer-lifecycle and cursor table functions:
-//! cdc_consumer_create / reset / drop / force_release / heartbeat / list,
-//! plus cdc_window / cdc_commit / cdc_wait. Called once at extension load.
+//! cdc_ddl_consumer_create/cdc_dml_consumer_create / reset / drop / force_release / heartbeat / list,
+//! plus cdc_window / cdc_commit / listen calls. Called once at extension load.
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader);
 
 } // namespace duckdb_cdc

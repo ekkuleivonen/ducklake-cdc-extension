@@ -27,7 +27,7 @@ What this script does (no Docker, no PyPI deps; all stdlib):
    `LoadInternal` at session start, after the initial database is
    visible. The probe then hits the seeded `__ducklake_metadata_<name>`
    schema, reads `'99.99'`, and emits the structured notice on stderr.
-3. Calls `cdc_consumer_create('<catalog>', 'test', subscriptions := ...)`
+3. Calls `cdc_dml_consumer_create('<catalog>', 'test', table_names := ...)`
    against the same seeded incompatible catalog and asserts the call-time
    gate throws the same structured prefix before any catalog write.
 4. Asserts both outputs contain the `CDC_INCOMPATIBLE_CATALOG:` prefix
@@ -38,7 +38,7 @@ What this script does (no Docker, no PyPI deps; all stdlib):
    - the supported-set in `{...}` form
    - the `ducklake_cdc ` build-stamp prefix (the version segment is
      either the release tag at HEAD or the git short SHA)
-   - a pointer to `docs/compatibility.md`
+   - a pointer to `docs/development.md`
 
 Why this is a Python smoke probe:
 
@@ -100,16 +100,10 @@ EXPECTED_VERSION_STAMP = "ducklake_cdc "
 # Pointer back to the matrix the notice tells operators to consult.
 # Hard-coded here so a refactor of compat_check.cpp that drops the
 # pointer is caught loudly.
-EXPECTED_DOC_POINTER = "docs/compatibility.md"
+EXPECTED_DOC_POINTER = "docs/development.md"
 
-
-def catalog_all_subscription_arg() -> str:
-    return (
-        "subscriptions := ["
-        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
-        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
-        "]"
-    )
+# Supported catalog-format set rendered by compat_check.cpp.
+EXPECTED_SUPPORTED_SET = "{0.4, 1.0}"
 
 
 def seed_fake_catalog(db_path: Path, catalog_name: str) -> None:
@@ -169,7 +163,7 @@ def capture_call_time_error(db_path: Path, catalog_name: str) -> str:
             "-unsigned",
             str(db_path),
             "-c",
-            f"SELECT * FROM cdc_consumer_create('{catalog_name}', 'test', {catalog_all_subscription_arg()});",
+            f"SELECT * FROM cdc_dml_consumer_create('{catalog_name}', 'test', table_names := ['probe']);",
         ],
         capture_output=True,
         text=True,
@@ -194,8 +188,8 @@ def assert_required_fields(catalog_name: str, notice: str) -> list[str]:
         problems.append(f"catalog name {catalog_name!r} missing or unquoted")
     if f"'{FAKE_VERSION}'" not in notice:
         problems.append(f"observed version {FAKE_VERSION!r} missing or unquoted")
-    if "{0.4}" not in notice:
-        problems.append("supported set '{0.4}' missing")
+    if EXPECTED_SUPPORTED_SET not in notice:
+        problems.append(f"supported set '{EXPECTED_SUPPORTED_SET}' missing")
     if EXPECTED_VERSION_STAMP not in notice:
         problems.append(f"build-stamp prefix {EXPECTED_VERSION_STAMP!r} missing")
     if EXPECTED_DOC_POINTER not in notice:

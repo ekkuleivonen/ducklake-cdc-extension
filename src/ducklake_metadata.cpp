@@ -36,7 +36,7 @@ const int64_t DEFAULT_MAX_SNAPSHOTS = 100;
 const int64_t HARD_MAX_SNAPSHOTS = 1000;
 const int64_t DEFAULT_WAIT_TIMEOUT_MS = 30000;
 const int64_t HARD_WAIT_TIMEOUT_MS = 300000;
-const int64_t WAIT_INITIAL_INTERVAL_MS = 100;
+const int64_t WAIT_INITIAL_INTERVAL_MS = 50;
 const int64_t WAIT_MAX_INTERVAL_MS = 10000;
 
 //===--------------------------------------------------------------------===//
@@ -238,7 +238,8 @@ int64_t ResolveSnapshot(duckdb::Connection &conn, const std::string &catalog_nam
 }
 
 int64_t ResolveCreateSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &start_at) {
-	return ResolveSnapshot(conn, catalog_name, start_at, "start_at", "cdc_consumer_create", false);
+	return ResolveSnapshot(conn, catalog_name, start_at, "start_at", "cdc_ddl_consumer_create/cdc_dml_consumer_create",
+	                       false);
 }
 
 int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
@@ -399,7 +400,7 @@ int64_t SinceSecondsParameter(duckdb::TableFunctionBindInput &input, int64_t def
 	return entry->second.GetValue<int64_t>();
 }
 
-//! Resolve the start snapshot for stateless `cdc_recent_*` calls. The start
+//! Resolve the start snapshot for bounded stateless query calls. The start
 //! is `MAX(snapshot_id)` whose `snapshot_time <= now() - since_seconds`,
 //! so the returned snapshot is the most-recent commit *before* the cutoff
 //! and the read-out range `[start, current_snapshot()]` covers everything
@@ -424,6 +425,7 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
 	       " ("
 	       "consumer_name VARCHAR, "
+	       "consumer_kind VARCHAR NOT NULL, "
 	       "consumer_id BIGINT NOT NULL, "
 	       "stop_at_schema_change BOOLEAN NOT NULL, "
 	       "last_committed_snapshot BIGINT, "
@@ -468,6 +470,54 @@ std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
 	       ")";
 }
 
+std::string SnapshotNotifyChannel(const std::string &catalog_name) {
+	std::string out = "ducklake_cdc_snapshot_";
+	for (auto c : catalog_name) {
+		if (out.size() >= 63) {
+			break;
+		}
+		const auto ch = static_cast<unsigned char>(c);
+		out.push_back(std::isalnum(ch) ? static_cast<char>(std::tolower(ch)) : '_');
+	}
+	return out;
+}
+
+bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto result = conn.Query("SELECT type FROM duckdb_databases() WHERE database_name = " +
+	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	const auto type = duckdb::StringUtil::Lower(result->GetValue(0, 0).ToString());
+	return type == "postgres" || type == "postgres_scanner";
+}
+
+void PostgresExecuteBestEffort(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
+	auto result = conn.Query("CALL postgres_execute(" + QuoteLiteral("__ducklake_metadata_" + catalog_name) + ", " +
+	                         QuoteLiteral(sql) + ")");
+	(void)result;
+}
+
+void InstallPostgresSnapshotNotifyBestEffort(duckdb::Connection &conn, const std::string &catalog_name) {
+	if (!MetadataBackendIsPostgres(conn, catalog_name)) {
+		return;
+	}
+	const auto channel = SnapshotNotifyChannel(catalog_name);
+	PostgresExecuteBestEffort(conn, catalog_name, "CREATE SCHEMA IF NOT EXISTS " + QuoteIdentifier(STATE_SCHEMA));
+	PostgresExecuteBestEffort(
+	    conn, catalog_name,
+	    "CREATE OR REPLACE FUNCTION " + QuoteIdentifier(STATE_SCHEMA) +
+	        ".ducklake_cdc_notify_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_notify(" +
+	        QuoteLiteral(channel) + ", NEW.snapshot_id::text); RETURN NEW; END; $$");
+	PostgresExecuteBestEffort(conn, catalog_name,
+	                          "DROP TRIGGER IF EXISTS ducklake_cdc_snapshot_notify ON public.ducklake_snapshot");
+	PostgresExecuteBestEffort(
+	    conn, catalog_name,
+	    "CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot FOR EACH ROW "
+	    "EXECUTE FUNCTION " +
+	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()");
+}
+
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
 	CheckCatalogOrThrow(context, catalog_name);
 	duckdb::Connection conn(*context.db);
@@ -477,6 +527,7 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
+	InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
 }
 
 //===--------------------------------------------------------------------===//
@@ -497,6 +548,26 @@ void RowScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &
 		for (duckdb::idx_t col = 0; col < row.size(); ++col) {
 			output.SetValue(col, count, row[col]);
 		}
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+void MaterializedResultScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input,
+                                   duckdb::DataChunk &output) {
+	auto &state = input.global_state->Cast<MaterializedResultScanState>();
+	if (!state.result || state.offset >= state.result->RowCount()) {
+		return;
+	}
+	duckdb::idx_t count = 0;
+	while (state.offset < state.result->RowCount() && count < STANDARD_VECTOR_SIZE) {
+		if (state.result->ColumnCount() != output.ColumnCount()) {
+			throw duckdb::InternalException("Unaligned materialized query result in table function result");
+		}
+		for (duckdb::idx_t col = 0; col < state.result->ColumnCount(); ++col) {
+			output.SetValue(col, count, state.result->GetValue(col, state.offset));
+		}
+		state.offset++;
 		count++;
 	}
 	output.SetCardinality(count);

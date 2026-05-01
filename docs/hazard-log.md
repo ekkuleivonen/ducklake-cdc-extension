@@ -48,8 +48,9 @@ go; this file says what can hurt users or maintainers on the way there.
   DML are delivered in the wrong order or a window crosses a schema boundary
   unexpectedly.
 - Status: handled for the SQL extension surface.
-- Handling: `cdc_window` exposes `schema_changes_pending`, `cdc_ddl` emits
-  typed DDL events, and `test/sql/always_breaks.test` plus
+- Handling: `cdc_window` exposes `schema_changes_pending`,
+  `cdc_ddl_changes_read` emits typed DDL events, and
+  `test/sql/always_breaks.test` plus
   `test/sql/ddl_stage2.test` cover schema boundaries and DDL-before-DML
   ordering.
 - Next action: Revisit when a client library interleaves DDL and DML into one
@@ -78,15 +79,15 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Keep operator docs clear that retention must exceed expected
   consumer lag.
 
-### H-006: `cdc_wait` Connection Starvation
+### H-006: Listen Connection Starvation
 
 - Risk: Long-polling holds a DuckDB connection and can starve shared pools or
   interactive sessions.
 - Status: handled by docs and warning.
-- Handling: `cdc_wait` emits `CDC_WAIT_SHARED_CONNECTION`, clamps excessive
-  timeouts, backs off polling up to 10s on idle lakes, and
+- Handling: listen functions emit `CDC_WAIT_SHARED_CONNECTION`, clamp excessive
+  timeouts, use level-triggered checks before waiting, and
   `test/smoke/cdc_wait_interrupt_smoke.py` covers interruptibility.
-- Notes: SQL users should hold a dedicated connection for `cdc_wait`. Batch
+- Notes: SQL users should hold a dedicated connection for listen calls. Batch
   jobs that wake up on a schedule should call `cdc_window` directly instead of
   long-polling.
 - Next action: Client libraries should hide this by using dedicated wait
@@ -150,12 +151,12 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: DuckLake can represent deletes against inlined rows by updating catalog
   row visibility rather than advertising a normal DML key. A consumer that uses
-  `cdc_events` alone as "is there work?" can miss rows that `cdc_changes` would
-  still return.
+  DML ticks alone as "is there row payload work?" can miss rows that DML changes
+  reads would still return.
 - Status: partially handled.
-- Handling: `cdc_changes` remains the source of truth for row reads. The
-  conservative rule is: do not skip `cdc_changes` just because `cdc_events`
-  looks empty.
+- Handling: DML changes reads remain the source of truth for row payloads. The
+  conservative rule is: do not skip a DML changes read just because a tick
+  stream looks empty.
 - Next action: Add a targeted test only if this shows up as a real user-facing
   confusion point.
 
@@ -173,8 +174,8 @@ go; this file says what can hurt users or maintainers on the way there.
 ### H-014: Dropped Columns in Same-Snapshot DML
 
 - Risk: If one DuckLake commit both drops a column and deletes or updates rows
-  in the same table, `cdc_changes` reads through the end-snapshot schema and
-  does not include the dropped column's old values.
+  in the same table, typed table DML reads use the end-snapshot schema and do
+  not include the dropped column's old values.
 - Status: accepted.
 - Handling: This is DuckLake `table_changes` behavior, not an extension bug.
   The recovery path for audit use cases is DuckLake time travel: read the table
@@ -229,7 +230,7 @@ go; this file says what can hurt users or maintainers on the way there.
   break ad-hoc runbooks, backups, and upgrades from earlier releases.
 - Status: partially handled.
 - Handling: Preserve the public table functions (`cdc_consumer_stats`,
-  `cdc_audit_recent`, and lifecycle functions) as the supported inspection
+  `cdc_audit_events`, and lifecycle functions) as the supported inspection
   surface instead of asking users to query storage tables directly.
 - Notes: Existing `__ducklake_cdc_*` DuckLake tables may exist in early user
   catalogs. The migration path must be explicit: either one-way copy into the
@@ -255,16 +256,16 @@ go; this file says what can hurt users or maintainers on the way there.
   age and observability for CDC metadata table row counts, before treating
   long-lived catalogs as production-ready.
 
-### H-019: Stateless Range Semantics
+### H-019: Stateless Query Semantics
 
-- Risk: `cdc_range_events`, `cdc_range_ddl`, and `cdc_range_changes` may appear
-  equivalent to consumer-window reads, but they intentionally do not acquire
-  leases, apply subscription filters, move cursors, or enforce consumer schema
-  boundary policy.
+- Risk: `*_query` functions may appear equivalent to consumer reads, but they
+  intentionally do not acquire leases, apply consumer subscription filters, move
+  cursors, or enforce consumer schema-boundary policy.
 - Status: not handled.
-- Handling: The API docs distinguish durable replay from stateless range reads.
-- Next action: Add TDD coverage for range gap handling, `to_snapshot := NULL`,
-  DDL/DML ordering, and proof that range reads do not mutate consumer state.
+- Handling: The API docs distinguish durable replay from stateless queries.
+- Next action: Add TDD coverage for query gap handling, `to_snapshot := NULL`,
+  DDL/DML ordering, and proof that stateless queries do not mutate consumer
+  state.
 
 ### H-020: Diagnostic False Confidence
 

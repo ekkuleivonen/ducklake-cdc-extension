@@ -1,30 +1,25 @@
-"""Phase 2 catalog-backend smoke matrix for ducklake-cdc.
+"""Catalog-backend smoke test for the ducklake_cdc extension.
 
-This is intentionally smaller than the full Phase 1 SQLLogic suite. It
-exercises the highest-risk portability contracts against every DuckLake
-catalog backend:
+This is the narrow CI gate for DuckLake catalog portability. It runs the same
+DDL + DML consumer flow and owner-token lease rejection check against DuckDB,
+SQLite, and Postgres catalog backends.
 
-* the Phase 1 README-style DDL + DML consumer flow;
-* schema-boundary handling via `cdc_ddl` + `cdc_changes`;
-* owner-token single-reader enforcement across two connections.
-
-Run after `make debug`:
+Usage:
 
     uv run python test/catalog_matrix/catalog_matrix_smoke.py
-
-Run the Postgres leg with the local fixture:
-
-    docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
     uv run python test/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
-    docker compose -f test/catalog_matrix/docker-compose.yml down -v
+
+The Postgres backend expects the compose fixture in this directory by default.
+Override it with DLCDC_CATALOG_PG_DSN or --postgres-dsn.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,282 +27,263 @@ from typing import Any
 
 import duckdb
 
-REPO = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
-DEFAULT_CDC_EXTENSION = REPO / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
-DEFAULT_BACKENDS = ("duckdb", "sqlite")
-ALL_BACKENDS = ("duckdb", "sqlite", "postgres")
-UPDATE_RETURNING_SUPPORTED = {
-    "duckdb": True,
-    # DuckDB's sqlite_scanner/postgres_scanner currently reject RETURNING for
-    # attached-table UPDATEs. Keep this probe near the backend matrix so the
-    # fast-path gate in consumer.cpp can be widened as soon as scanner support
-    # appears.
-    "sqlite": False,
-    "postgres": False,
-}
-DEFAULT_PG_DSN = "host=127.0.0.1 port=5434 user=ducklake password=ducklake dbname=ducklake"
+CDC_EXTENSION = REPO_ROOT / "build" / BUILD / "extension" / "ducklake_cdc" / "ducklake_cdc.duckdb_extension"
+
+DEFAULT_POSTGRES_DSN = "host=127.0.0.1 port=5434 user=ducklake password=ducklake dbname=ducklake"
 
 
 @dataclass(frozen=True)
-class BackendConfig:
+class Backend:
     name: str
-    attach_uri: str
-    data_path: Path
+    attach_sql: str
+    before_attach: tuple[str, ...] = ()
+    optional_before_attach: tuple[str, ...] = ()
 
 
-def quote_string(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+def sql_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
-def catalog_all_subscription_arg() -> str:
-    return (
-        "subscriptions := ["
-        "struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, table_name := NULL::VARCHAR, "
-        "schema_id := NULL::BIGINT, table_id := NULL::BIGINT, event_category := '*', change_type := '*')"
-        "]"
-    )
+def connect() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(config={"allow_unsigned_extensions": "true"})
 
 
-def require_rows(conn: duckdb.DuckDBPyConnection, sql: str) -> list[Any]:
+def load_extensions(con: duckdb.DuckDBPyConnection, backend: Backend) -> None:
+    con.execute("INSTALL ducklake")
+    con.execute("LOAD ducklake")
+    con.execute("LOAD parquet")
+    for sql in backend.before_attach:
+        con.execute(sql)
+    for sql in backend.optional_before_attach:
+        try:
+            con.execute(sql)
+        except duckdb.CatalogException as exc:
+            if "unrecognized configuration parameter" not in str(exc):
+                raise
+    con.execute(f"LOAD {sql_quote(CDC_EXTENSION)}")
+
+
+@contextmanager
+def attached_pair(
+    backend: Backend,
+) -> Iterator[tuple[duckdb.DuckDBPyConnection, duckdb.DuckDBPyConnection]]:
+    a = connect()
+    b: duckdb.DuckDBPyConnection | None = None
     try:
-        return conn.execute(sql).fetchall()
-    except Exception as exc:
-        raise RuntimeError(f"{sql}\n{exc}") from exc
+        load_extensions(a, backend)
+        a.execute(backend.attach_sql)
+
+        # `cursor()` gives us a second DuckDB connection against the same
+        # database, matching the C++ multiconnection smoke. Attaching the same
+        # embedded DuckLake metadata file from two independent Python databases
+        # trips DuckDB's unique file-handle guard.
+        b = a.cursor()
+        load_extensions(b, backend)
+        has_lake = b.execute("SELECT count(*) FROM duckdb_databases() WHERE database_name = 'lake'").fetchone()[0]
+        if has_lake == 0:
+            b.execute(backend.attach_sql)
+        yield a, b
+    finally:
+        if b is not None:
+            b.close()
+        a.close()
 
 
-def require_ok(conn: duckdb.DuckDBPyConnection, sql: str) -> None:
-    require_rows(conn, sql)
-
-
-def require_error(conn: duckdb.DuckDBPyConnection, sql: str, needle: str) -> None:
-    try:
-        conn.execute(sql).fetchall()
-    except Exception as exc:
-        if needle in str(exc):
-            return
-        raise RuntimeError(f"expected error containing {needle!r} from:\n{sql}\nactual error:\n{exc}") from exc
-    raise RuntimeError(f"expected error containing {needle!r} from:\n{sql}")
-
-
-def reset_postgres_catalog(pg_dsn: str) -> None:
+def reset_postgres_catalog(dsn: str) -> None:
     import psycopg
 
-    with psycopg.connect(pg_dsn) as conn:
+    with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
         conn.commit()
 
 
-def backend_config(name: str, workdir: Path, pg_dsn: str) -> BackendConfig:
-    if name == "duckdb":
-        return BackendConfig(
-            name=name,
-            attach_uri=f"ducklake:{workdir / 'catalog.ducklake'}",
-            data_path=workdir / "duckdb_data",
-        )
-    if name == "sqlite":
-        return BackendConfig(
-            name=name,
-            attach_uri=f"ducklake:sqlite:{workdir / 'catalog.sqlite'}",
-            data_path=workdir / "sqlite_data",
-        )
-    if name == "postgres":
-        reset_postgres_catalog(pg_dsn)
-        return BackendConfig(
-            name=name,
-            attach_uri=f"ducklake:postgres:{pg_dsn}",
-            data_path=workdir / "postgres_data",
-        )
-    raise ValueError(f"unknown backend {name!r}")
+def duckdb_backend(workdir: Path, _: str) -> Backend:
+    catalog = workdir / "catalog.ducklake"
+    data = workdir / "duckdb_data"
+    data.mkdir(parents=True, exist_ok=True)
+    return Backend(
+        name="duckdb",
+        attach_sql=f"ATTACH 'ducklake:{catalog}' AS lake (DATA_PATH {sql_quote(data)})",
+    )
 
 
-@contextmanager
-def connected(config: BackendConfig, cdc_extension: Path) -> Iterator[duckdb.DuckDBPyConnection]:
-    config.data_path.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+def sqlite_backend(workdir: Path, _: str) -> Backend:
+    catalog = workdir / "catalog.sqlite"
+    data = workdir / "sqlite_data"
+    data.mkdir(parents=True, exist_ok=True)
+    return Backend(
+        name="sqlite",
+        before_attach=("INSTALL sqlite", "LOAD sqlite"),
+        attach_sql=f"ATTACH 'ducklake:sqlite:{catalog}' AS lake (DATA_PATH {sql_quote(data)})",
+    )
+
+
+def postgres_backend(workdir: Path, dsn: str) -> Backend:
+    reset_postgres_catalog(dsn)
+    data = workdir / "postgres_data"
+    data.mkdir(parents=True, exist_ok=True)
+    return Backend(
+        name="postgres",
+        before_attach=(
+            "INSTALL postgres",
+            "LOAD postgres",
+        ),
+        optional_before_attach=(
+            "SET pg_pool_max_connections = 64",
+            "SET pg_connection_limit = 64",
+        ),
+        attach_sql=f"ATTACH 'ducklake:postgres:{dsn}' AS lake (DATA_PATH {sql_quote(data)})",
+    )
+
+
+BACKENDS: dict[str, Callable[[Path, str], Backend]] = {
+    "duckdb": duckdb_backend,
+    "sqlite": sqlite_backend,
+    "postgres": postgres_backend,
+}
+
+
+def one(con: duckdb.DuckDBPyConnection, sql: str) -> Any:
+    return con.execute(sql).fetchone()
+
+
+def all_rows(con: duckdb.DuckDBPyConnection, sql: str) -> list[tuple[Any, ...]]:
+    return con.execute(sql).fetchall()
+
+
+def require_error(con: duckdb.DuckDBPyConnection, sql: str, needle: str) -> None:
     try:
-        require_ok(conn, "INSTALL ducklake")
-        require_ok(conn, "LOAD ducklake")
-        require_ok(conn, "LOAD parquet")
-        if config.name == "sqlite":
-            require_ok(conn, "INSTALL sqlite")
-            require_ok(conn, "LOAD sqlite")
-        elif config.name == "postgres":
-            require_ok(conn, "INSTALL postgres")
-            require_ok(conn, "LOAD postgres")
-            # `pg_connection_limit` keeps the underlying postgres-scanner
-            # client pool roomy enough for the lease test, which holds two
-            # logical sessions over the same DuckLake catalog. The historic
-            # `pg_pool_max_connections` knob was removed upstream.
-            require_ok(conn, "SET pg_connection_limit = 64")
-        require_ok(conn, "LOAD " + quote_string(str(cdc_extension)))
-        require_ok(
-            conn,
-            "ATTACH "
-            + quote_string(config.attach_uri)
-            + " AS lake (DATA_PATH "
-            + quote_string(str(config.data_path))
-            + ")",
-        )
-        yield conn
-    finally:
-        conn.close()
-
-
-def scalar(conn: duckdb.DuckDBPyConnection, sql: str) -> Any:
-    rows = require_rows(conn, sql)
-    if len(rows) != 1 or len(rows[0]) != 1:
-        raise RuntimeError(f"expected one scalar row from:\n{sql}\ngot: {rows!r}")
-    return rows[0][0]
-
-
-def run_update_returning_probe(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
-    require_ok(conn, "CREATE TABLE __ducklake_metadata_lake.returning_probe(id INTEGER, value INTEGER)")
-    require_ok(conn, "INSERT INTO __ducklake_metadata_lake.returning_probe VALUES (1, 10)")
-    sql = "UPDATE __ducklake_metadata_lake.returning_probe " "SET value = value + 1 WHERE id = 1 RETURNING id, value"
-    expected = UPDATE_RETURNING_SUPPORTED[backend]
-    if expected:
-        rows = require_rows(conn, sql)
-        if rows != [(1, 11)]:
-            raise RuntimeError(f"{backend}: UPDATE RETURNING returned unexpected rows: {rows!r}")
-        return
-    try:
-        rows = require_rows(conn, sql)
-    except RuntimeError as exc:
-        if "RETURNING clause not yet supported" in str(exc):
+        con.execute(sql).fetchall()
+    except Exception as exc:  # noqa: BLE001 - smoke reports the concrete DuckDB text below.
+        if needle in str(exc):
             return
-        raise
-    raise RuntimeError(
-        f"{backend}: UPDATE RETURNING now works through the attached backend ({rows!r}); "
-        "widen SupportsUpdateReturning and update UPDATE_RETURNING_SUPPORTED"
+        raise AssertionError(f"expected error containing {needle!r}, got: {exc}") from exc
+    raise AssertionError(f"expected error containing {needle!r} from: {sql}")
+
+
+def run_consumer_flow(a: duckdb.DuckDBPyConnection, b: duckdb.DuckDBPyConnection) -> None:
+    a.execute("CREATE TABLE lake.orders(id INTEGER, status VARCHAR)")
+    a.execute(
+        "SELECT * FROM cdc_dml_consumer_create("
+        "'lake', 'orders_sink', table_names := ['orders'], start_at := 'now'"
+        ")"
     )
 
-
-def run_demo_flow(conn: duckdb.DuckDBPyConnection, backend: str) -> None:
-    consumer = f"matrix_demo_{backend}"
-    require_ok(conn, "CREATE TABLE lake.orders(id INTEGER, amount INTEGER)")
-    require_ok(
-        conn,
-        f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)}, {catalog_all_subscription_arg()})",
+    a.execute("INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid')")
+    start_snapshot, end_snapshot, has_changes, _, schema_pending = one(
+        a,
+        "SELECT start_snapshot, end_snapshot, has_changes, schema_version, schema_changes_pending "
+        "FROM cdc_window('lake', 'orders_sink')",
     )
-    require_ok(conn, "INSERT INTO lake.orders VALUES (1, 100), (2, 200)")
+    if not has_changes:
+        raise AssertionError("expected the initial DML window to have changes")
+    if schema_pending:
+        raise AssertionError("initial DML window should not report a schema boundary")
 
-    window = require_rows(conn, f"SELECT end_snapshot, has_changes FROM cdc_window('lake', {quote_string(consumer)})")
-    if len(window) != 1 or window[0][1] is not True:
-        raise RuntimeError(f"{backend}: expected first window with DML changes, got {window!r}")
+    require_error(b, "SELECT * FROM cdc_window('lake', 'orders_sink')", "CDC_BUSY")
 
-    inserted = scalar(
-        conn,
-        "SELECT count(*) FROM cdc_changes('lake', "
-        + quote_string(consumer)
-        + ", 'orders') WHERE change_type = 'insert'",
+    dml_rows = all_rows(
+        a,
+        "SELECT change_type, values "
+        "FROM cdc_dml_changes_read("
+        "'lake', 'orders_sink', "
+        f"start_snapshot := {start_snapshot}, end_snapshot := {end_snapshot}"
+        ") "
+        "ORDER BY snapshot_id, rowid",
     )
-    if inserted != 2:
-        raise RuntimeError(f"{backend}: expected two inserted rows before schema change, got {inserted}")
-    require_ok(conn, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer)}, {window[0][0]})")
+    if len(dml_rows) != 2 or {row[0] for row in dml_rows} != {"insert"}:
+        raise AssertionError(f"expected two insert rows from initial DML window, got {dml_rows!r}")
+    if not all('"status"' in row[1] for row in dml_rows):
+        raise AssertionError(f"expected generic DML JSON payloads to contain status, got {dml_rows!r}")
 
-    require_ok(conn, "ALTER TABLE lake.orders ADD COLUMN region VARCHAR DEFAULT 'UNKNOWN'")
-    require_ok(conn, "INSERT INTO lake.orders VALUES (3, 300, 'EU')")
+    a.execute(f"SELECT * FROM cdc_commit('lake', 'orders_sink', {end_snapshot})")
 
-    ddl_events = require_rows(
-        conn,
-        "SELECT event_kind, object_kind FROM cdc_ddl('lake', "
-        + quote_string(consumer)
-        + ") WHERE event_kind = 'altered' AND object_kind = 'table'",
+
+def run_schema_boundary_flow(a: duckdb.DuckDBPyConnection) -> None:
+    a.execute(
+        "SELECT * FROM cdc_ddl_consumer_create(" "'lake', 'schema_watch', schemas := ['main'], start_at := 'now'" ")"
     )
-    if ddl_events != [("altered", "table")]:
-        raise RuntimeError(f"{backend}: expected one altered.table event, got {ddl_events!r}")
+    a.execute("ALTER TABLE lake.orders ADD COLUMN note VARCHAR")
+    a.execute("INSERT INTO lake.orders VALUES (3, 'shipped', 'schema-boundary')")
 
-    new_rows = scalar(
-        conn,
-        "SELECT count(*) FROM cdc_changes('lake', "
-        + quote_string(consumer)
-        + ", 'orders') WHERE change_type = 'insert' AND id = 3 AND region = 'EU'",
+    ddl_rows = all_rows(
+        a,
+        "SELECT event_kind, object_kind, object_name "
+        "FROM cdc_ddl_changes_read('lake', 'schema_watch', auto_commit := true)",
     )
-    if new_rows != 1:
-        raise RuntimeError(f"{backend}: expected the post-DDL insert under the new schema, got {new_rows}")
+    if ("altered", "table", "orders") not in ddl_rows:
+        raise AssertionError(f"expected ALTER TABLE event for orders, got {ddl_rows!r}")
 
-    end_snapshot = scalar(conn, f"SELECT end_snapshot FROM cdc_window('lake', {quote_string(consumer)})")
-    require_ok(conn, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer)}, {end_snapshot})")
-
-    # CDC state writes live in the metadata catalog now, so the final commit
-    # should leave the consumer caught up to the DuckLake snapshot head.
-    stats = require_rows(
-        conn,
-        "SELECT consumer_name, lag_snapshots, lease_alive FROM cdc_consumer_stats('lake', consumer := "
-        + quote_string(consumer)
-        + ")",
+    start_snapshot, end_snapshot, has_changes, _, schema_pending = one(
+        a,
+        "SELECT start_snapshot, end_snapshot, has_changes, schema_version, schema_changes_pending "
+        "FROM cdc_window('lake', 'orders_sink')",
     )
-    if len(stats) != 1 or stats[0][0] != consumer or stats[0][1] != 0 or stats[0][2] is not True:
-        raise RuntimeError(f"{backend}: unexpected cdc_consumer_stats row: {stats!r}")
+    if not has_changes:
+        raise AssertionError("expected post-DDL DML window to have changes")
+    if not schema_pending:
+        raise AssertionError("expected post-DDL DML window to report schema_changes_pending")
+
+    typed_rows = all_rows(
+        a,
+        "SELECT change_type, id, status, note "
+        "FROM cdc_dml_table_changes_read("
+        "'lake', 'orders_sink', "
+        "table_name := 'orders', "
+        f"start_snapshot := {start_snapshot}, end_snapshot := {end_snapshot}"
+        ") "
+        "WHERE change_type = 'insert' "
+        "ORDER BY snapshot_id, rowid",
+    )
+    if ("insert", 3, "shipped", "schema-boundary") not in typed_rows:
+        raise AssertionError(f"expected typed post-DDL insert row with the new note column, got {typed_rows!r}")
+
+    a.execute(f"SELECT * FROM cdc_commit('lake', 'orders_sink', {end_snapshot})")
 
 
-def run_lease_flow(config: BackendConfig, cdc_extension: Path) -> None:
-    """Single-reader lease enforcement: a second concurrent reader against the
-    same consumer must be rejected with `CDC_BUSY`, and a `force_release`
-    invalidates the holder's owner-token so the holder's subsequent commit
-    fails (also `CDC_BUSY`).
-
-    The two readers run as two cursors on the same DuckDB instance because
-    DuckDB enforces single-attach for the underlying catalog file (DuckDB and
-    SQLite backends are local files; Postgres is multi-client at the catalog
-    layer but we still share one DuckDB host process). Cursors share the
-    ATTACH and the loaded extensions but each call generates its own
-    owner-token, so the lease state in `__ducklake_cdc_consumers` is what
-    actually arbitrates.
-    """
-    consumer = f"matrix_lease_{config.name}"
-    with connected(config, cdc_extension) as conn:
-        a = conn.cursor()
-        b = conn.cursor()
-        require_ok(a, "CREATE TABLE lake.lease_probe(id INTEGER)")
-        require_ok(
-            a,
-            f"SELECT * FROM cdc_consumer_create('lake', {quote_string(consumer)}, {catalog_all_subscription_arg()})",
-        )
-        require_ok(a, "INSERT INTO lake.lease_probe VALUES (1)")
-        end_snapshot = scalar(a, f"SELECT end_snapshot FROM cdc_window('lake', {quote_string(consumer)})")
-        require_error(b, f"SELECT * FROM cdc_window('lake', {quote_string(consumer)})", "CDC_BUSY")
-        require_ok(b, f"SELECT * FROM cdc_consumer_force_release('lake', {quote_string(consumer)})")
-        require_error(a, f"SELECT * FROM cdc_commit('lake', {quote_string(consumer)}, {end_snapshot})", "CDC_BUSY")
+def run_backend(name: str, postgres_dsn: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"dlcdc_catalog_{name}_") as tmp:
+        backend = BACKENDS[name](Path(tmp), postgres_dsn)
+        with attached_pair(backend) as (a, b):
+            run_consumer_flow(a, b)
+            run_schema_boundary_flow(a)
+    print(f"catalog_matrix_smoke[{name}] PASSED")
 
 
-def run_backend(name: str, cdc_extension: Path, pg_dsn: str) -> None:
-    # Each phase gets its own catalog dir + (for Postgres) its own clean
-    # `public` schema so the demo and lease flows don't share consumer state.
-    with tempfile.TemporaryDirectory(prefix=f"ducklake_cdc_{name}_demo_") as tmp:
-        config = backend_config(name, Path(tmp), pg_dsn)
-        print(f"[{name}] demo flow", flush=True)
-        with connected(config, cdc_extension) as conn:
-            run_update_returning_probe(conn, name)
-            run_demo_flow(conn, name)
-    with tempfile.TemporaryDirectory(prefix=f"ducklake_cdc_{name}_lease_") as tmp:
-        config = backend_config(name, Path(tmp), pg_dsn)
-        print(f"[{name}] lease flow", flush=True)
-        run_lease_flow(config, cdc_extension)
-    print(f"[{name}] ok", flush=True)
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cdc-extension", type=Path, default=DEFAULT_CDC_EXTENSION)
-    parser.add_argument("--backends", nargs="+", choices=ALL_BACKENDS, default=list(DEFAULT_BACKENDS))
-    parser.add_argument("--postgres-dsn", default=os.environ.get("DLCDC_CATALOG_PG_DSN", DEFAULT_PG_DSN))
-    return parser.parse_args()
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        choices=sorted(BACKENDS),
+        default=["duckdb", "sqlite"],
+        help="Catalog backends to exercise. Defaults to local embedded backends.",
+    )
+    parser.add_argument(
+        "--postgres-dsn",
+        default=os.environ.get("DLCDC_CATALOG_PG_DSN", DEFAULT_POSTGRES_DSN),
+        help="Postgres DSN for the postgres backend.",
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
-    cdc_extension = args.cdc_extension.resolve()
-    if not cdc_extension.exists():
-        raise FileNotFoundError(f"missing ducklake_cdc extension artifact: {cdc_extension}; run `make debug` first")
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if not CDC_EXTENSION.exists():
+        print(
+            f"missing ducklake_cdc artifact at {CDC_EXTENSION}; run `make {BUILD}` first",
+            file=sys.stderr,
+        )
+        return 1
+
     for backend in args.backends:
-        run_backend(backend, cdc_extension, args.postgres_dsn)
-    print("catalog_matrix_smoke PASSED", flush=True)
+        run_backend(backend, args.postgres_dsn)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

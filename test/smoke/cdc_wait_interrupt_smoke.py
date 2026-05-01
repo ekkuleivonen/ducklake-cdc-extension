@@ -1,6 +1,6 @@
-"""Smoke test for cdc_wait interrupt handling.
+"""Smoke test for cdc_dml_ticks_listen interrupt handling.
 
-`cdc_wait` blocks for up to `timeout_ms` (capped at 5 minutes). The
+`cdc_dml_ticks_listen` blocks for up to `timeout_ms` (capped at 5 minutes). The
 honest exit gate for Phase 1 is that DuckDB's interrupt mechanism
 returns control to the caller in well under a second — the polling
 backoff is bounded at 10s but the interrupt check sits at the top of
@@ -10,7 +10,7 @@ long-poll without restarting the process.
 
 This script compiles a tiny C++ harness that:
 
-1. starts `cdc_wait('lake', 'iw_consumer', timeout_ms => 60000)` on
+1. starts `cdc_dml_ticks_listen('lake', 'iw_consumer', timeout_ms => 60000)` on
    connection A in a worker thread;
 2. lets the wait spin for ~200ms so we are demonstrably mid-poll;
 3. calls `a.Interrupt()` from the main thread;
@@ -88,7 +88,7 @@ HARNESS = r"""
 using namespace duckdb;
 
 // Conservative ceiling: the interrupt check sits at the top of each
-// poll iteration and the backoff doubles from 100ms to a 10s cap. A
+// poll iteration and the backoff doubles from 50ms to a 10s cap. A
 // 3000ms deadline catches even a worst-case "interrupt landed mid
 // 1.6s sleep" run while still failing fast on a real regression.
 static constexpr int64_t WAIT_DEADLINE_MS = 3000;
@@ -119,12 +119,6 @@ std::string QuotePath(const std::string &path) {
 	return result;
 }
 
-std::string CatalogAllSubscription() {
-	return "subscriptions := [struct_pack(scope_kind := 'catalog', schema_name := NULL::VARCHAR, "
-	       "table_name := NULL::VARCHAR, schema_id := NULL::BIGINT, table_id := NULL::BIGINT, "
-	       "event_category := '*', change_type := '*')]";
-}
-
 int main(int argc, char **argv) {
 	if (argc != 5) {
 		std::cerr << "usage: harness <ducklake-extension> <cdc-extension> <lake-path> <data-path>\n";
@@ -149,7 +143,7 @@ int main(int argc, char **argv) {
 
 	RequireOk(a, "CREATE TABLE lake.iw(id INTEGER)");
 	RequireOk(a, "INSERT INTO lake.iw VALUES (1)");
-	RequireOk(a, "SELECT * FROM cdc_consumer_create('lake', 'iw_consumer', " + CatalogAllSubscription() + ")");
+	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'iw_consumer', table_names := ['iw'])");
 
 	std::atomic<bool> wait_started{false};
 	std::atomic<bool> wait_completed{false};
@@ -160,7 +154,7 @@ int main(int argc, char **argv) {
 	std::thread waiter([&]() {
 		wait_start = std::chrono::steady_clock::now();
 		wait_started.store(true, std::memory_order_release);
-		auto result = a.Query("SELECT * FROM cdc_wait('lake', 'iw_consumer', timeout_ms => 60000)");
+		auto result = a.Query("SELECT * FROM cdc_dml_ticks_listen('lake', 'iw_consumer', timeout_ms => 60000)");
 		wait_end = std::chrono::steady_clock::now();
 		if (result && result->HasError()) {
 			wait_error = result->GetError();
@@ -179,7 +173,7 @@ int main(int argc, char **argv) {
 	while (!wait_completed.load(std::memory_order_acquire)) {
 		const auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - interrupt_at).count() > WAIT_DEADLINE_MS) {
-			std::cerr << "cdc_wait did not return within " << WAIT_DEADLINE_MS << "ms after Interrupt()" << "\n";
+			std::cerr << "cdc_dml_ticks_listen did not return within " << WAIT_DEADLINE_MS << "ms after Interrupt()" << "\n";
 			a.Interrupt();
 			waiter.detach();
 			return 1;
@@ -191,14 +185,14 @@ int main(int argc, char **argv) {
 	const auto elapsed_ms =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(wait_end - interrupt_at).count();
 	if (wait_error.empty()) {
-		std::cerr << "expected cdc_wait to surface an interrupt error; got success after " << elapsed_ms
+		std::cerr << "expected cdc_dml_ticks_listen to surface an interrupt error; got success after " << elapsed_ms
 		          << "ms\n";
 		return 1;
 	}
 	if (wait_error.find("INTERRUPT") == std::string::npos &&
 	    wait_error.find("Interrupted") == std::string::npos &&
 	    wait_error.find("interrupted") == std::string::npos) {
-		std::cerr << "expected interrupt-shaped error from cdc_wait; got: " << wait_error << "\n";
+		std::cerr << "expected interrupt-shaped error from cdc_dml_ticks_listen; got: " << wait_error << "\n";
 		return 1;
 	}
 

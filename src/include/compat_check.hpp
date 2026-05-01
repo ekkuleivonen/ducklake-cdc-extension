@@ -7,13 +7,12 @@
 //
 // Background: every DuckLake catalog stores a format version string in its
 // metadata table at `__ducklake_metadata_<lake>.ducklake_metadata WHERE
-// key='version'`. The DuckLake commit validated with DuckDB v1.5.1 stamps
-// `'0.4'` there. This extension's SQL against `ducklake_*` and
-// `__ducklake_metadata_*` is only known to be well-formed on the catalog
-// versions explicitly listed in
-// `docs/compatibility.md`. Loading the extension against an untested
-// catalog format and then watching it fail with a cryptic
-// `column 'foo' does not exist` 30 minutes later is the worst possible UX.
+// key='version'`. The DuckLake extension binaries validated with DuckDB v1.5.x
+// stamp either `'0.4'` or `'1.0'` there. This extension's SQL against
+// `ducklake_*` and `__ducklake_metadata_*` is only known to be well-formed on
+// the catalog versions explicitly listed in `docs/development.md`. Loading the
+// extension against an untested catalog format and then watching it fail with a
+// cryptic `column 'foo' does not exist` 30 minutes later is the worst possible UX.
 //
 // This module:
 //
@@ -22,7 +21,7 @@
 //    (`SUPPORTED_DUCKLAKE_CATALOG_VERSIONS`).
 // 3. Emits a structured `CDC_INCOMPATIBLE_CATALOG` notice (one per
 //    incompatible catalog) so the operator hits the matrix in
-//    `docs/compatibility.md` immediately on `LOAD ducklake_cdc;`,
+//    `docs/development.md` immediately on `LOAD ducklake_cdc;`,
 //    not after the first cdc_* call against the catalog.
 //
 // The probe is intentionally **best-effort** at LOAD time: catalogs may be
@@ -62,7 +61,7 @@ struct CompatStatus {
 //!
 //! Narrow on purpose: an unrecognised version is louder than a wrong
 //! version. Add a string here when (and only when) a release is tested
-//! against that catalog format and the matrix in `docs/compatibility.md`
+//! against that catalog format and the matrix in `docs/development.md`
 //! is bumped in the same PR. See ADR 0001-style discipline notes in the
 //! plan that birthed this guard for why we don't open this to a regex.
 extern const std::vector<std::string> SUPPORTED_DUCKLAKE_CATALOG_VERSIONS;

@@ -1,24 +1,29 @@
 # Performance, honestly
 
-`ducklake-cdc` is designed for **~100–10k events/sec per consumer** with
-**sub-second to seconds latency**, against a Postgres catalog that
-comfortably serves **~50 consumers** without connection pooling
-(~500 with PgBouncer). Idle consumers are cheap by design — `cdc_wait`
-backs off from 100ms to a 10s cap and resets on activity, so 50 idle
-consumers are 5 catalog queries / sec total.
+`ducklake-cdc` is designed for durable, low-friction CDC over DuckLake
+snapshots, not for OLTP-log firehose rates. The current single-table Python demo
+shows sub-second fresh-row latency with a few concurrent producers; multi-table
+and multi-consumer numbers are still being established.
+
+Idle consumers should be cheap by design: listen functions should combine a
+level check ("is there already work?") with a notification/wait path rather than
+busy-polling.
 
 ## What we measure (and what we don't)
 
 The project tracks four measurement categories:
 
-- **End-to-end latency** (`p50`, `p95`, `p99`, `max`, `mean`) — time
-  from a producer-side INSERT landing as a snapshot to the consumer's
-  `cdc_commit` for that snapshot id. Computed via a monotonic-time
-  ledger so cross-process clock skew is irrelevant.
-- **Events / sec** — total rows surfaced via `cdc_changes` divided by
-  the run duration.
-- **Catalog QPS** — every `cdc_window` / `cdc_changes` / `cdc_commit`
-  call counts as one round-trip from the consumer's perspective.
+- **Fresh latency** (`p50`, `p95`, `p99`, `max`, `mean`) — time from a
+  producer-side insert/update-postimage timestamp to consumer observation.
+  Preimages and deletes are tracked separately because they intentionally carry
+  older row-version timestamps.
+- **Producer-to-snapshot latency** — producer transaction / visibility cost.
+- **Snapshot-to-consumer latency** — the consumer/extension-owned part of the
+  pipeline.
+- **Events / sec** — total rows delivered by the consumer divided by run
+  duration.
+- **Catalog QPS** — every stateful read/listen/commit call counts as one
+  round-trip from the consumer's perspective.
 - **Lag drift** — `producer.snapshots_produced - consumer.commits`,
   sampled per consumer iteration. Producer-truth because
   `cdc_consumer_stats.lag_snapshots` over-counts internal
@@ -44,10 +49,10 @@ meaningful.
 
 We are a **poor fit** for:
 
-- **Sub-10ms latency.** The polling backoff bottoms out at 100ms; the
-  ratchet up means a typical `cdc_wait` returns within 100–300ms of
-  the producer commit, not microseconds. If you need sub-10ms,
-  Debezium against your OLTP database is the right tool.
+- **Sub-10ms latency.** Even with notification-based listen functions, latency
+  is bounded by DuckLake snapshot creation, query planning, row materialization,
+  and consumer commit/checkpoint work. If you need sub-10ms OLTP invalidation,
+  Debezium against your source database is the right tool.
 - **OLTP CDC.** We read DuckLake snapshots; we do not tap a write-ahead
   log. Latency is bounded below by snapshot frequency.
 - **Globally-distributed sub-second cache invalidation.** The lease
@@ -56,12 +61,29 @@ We are a **poor fit** for:
   reverse ETL but not for cache invalidation in the critical path of a
   user request.
 
+## Python Client-Loop Baseline
+
+The Python demo summary separates responsibility:
+
+- `latency_fresh_ms_*` is the headline latency for fresh insert and
+  update-postimage events.
+- `producer_to_snapshot_ms_*` belongs mostly to producer/catalog contention.
+- `snapshot_to_consumer_ms_*` is the consumer/extension-owned slice.
+- `latency_stale_rows_ms_*` covers update preimages and deletes, where the row
+  timestamp represents the previous row version rather than the current action.
+
+Recent local runs show the single-table path is no longer dominated by the old
+duplicate window resolution. The next performance questions are multi-table
+single-consumer fan-out and multi-consumer catalog pressure. The target API
+captures those as generic consumer-level DML reads/listens plus typed
+single-table reads for application processing.
+
 ## The four axes
 
 Performance discussions on this project always frame against four axes:
 
 1. **Throughput** (events/sec).
-2. **Latency** (snapshot landing → consumer commit).
+2. **Latency** (fresh producer event → snapshot → consumer observation/commit).
 3. **Catalog load** (QPS, connection count).
 4. **Footprint** (consumer process CPU / RSS, lag drift).
 
