@@ -1,6 +1,7 @@
 """Python client helpers for the ducklake-cdc DuckDB extension."""
 
 from ducklake_cdc._version import __version__
+from ducklake_cdc.client import CDCClient
 from ducklake_cdc.enums import (
     ChangeType,
     DdlEventKind,
@@ -33,6 +34,7 @@ from ducklake_cdc.models import (
 
 __all__ = [
     "AuditEntry",
+    "CDCClient",
     "CDCModel",
     "ChangeRow",
     "ChangeType",

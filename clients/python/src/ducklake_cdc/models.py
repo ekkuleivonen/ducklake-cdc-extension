@@ -59,6 +59,7 @@ class ConsumerSubscription(CDCModel):
 
     consumer_name: str
     consumer_id: int
+    last_committed_snapshot: int | None = None
     subscription_id: int
     scope_kind: ScopeKind
     schema_id: int | None = None
