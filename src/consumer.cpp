@@ -1187,7 +1187,6 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 
 std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
@@ -1278,7 +1277,6 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerHeartbeatBind(duckdb::ClientCon
 
 std::vector<duckdb::Value> HeartbeatConsumer(duckdb::ClientContext &context, const ConsumerHeartbeatData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
@@ -1358,7 +1356,6 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &cont
 
 std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const CdcWaitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	if (data.timeout_ms < 0) {
 		throw duckdb::InvalidInputException("cdc_wait timeout_ms must be >= 0");
 	}
@@ -1741,7 +1738,6 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 
 std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	if (data.max_snapshots > HARD_MAX_SNAPSHOTS) {
 		ThrowMaxSnapshotsExceeded(data.max_snapshots);
 	}

@@ -353,7 +353,6 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBind(duckdb::ClientContext &c
 	result->max_snapshots = MaxSnapshotsParameter(input);
 
 	CheckCatalogOrThrow(context, result->catalog_name);
-	BootstrapConsumerStateOrThrow(context, result->catalog_name);
 
 	// Probe the underlying `<lake>.table_changes(...)` schema with a `LIMIT 0`
 	// query so the planner sees the table's actual columns. `table_changes`
