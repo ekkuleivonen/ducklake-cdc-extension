@@ -1,5 +1,61 @@
 """Python client helpers for the ducklake-cdc DuckDB extension."""
 
 from ducklake_cdc._version import __version__
+from ducklake_cdc.enums import (
+    ChangeType,
+    DdlEventKind,
+    DdlObjectKind,
+    DiagnosticSeverity,
+    EventCategory,
+    ScopeKind,
+    SubscriptionStatus,
+)
+from ducklake_cdc.models import (
+    AuditEntry,
+    CDCModel,
+    ChangeRow,
+    ConsumerCommit,
+    ConsumerDrop,
+    ConsumerForceRelease,
+    ConsumerHeartbeat,
+    ConsumerListEntry,
+    ConsumerReset,
+    ConsumerStats,
+    ConsumerSubscription,
+    ConsumerWait,
+    ConsumerWindow,
+    DdlEvent,
+    DoctorDiagnostic,
+    SchemaDiff,
+    SnapshotEvent,
+    Subscription,
+)
 
-__all__ = ["__version__"]
+__all__ = [
+    "AuditEntry",
+    "CDCModel",
+    "ChangeRow",
+    "ChangeType",
+    "ConsumerCommit",
+    "ConsumerDrop",
+    "ConsumerForceRelease",
+    "ConsumerHeartbeat",
+    "ConsumerListEntry",
+    "ConsumerReset",
+    "ConsumerStats",
+    "ConsumerSubscription",
+    "ConsumerWait",
+    "ConsumerWindow",
+    "DdlEvent",
+    "DdlEventKind",
+    "DdlObjectKind",
+    "DiagnosticSeverity",
+    "DoctorDiagnostic",
+    "EventCategory",
+    "SchemaDiff",
+    "ScopeKind",
+    "SnapshotEvent",
+    "Subscription",
+    "SubscriptionStatus",
+    "__version__",
+]

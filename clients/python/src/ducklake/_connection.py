@@ -44,7 +44,11 @@ class ConnectionManager:
             import duckdb
 
             config = cast(DuckDBConfig | None, self.duckdb_config)
-            conn = duckdb.connect(self.database, config=config)
+            conn = (
+                duckdb.connect(self.database, config=config)
+                if config is not None
+                else duckdb.connect(self.database)
+            )
             for name, value in (self.duckdb_settings or {}).items():
                 conn.execute(_setting_sql(name, value))
             for extension in self._required_extensions():

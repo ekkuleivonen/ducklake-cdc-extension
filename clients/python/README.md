@@ -28,6 +28,19 @@ the DuckDB connection and attaches DuckLake on the first query. Use
 `duckdb_settings` mirrors DuckDB runtime settings directly. Each entry is applied
 as `SET name = value` before DuckLake is attached.
 
+## Playground
+
+Run the zero-infra local playground from this directory:
+
+```bash
+uv run python playground/01_local_ducklake.py
+```
+
+The script creates a local DuckLake catalog under `playground/.work/`, seeds a
+small `events` table, and exercises the client API with `lake.sql(...)`,
+`lake.tables()`, `lake.table("events").schema()`, `.head()`, `.row_count()`,
+and `lake.snapshots()`.
+
 ## Development
 
 ```bash
