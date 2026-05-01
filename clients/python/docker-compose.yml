@@ -2,7 +2,6 @@
 #
 # Usage:
 #   docker compose up -d --wait
-#   export DUCKLAKE_DEMO_CATALOG='postgresql://ducklake:ducklake@localhost:5435/ducklake'
 #   uv run python demo/consumer.py --analytics
 #   uv run python demo/producer.py --schemas 3 --tables 5 --inserts 100
 #   docker compose down -v

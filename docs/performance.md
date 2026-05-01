@@ -56,6 +56,27 @@ We are a **poor fit** for:
   reverse ETL but not for cache invalidation in the critical path of a
   user request.
 
+## Python client-loop baseline
+
+The Python demo consumer now has two output modes: normal JSON lines and
+`--output-mode none`, which drains the same CDC loop without per-row stdout.
+A clean local Postgres run on a 25-table workload showed stdout is not the
+primary bottleneck:
+
+- Small commits (`--schemas 5 --tables 5 --inserts 100`): stdout p95
+  latency ~13.4s vs silent ~12.7s.
+- Larger commits (`--batch_min 100 --batch_max 100`): stdout p95 latency
+  ~9.6s vs silent ~10.1s.
+- Both modes still scanned 25 tables per non-empty window, with
+  `cdc_changes` p95 around 88-92ms per table call and
+  `cdc_window_processing` p95 around 2.1-2.4s.
+
+The first extension/API optimization should therefore target fan-out, not
+stdout: resolve the consumer window/lease once for a logical batch and reuse
+that resolved window while reading each table's changes. A later
+all-subscribed-tables row API can reduce client calls further, but it needs a
+deliberate row-shape design for heterogeneous table schemas.
+
 ## The four axes
 
 Performance discussions on this project always frame against four axes:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import shutil
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -12,10 +11,11 @@ from typing import Any, Protocol
 
 from common import (
     CATALOG_ENV,
+    DEFAULT_POSTGRES_CATALOG,
     STORAGE_ENV,
-    WORK_DIR,
     is_database_locked,
     open_demo_lake,
+    reset_demo_state,
     retry_on_lock,
 )
 
@@ -64,6 +64,7 @@ class Args:
     batch_max: int
     reset: bool
     catalog: str | None
+    catalog_backend: str | None
     storage: str | None
 
 
@@ -72,10 +73,17 @@ def main() -> None:
     rng = random.Random(RANDOM_SEED)
 
     if args.reset:
-        shutil.rmtree(WORK_DIR, ignore_errors=True)
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
+        reset_demo_state(
+            catalog=args.catalog,
+            catalog_backend=args.catalog_backend,
+            storage=args.storage,
+        )
 
-    lake = open_demo_lake(catalog=args.catalog, storage=args.storage)
+    lake = open_demo_lake(
+        catalog=args.catalog,
+        catalog_backend=args.catalog_backend,
+        storage=args.storage,
+    )
     try:
         tables = create_layout(lake, args)
         actions = build_actions(args, tables, rng)
@@ -101,10 +109,22 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
     parser.add_argument("--profile", choices=("flat", "ramp", "variate"), default="flat")
     parser.add_argument("--batch_min", type=positive_int, default=1)
     parser.add_argument("--batch_max", type=positive_int, default=10)
-    parser.add_argument("--reset", action="store_true", help="reset demo/.work before producing")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="reset the demo catalog and local storage before producing",
+    )
     parser.add_argument(
         "--catalog",
-        help=f"DuckLake catalog URL; defaults to ${CATALOG_ENV} or local SQLite",
+        help=(
+            f"DuckLake catalog URL; defaults to ${CATALOG_ENV} or "
+            f"{DEFAULT_POSTGRES_CATALOG}"
+        ),
+    )
+    parser.add_argument(
+        "--catalog-backend",
+        choices=("postgres", "sqlite"),
+        help="demo catalog backend when --catalog and $DUCKLAKE_DEMO_CATALOG are unset",
     )
     parser.add_argument(
         "--storage",
@@ -125,6 +145,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         batch_max=namespace.batch_max,
         reset=namespace.reset,
         catalog=namespace.catalog,
+        catalog_backend=namespace.catalog_backend,
         storage=namespace.storage,
     )
 

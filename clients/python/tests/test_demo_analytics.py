@@ -39,10 +39,11 @@ def test_demo_stats_summary_is_json_ready() -> None:
     stats.record_wait(has_snapshot=False)
     stats.record_window(has_changes=True)
     stats.record_window(has_changes=False)
-    stats.record_changes(2)
+    stats.record_ddl(1)
+    stats.record_events(2)
+    stats.record_tables(2)
+    stats.record_changes(2, table_name="main.orders")
     stats.record_commit()
-    stats.ddl_events += 1
-    stats.snapshot_events += 2
     stats.record_latency(1_000_000_000, consumed_ns=1_250_000_000)
     stats.record_latency(None, consumed_ns=1_250_000_000)
     stats.finished_ns = 2_000_000_000
@@ -52,13 +53,21 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["actual_duration_seconds"] == 2.0
     assert summary["consumed_changes"] == 2
     assert summary["consumed_changes_per_second"] == 1.0
-    assert summary["catalog_queries_estimated"] == 4
-    assert summary["catalog_qps_avg"] == 2.0
+    assert summary["catalog_queries_estimated"] == 9
+    assert summary["catalog_qps_avg"] == 4.5
     assert summary["empty_window_ratio"] == 0.5
     assert summary["cdc_wait_calls"] == 2
     assert summary["cdc_wait_timeouts"] == 1
+    assert summary["cdc_ddl_calls"] == 1
+    assert summary["cdc_events_calls"] == 1
+    assert summary["lake_tables_calls"] == 1
+    assert summary["cdc_changes_calls"] == 1
+    assert summary["cdc_commit_calls"] == 1
     assert summary["ddl_events"] == 1
     assert summary["snapshot_events"] == 2
+    assert summary["table_count_per_window"]["p95"] == 2.0
+    assert summary["rows_per_table_call"]["p95"] == 2.0
+    assert summary["changes_by_table"] == {"main.orders": 2}
     assert summary["latency_observations"] == 1
     assert summary["latency_missing_produced_ns"] == 1
     assert summary["end_to_end_latency_ms"] == {

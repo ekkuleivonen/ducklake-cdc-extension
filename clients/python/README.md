@@ -48,28 +48,28 @@ catalog-wide CDC subscription, and streams DDL, snapshot events, row-level DML,
 and commits as JSON lines on stdout. Run it first, then run `producer.py` in
 another terminal.
 
-By default the demo uses a SQLite-backed DuckLake metadata catalog plus local
-data files under `demo/.work/`, so it stays zero-setup for local development.
-For a topology closer to production, point both processes at the same Postgres
-catalog and shared storage using `--catalog`/`--storage` or the
-`DUCKLAKE_DEMO_CATALOG` and `DUCKLAKE_DEMO_STORAGE` environment variables.
-This project includes a demo Postgres catalog on `localhost:5435`:
+By default the demo uses the included Postgres-backed DuckLake metadata catalog
+on `localhost:5435` plus local data files under `demo/.work/`. Start the demo
+catalog first:
 
 ```bash
 docker compose up -d --wait
-export DUCKLAKE_DEMO_CATALOG='postgresql://ducklake:ducklake@localhost:5435/ducklake'
 ```
 
-`producer.py` writes to the same local DuckLake catalog under `demo/.work/`.
-It generates schemas, tables, inserts, updates, and deletes over a requested
-duration. `--batch_min` and `--batch_max` control how many actions are grouped
-into each DuckLake transaction. Pass `--reset` when you want to clear the local
-demo state before a new run; do not use `--reset` while `consumer.py` is
-attached.
+Use `--catalog-backend sqlite` to opt into the local SQLite catalog. You can
+still override either process with `--catalog`/`--storage` or the
+`DUCKLAKE_DEMO_CATALOG` and `DUCKLAKE_DEMO_STORAGE` environment variables.
+
+`consumer.py` resets the demo catalog and removes local demo data files before
+it opens the CDC connections, so each demo run starts from a clean catalog and
+Parquet directory. `producer.py` generates schemas, tables, inserts, updates,
+and deletes over a requested duration. `--batch_min` and `--batch_max` control
+how many actions are grouped into each DuckLake transaction. `producer.py --reset`
+is still available for one-off producer-only runs, but do not use it while
+`consumer.py` is attached.
 
 ```bash
 uv run python demo/producer.py \
-  --reset \
   --schemas 2 \
   --tables 3 \
   --inserts 100 \
@@ -83,16 +83,13 @@ uv run python demo/producer.py \
 
 ```bash
 docker compose up -d --wait
-export DUCKLAKE_DEMO_CATALOG='postgresql://ducklake:ducklake@localhost:5435/ducklake'
 export DUCKLAKE_DEMO_STORAGE='s3://my-demo-bucket/ducklake-demo'
 uv run python demo/consumer.py --analytics
 uv run python demo/producer.py --schemas 2 --tables 3 --inserts 100
 ```
 
-Use `--reset` only for the local `demo/.work/` files. For a persistent Postgres
-catalog, reset by dropping/recreating the demo tables or the catalog database
-itself. To fully reset the local demo Postgres container and volume, run
-`docker compose down -v`.
+To fully reset the local demo Postgres container and volume outside the normal
+consumer startup reset, run `docker compose down -v`.
 
 For a benchmark-like exploratory run, collect aggregate analytics from the
 consumer while keeping the live event stream on stdout:

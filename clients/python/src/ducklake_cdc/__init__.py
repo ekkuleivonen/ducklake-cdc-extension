@@ -11,6 +11,12 @@ from ducklake_cdc.enums import (
     ScopeKind,
     SubscriptionStatus,
 )
+from ducklake_cdc.loop import (
+    ConsumerBatch,
+    ConsumerLoopStats,
+    TableChangeBatch,
+    iter_consumer_batches,
+)
 from ducklake_cdc.models import (
     AuditEntry,
     CDCModel,
@@ -42,7 +48,9 @@ __all__ = [
     "ConsumerDrop",
     "ConsumerForceRelease",
     "ConsumerHeartbeat",
+    "ConsumerBatch",
     "ConsumerListEntry",
+    "ConsumerLoopStats",
     "ConsumerReset",
     "ConsumerStats",
     "ConsumerSubscription",
@@ -59,5 +67,7 @@ __all__ = [
     "SnapshotEvent",
     "Subscription",
     "SubscriptionStatus",
+    "TableChangeBatch",
     "__version__",
+    "iter_consumer_batches",
 ]

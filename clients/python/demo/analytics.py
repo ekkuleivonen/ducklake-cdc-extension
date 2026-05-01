@@ -42,6 +42,9 @@ class DemoStats:
     cdc_window_calls: int = 0
     cdc_window_non_empty_calls: int = 0
     cdc_window_empty_calls: int = 0
+    cdc_ddl_calls: int = 0
+    cdc_events_calls: int = 0
+    lake_tables_calls: int = 0
     cdc_changes_calls: int = 0
     cdc_commit_calls: int = 0
     ddl_events: int = 0
@@ -49,6 +52,9 @@ class DemoStats:
     consumed_changes: int = 0
     latency_observations: int = 0
     latency_missing_produced_ns: int = 0
+    table_counts: list[int] = field(default_factory=list)
+    rows_per_table: list[int] = field(default_factory=list)
+    changes_by_table: dict[str, int] = field(default_factory=dict)
 
     def finish(self) -> None:
         if self.finished_ns is None:
@@ -69,9 +75,24 @@ class DemoStats:
         else:
             self.cdc_window_empty_calls += 1
 
-    def record_changes(self, count: int) -> None:
+    def record_ddl(self, count: int) -> None:
+        self.cdc_ddl_calls += 1
+        self.ddl_events += count
+
+    def record_events(self, count: int) -> None:
+        self.cdc_events_calls += 1
+        self.snapshot_events += count
+
+    def record_tables(self, count: int) -> None:
+        self.lake_tables_calls += 1
+        self.table_counts.append(count)
+
+    def record_changes(self, count: int, *, table_name: str | None = None) -> None:
         self.cdc_changes_calls += 1
         self.consumed_changes += count
+        self.rows_per_table.append(count)
+        if table_name is not None:
+            self.changes_by_table[table_name] = self.changes_by_table.get(table_name, 0) + count
 
     def record_commit(self) -> None:
         self.cdc_commit_calls += 1
@@ -90,9 +111,7 @@ class DemoStats:
     def summary(self) -> dict[str, Any]:
         end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
         actual_duration_seconds = max((end_ns - self.started_ns) / 1_000_000_000.0, 0.0)
-        catalog_queries_estimated = (
-            self.cdc_window_calls + self.cdc_changes_calls + self.cdc_commit_calls
-        )
+        catalog_queries_estimated = self.catalog_queries_estimated()
         return {
             "actual_duration_seconds": actual_duration_seconds,
             "consumed_changes": self.consumed_changes,
@@ -110,13 +129,34 @@ class DemoStats:
             "cdc_window_non_empty_calls": self.cdc_window_non_empty_calls,
             "cdc_window_empty_calls": self.cdc_window_empty_calls,
             "empty_window_ratio": divide(self.cdc_window_empty_calls, self.cdc_window_calls),
+            "cdc_ddl_calls": self.cdc_ddl_calls,
+            "cdc_events_calls": self.cdc_events_calls,
+            "lake_tables_calls": self.lake_tables_calls,
             "cdc_changes_calls": self.cdc_changes_calls,
             "cdc_commit_calls": self.cdc_commit_calls,
             "ddl_events": self.ddl_events,
             "snapshot_events": self.snapshot_events,
+            "table_count_per_window": metric_summary(
+                [float(count) for count in self.table_counts]
+            ).to_json(),
+            "rows_per_table_call": metric_summary(
+                [float(count) for count in self.rows_per_table]
+            ).to_json(),
+            "changes_by_table": dict(sorted(self.changes_by_table.items())),
             "latency_observations": self.latency_observations,
             "latency_missing_produced_ns": self.latency_missing_produced_ns,
         }
+
+    def catalog_queries_estimated(self) -> int:
+        return (
+            self.cdc_wait_calls
+            + self.cdc_window_calls
+            + self.cdc_ddl_calls
+            + self.cdc_events_calls
+            + self.lake_tables_calls
+            + self.cdc_changes_calls
+            + self.cdc_commit_calls
+        )
 
 
 def metric_summary(values: list[float]) -> MetricSummary:
@@ -165,6 +205,12 @@ def summary_table(summary: Mapping[str, Any]) -> str:
         ("catalog_qps", format_float(summary["catalog_qps_avg"])),
         ("cdc_wait_calls", str(summary["cdc_wait_calls"])),
         ("cdc_wait_timeouts", str(summary["cdc_wait_timeouts"])),
+        ("cdc_window_calls", str(summary["cdc_window_calls"])),
+        ("cdc_ddl_calls", str(summary["cdc_ddl_calls"])),
+        ("cdc_events_calls", str(summary["cdc_events_calls"])),
+        ("lake_tables_calls", str(summary["lake_tables_calls"])),
+        ("cdc_changes_calls", str(summary["cdc_changes_calls"])),
+        ("cdc_commit_calls", str(summary["cdc_commit_calls"])),
         ("empty_window_ratio", format_float(summary["empty_window_ratio"])),
         ("latency_observations", str(summary["latency_observations"])),
         ("latency_missing_produced_ns", str(summary["latency_missing_produced_ns"])),
@@ -178,6 +224,13 @@ def summary_table(summary: Mapping[str, Any]) -> str:
             ("latency_ms_max", format_float(latency["max"])),
         ]
     )
+
+    table_counts = summary["table_count_per_window"]
+    rows_per_table = summary["rows_per_table_call"]
+    if isinstance(table_counts, Mapping):
+        rows.append(("tables_per_window_p95", format_float(table_counts["p95"])))
+    if isinstance(rows_per_table, Mapping):
+        rows.append(("rows_per_table_call_p95", format_float(rows_per_table["p95"])))
 
     operation_ms = summary["operation_ms"]
     if isinstance(operation_ms, Mapping):
