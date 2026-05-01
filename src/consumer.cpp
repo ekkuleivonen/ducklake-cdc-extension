@@ -98,6 +98,54 @@ std::string TokenSqlOrNull(const std::string &token) {
 	return QuoteLiteral(token) + "::UUID";
 }
 
+ConsumerRow ConsumerRowFromResult(duckdb::MaterializedQueryResult &result, duckdb::idx_t row_index) {
+	ConsumerRow row;
+	row.consumer_name = result.GetValue(0, row_index).ToString();
+	row.consumer_id = result.GetValue(1, row_index).GetValue<int64_t>();
+	auto snapshot_value = result.GetValue(2, row_index);
+	row.last_committed_snapshot = snapshot_value.IsNull() ? -1 : snapshot_value.GetValue<int64_t>();
+	auto schema_value = result.GetValue(3, row_index);
+	row.last_committed_schema_version = schema_value.IsNull() ? -1 : schema_value.GetValue<int64_t>();
+	row.owner_token = result.GetValue(4, row_index);
+	row.owner_acquired_at = result.GetValue(5, row_index);
+	row.owner_heartbeat_at = result.GetValue(6, row_index);
+	row.lease_interval_seconds = result.GetValue(7, row_index).GetValue<int64_t>();
+	const auto stop_value = result.GetValue(8, row_index);
+	row.stop_at_schema_change = stop_value.IsNull() ? true : stop_value.GetValue<bool>();
+	return row;
+}
+
+std::string ConsumerRowProjection() {
+	return "consumer_name, consumer_id, last_committed_snapshot, last_committed_schema_version, owner_token, "
+	       "owner_acquired_at, owner_heartbeat_at, lease_interval_seconds, stop_at_schema_change";
+}
+
+enum class StateBackendKind { DuckDB, SQLite, Postgres, Unknown };
+
+StateBackendKind DetectStateBackend(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto metadata_database = std::string("__ducklake_metadata_") + catalog_name;
+	auto result = conn.Query(
+	    "SELECT type FROM duckdb_databases() WHERE database_name = " + QuoteLiteral(metadata_database) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return StateBackendKind::Unknown;
+	}
+	const auto type = duckdb::StringUtil::Lower(result->GetValue(0, 0).ToString());
+	if (type == "duckdb") {
+		return StateBackendKind::DuckDB;
+	}
+	if (type == "sqlite") {
+		return StateBackendKind::SQLite;
+	}
+	if (type == "postgres" || type == "postgres_scanner") {
+		return StateBackendKind::Postgres;
+	}
+	return StateBackendKind::Unknown;
+}
+
+bool SupportsUpdateReturning(StateBackendKind backend) {
+	return backend == StateBackendKind::DuckDB;
+}
+
 std::string BuildBusyMessage(const std::string &catalog_name, const std::string &consumer_name,
                              const duckdb::Value &owner_token, const duckdb::Value &owner_acquired_at,
                              const duckdb::Value &owner_heartbeat_at, int64_t lease_interval_seconds,
@@ -956,6 +1004,192 @@ bool LeaseExpired(duckdb::Connection &conn, const ConsumerRow &row, int64_t mult
 	       result->GetValue(0, 0).GetValue<bool>();
 }
 
+ConsumerRow AcquireLeaseLegacy(duckdb::Connection &conn, const std::string &catalog_name,
+                               const std::string &consumer_name, const std::string &cached_token) {
+	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
+	const auto new_token = GenerateUuid(conn);
+	const auto cached_token_sql = TokenSqlOrNull(cached_token);
+	auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+	const bool expired = LeaseExpired(conn, row);
+	const bool owns_lease =
+	    !row.owner_token.IsNull() && !cached_token.empty() && row.owner_token.ToString() == cached_token;
+	if (!row.owner_token.IsNull() && !expired && !owns_lease) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+	const auto owner_token =
+	    row.owner_token.IsNull() || (expired && !owns_lease) ? new_token : row.owner_token.ToString();
+	if (expired && !owns_lease) {
+		const auto details = "{\"previous_token\":" + JsonValue(row.owner_token) +
+		                     ",\"previous_acquired_at\":" + JsonValue(row.owner_acquired_at) +
+		                     ",\"previous_heartbeat_at\":" + JsonValue(row.owner_heartbeat_at) +
+		                     ",\"lease_interval_seconds\":" + std::to_string(row.lease_interval_seconds) + "}";
+		InsertAuditRow(conn, catalog_name, "lease_force_acquire", consumer_name, row.consumer_id, details);
+	}
+	ExecuteChecked(conn, "UPDATE " + consumers + " SET owner_token = " + TokenSqlOrNull(owner_token) +
+	                         ", owner_acquired_at = CASE WHEN owner_token IS NULL OR epoch(now()) - "
+	                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds THEN "
+	                         "now() ELSE owner_acquired_at::TIMESTAMP WITH TIME ZONE "
+	                         "END, owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
+	                         QuoteLiteral(consumer_name) +
+	                         " AND (owner_token IS NULL OR epoch(now()) - "
+	                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds OR "
+	                         "owner_token = " +
+	                         cached_token_sql + ")");
+	row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+	if (row.owner_token.IsNull() || row.owner_token.ToString() != owner_token) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+	return row;
+}
+
+ConsumerRow AcquireLeaseReturning(duckdb::Connection &conn, const std::string &catalog_name,
+                                  const std::string &consumer_name, const std::string &cached_token) {
+	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
+	const auto cached_token_sql = TokenSqlOrNull(cached_token);
+	auto result =
+	    conn.Query("UPDATE " + consumers +
+	               " SET owner_token = CASE WHEN owner_token IS NULL THEN CAST(uuid() AS VARCHAR) "
+	               "ELSE CAST(owner_token AS VARCHAR) END, "
+	               "owner_acquired_at = CASE WHEN owner_token IS NULL OR epoch(now()) - "
+	               "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds THEN now() "
+	               "ELSE owner_acquired_at::TIMESTAMP WITH TIME ZONE END, owner_heartbeat_at = now(), updated_at = "
+	               "now() WHERE consumer_name = " +
+	               QuoteLiteral(consumer_name) + " AND (owner_token IS NULL OR owner_token = " + cached_token_sql +
+	               ") RETURNING " + ConsumerRowProjection());
+	ThrowIfQueryFailed(result);
+	if (result && result->RowCount() > 0) {
+		return ConsumerRowFromResult(*result, 0);
+	}
+
+	auto previous = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+	if (!LeaseExpired(conn, previous)) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+
+	const auto previous_token_sql =
+	    TokenSqlOrNull(previous.owner_token.IsNull() ? std::string() : previous.owner_token.ToString());
+	result =
+	    conn.Query("UPDATE " + consumers +
+	               " SET owner_token = CAST(uuid() AS VARCHAR), owner_acquired_at = now(), owner_heartbeat_at = now(), "
+	               "updated_at = now() WHERE consumer_name = " +
+	               QuoteLiteral(consumer_name) + " AND owner_token = " + previous_token_sql +
+	               " AND epoch(now()) - epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > "
+	               "lease_interval_seconds RETURNING " +
+	               ConsumerRowProjection());
+	ThrowIfQueryFailed(result);
+	if (!result || result->RowCount() == 0) {
+		ThrowBusy(conn, catalog_name, consumer_name);
+	}
+
+	auto acquired = ConsumerRowFromResult(*result, 0);
+	const auto details = "{\"previous_token\":" + JsonValue(previous.owner_token) +
+	                     ",\"previous_acquired_at\":" + JsonValue(previous.owner_acquired_at) +
+	                     ",\"previous_heartbeat_at\":" + JsonValue(previous.owner_heartbeat_at) +
+	                     ",\"lease_interval_seconds\":" + std::to_string(previous.lease_interval_seconds) + "}";
+	InsertAuditRow(conn, catalog_name, "lease_force_acquire", consumer_name, previous.consumer_id, details);
+	return acquired;
+}
+
+ConsumerRow AcquireLease(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name,
+                         const std::string &cached_token, StateBackendKind backend) {
+	if (SupportsUpdateReturning(backend)) {
+		return AcquireLeaseReturning(conn, catalog_name, consumer_name, cached_token);
+	}
+	return AcquireLeaseLegacy(conn, catalog_name, consumer_name, cached_token);
+}
+
+struct WindowResolution {
+	int64_t current_snapshot;
+	duckdb::Value oldest_snapshot;
+	bool last_snapshot_exists;
+	int64_t first_snapshot;
+	int64_t start_snapshot;
+	int64_t end_snapshot;
+	duckdb::Value last_schema_version;
+	duckdb::Value start_schema_version;
+	duckdb::Value end_schema_version;
+	bool start_is_schema_change = false;
+	int64_t next_schema_change = -1;
+	duckdb::Value next_schema_change_schema_version;
+};
+
+int64_t RequiredInt64(const duckdb::Value &value, const std::string &description) {
+	if (value.IsNull()) {
+		throw duckdb::InvalidInputException("Unable to resolve %s", description);
+	}
+	return value.GetValue<int64_t>();
+}
+
+WindowResolution ResolveWindowFast(duckdb::Connection &conn, const std::string &catalog_name, int64_t last_snapshot,
+                                   int64_t max_snapshots) {
+	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto changes_table = MetadataTable(catalog_name, "ducklake_snapshot_changes");
+	const auto last_snapshot_sql = std::to_string(last_snapshot);
+	const auto max_snapshots_sql = std::to_string(max_snapshots);
+	auto result =
+	    conn.Query("WITH snapshot_bounds AS ("
+	               "SELECT max(snapshot_id) AS current_snapshot, min(snapshot_id) AS oldest_snapshot, "
+	               "count(*) FILTER (WHERE snapshot_id = " +
+	               last_snapshot_sql + ") AS last_exists FROM " + snapshot_table +
+	               "), first_change AS ("
+	               "SELECT min(sc.snapshot_id) AS first_snapshot FROM " +
+	               changes_table + " sc, snapshot_bounds b WHERE sc.snapshot_id > " + last_snapshot_sql +
+	               " AND sc.snapshot_id <= b.current_snapshot), computed AS ("
+	               "SELECT b.current_snapshot, b.oldest_snapshot, b.last_exists > 0 AS last_snapshot_exists, "
+	               "COALESCE(f.first_snapshot, -1) AS first_snapshot, "
+	               "CASE WHEN f.first_snapshot IS NULL THEN " +
+	               last_snapshot_sql +
+	               " + 1 ELSE f.first_snapshot END AS start_snapshot, "
+	               "CASE WHEN f.first_snapshot IS NULL THEN " +
+	               last_snapshot_sql + " ELSE LEAST(b.current_snapshot, f.first_snapshot + " + max_snapshots_sql +
+	               " - 1) END AS end_snapshot FROM snapshot_bounds b CROSS JOIN first_change f)"
+	               " SELECT c.current_snapshot, c.oldest_snapshot, c.last_snapshot_exists, c.first_snapshot, "
+	               "c.start_snapshot, c.end_snapshot, last_s.schema_version AS last_schema_version, "
+	               "start_s.schema_version AS start_schema_version, end_s.schema_version AS end_schema_version, "
+	               "sc.snapshot_id AS change_snapshot, sc.changes_made, change_s.schema_version AS "
+	               "change_schema_version FROM computed c LEFT JOIN " +
+	               snapshot_table + " last_s ON last_s.snapshot_id = " + last_snapshot_sql + " LEFT JOIN " +
+	               snapshot_table + " start_s ON start_s.snapshot_id = c.start_snapshot LEFT JOIN " + snapshot_table +
+	               " end_s ON end_s.snapshot_id = c.end_snapshot LEFT JOIN " + changes_table +
+	               " sc ON sc.snapshot_id >= c.start_snapshot AND sc.snapshot_id <= c.current_snapshot LEFT JOIN " +
+	               snapshot_table + " change_s ON change_s.snapshot_id = sc.snapshot_id ORDER BY sc.snapshot_id ASC");
+	ThrowIfQueryFailed(result);
+	if (!result || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		throw duckdb::InvalidInputException("Unable to resolve current snapshot");
+	}
+
+	WindowResolution resolution;
+	resolution.current_snapshot = result->GetValue(0, 0).GetValue<int64_t>();
+	resolution.oldest_snapshot = result->GetValue(1, 0);
+	resolution.last_snapshot_exists = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
+	resolution.first_snapshot = result->GetValue(3, 0).GetValue<int64_t>();
+	resolution.start_snapshot = result->GetValue(4, 0).GetValue<int64_t>();
+	resolution.end_snapshot = result->GetValue(5, 0).GetValue<int64_t>();
+	resolution.last_schema_version = result->GetValue(6, 0);
+	resolution.start_schema_version = result->GetValue(7, 0);
+	resolution.end_schema_version = result->GetValue(8, 0);
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		const auto snapshot_value = result->GetValue(9, i);
+		const auto changes_value = result->GetValue(10, i);
+		if (snapshot_value.IsNull() || changes_value.IsNull()) {
+			continue;
+		}
+		const auto snapshot_id = snapshot_value.GetValue<int64_t>();
+		if (!SnapshotHasSchemaChange(changes_value.ToString())) {
+			continue;
+		}
+		if (snapshot_id == resolution.start_snapshot) {
+			resolution.start_is_schema_change = true;
+			continue;
+		}
+		if (resolution.next_schema_change == -1) {
+			resolution.next_schema_change = snapshot_id;
+			resolution.next_schema_change_schema_version = result->GetValue(11, i);
+		}
+	}
+	return resolution;
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcWindowInit(duckdb::ClientContext &context,
                                                                    duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
@@ -1027,12 +1261,29 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 
 std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	const auto backend = DetectStateBackend(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	try {
+		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
+		if (SupportsUpdateReturning(backend)) {
+			auto fast_commit = conn.Query(
+			    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
+			    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
+			    " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
+			    " LIMIT 1), owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
+			    QuoteLiteral(data.consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
+			    " AND last_committed_snapshot <= " + std::to_string(data.snapshot_id) + " AND EXISTS (SELECT 1 FROM " +
+			    snapshot_table + " WHERE snapshot_id = " + std::to_string(data.snapshot_id) +
+			    ") RETURNING consumer_name, last_committed_snapshot, last_committed_schema_version");
+			ThrowIfQueryFailed(fast_commit);
+			if (fast_commit && fast_commit->RowCount() > 0) {
+				return {fast_commit->GetValue(0, 0), fast_commit->GetValue(1, 0), fast_commit->GetValue(2, 0)};
+			}
+		}
+
 		auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 		if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
 			ThrowBusy(conn, data.catalog_name, data.consumer_name);
@@ -1103,7 +1354,6 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerHeartbeatBind(duckdb::ClientCon
 
 std::vector<duckdb::Value> HeartbeatConsumer(duckdb::ClientContext &context, const ConsumerHeartbeatData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
@@ -1183,7 +1433,6 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWaitBind(duckdb::ClientContext &cont
 
 std::vector<duckdb::Value> WaitForSnapshot(duckdb::ClientContext &context, const CdcWaitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	if (data.timeout_ms < 0) {
 		throw duckdb::InvalidInputException("cdc_wait timeout_ms must be >= 0");
 	}
@@ -1407,30 +1656,15 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerSubscriptionsInit(d
 ConsumerRow LoadConsumerOrThrow(duckdb::Connection &conn, const std::string &catalog_name,
                                 const std::string &consumer_name) {
 	const auto consumers = StateTable(conn, catalog_name, CONSUMERS_TABLE);
-	auto result = conn.Query("SELECT consumer_name, consumer_id, last_committed_snapshot, "
-	                         "last_committed_schema_version, owner_token, owner_acquired_at, owner_heartbeat_at, "
-	                         "lease_interval_seconds, stop_at_schema_change FROM " +
-	                         consumers + " WHERE consumer_name = " + QuoteLiteral(consumer_name) + " LIMIT 1");
+	auto result = conn.Query("SELECT " + ConsumerRowProjection() + " FROM " + consumers +
+	                         " WHERE consumer_name = " + QuoteLiteral(consumer_name) + " LIMIT 1");
 	if (!result || result->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, result ? result->GetError() : "consumer lookup failed");
 	}
 	if (result->RowCount() == 0) {
 		throw duckdb::InvalidInputException("consumer '%s' does not exist", consumer_name);
 	}
-	ConsumerRow row;
-	row.consumer_name = result->GetValue(0, 0).ToString();
-	row.consumer_id = result->GetValue(1, 0).GetValue<int64_t>();
-	auto snapshot_value = result->GetValue(2, 0);
-	row.last_committed_snapshot = snapshot_value.IsNull() ? -1 : snapshot_value.GetValue<int64_t>();
-	auto schema_value = result->GetValue(3, 0);
-	row.last_committed_schema_version = schema_value.IsNull() ? -1 : schema_value.GetValue<int64_t>();
-	row.owner_token = result->GetValue(4, 0);
-	row.owner_acquired_at = result->GetValue(5, 0);
-	row.owner_heartbeat_at = result->GetValue(6, 0);
-	row.lease_interval_seconds = result->GetValue(7, 0).GetValue<int64_t>();
-	const auto stop_value = result->GetValue(8, 0);
-	row.stop_at_schema_change = stop_value.IsNull() ? true : stop_value.GetValue<bool>();
-	return row;
+	return ConsumerRowFromResult(*result, 0);
 }
 
 std::string CurrentQualifiedTableName(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
@@ -1581,7 +1815,6 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 
 std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	if (data.max_snapshots > HARD_MAX_SNAPSHOTS) {
 		ThrowMaxSnapshotsExceeded(data.max_snapshots);
 	}
@@ -1590,79 +1823,54 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	}
 
 	duckdb::Connection conn(*context.db);
-	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
+	const auto backend = DetectStateBackend(conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
-	const auto new_token = GenerateUuid(conn);
-	const auto cached_token_sql = TokenSqlOrNull(cached_token);
 	try {
-		auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		const bool expired = LeaseExpired(conn, row);
-		const bool owns_lease =
-		    !row.owner_token.IsNull() && !cached_token.empty() && row.owner_token.ToString() == cached_token;
-		if (!row.owner_token.IsNull() && !expired && !owns_lease) {
-			ThrowBusy(conn, data.catalog_name, data.consumer_name);
-		}
-		const auto owner_token =
-		    row.owner_token.IsNull() || (expired && !owns_lease) ? new_token : row.owner_token.ToString();
-		if (expired && !owns_lease) {
-			const auto details = "{\"previous_token\":" + JsonValue(row.owner_token) +
-			                     ",\"previous_acquired_at\":" + JsonValue(row.owner_acquired_at) +
-			                     ",\"previous_heartbeat_at\":" + JsonValue(row.owner_heartbeat_at) +
-			                     ",\"lease_interval_seconds\":" + std::to_string(row.lease_interval_seconds) + "}";
-			InsertAuditRow(conn, data.catalog_name, "lease_force_acquire", data.consumer_name, row.consumer_id,
-			               details);
-		}
-		ExecuteChecked(conn, "UPDATE " + consumers + " SET owner_token = " + TokenSqlOrNull(owner_token) +
-		                         ", owner_acquired_at = CASE WHEN owner_token IS NULL OR epoch(now()) - "
-		                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds THEN "
-		                         "now() ELSE owner_acquired_at::TIMESTAMP WITH TIME ZONE "
-		                         "END, owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
-		                         QuoteLiteral(data.consumer_name) +
-		                         " AND (owner_token IS NULL OR epoch(now()) - "
-		                         "epoch(owner_heartbeat_at::TIMESTAMP WITH TIME ZONE) > lease_interval_seconds OR "
-		                         "owner_token = " +
-		                         cached_token_sql + ")");
-		row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		if (row.owner_token.IsNull() || row.owner_token.ToString() != owner_token) {
-			ThrowBusy(conn, data.catalog_name, data.consumer_name);
-		}
+		auto row = AcquireLease(conn, data.catalog_name, data.consumer_name, cached_token, backend);
 		const auto last_snapshot = row.last_committed_snapshot;
 		const auto stop_at_schema_change = row.stop_at_schema_change;
+		const auto owner_token = row.owner_token.ToString();
 		CacheToken(context, data.catalog_name, data.consumer_name, owner_token);
-		EnsureSnapshotExistsOrGap(conn, data.catalog_name, data.consumer_name, last_snapshot);
 
-		const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
-		const auto first_snapshot = FirstSnapshotAfter(conn, data.catalog_name, last_snapshot, current_snapshot);
-		const auto start_snapshot = first_snapshot == -1 ? last_snapshot + 1 : first_snapshot;
-		int64_t end_snapshot =
-		    first_snapshot == -1 ? last_snapshot : std::min(current_snapshot, start_snapshot + data.max_snapshots - 1);
+		const auto resolved = ResolveWindowFast(conn, data.catalog_name, last_snapshot, data.max_snapshots);
+		if (!resolved.last_snapshot_exists) {
+			const auto oldest_snapshot = RequiredInt64(resolved.oldest_snapshot, "oldest snapshot");
+			throw duckdb::InvalidInputException(
+			    "CDC_GAP: consumer '%s' is at snapshot %lld, but the oldest available snapshot is %lld. To recover "
+			    "and skip the gap: CALL cdc_consumer_reset('%s', '%s', to_snapshot => 'oldest_available'); To "
+			    "preserve all events, run consumers more frequently than your expire_older_than setting.",
+			    data.consumer_name, static_cast<long long>(last_snapshot), static_cast<long long>(oldest_snapshot),
+			    data.catalog_name, data.consumer_name);
+		}
+		const auto current_snapshot = resolved.current_snapshot;
+		const auto first_snapshot = resolved.first_snapshot;
+		const auto start_snapshot = resolved.start_snapshot;
+		int64_t end_snapshot = resolved.end_snapshot;
 		bool schema_changes_pending = false;
 		int64_t boundary_next_snapshot = -1;
-		int64_t boundary_next_schema_version = -1;
+		duckdb::Value boundary_next_schema_version;
 		auto schema_version = last_snapshot <= current_snapshot
-		                          ? ResolveSchemaVersion(conn, data.catalog_name, last_snapshot)
+		                          ? RequiredInt64(resolved.last_schema_version, "schema_version")
 		                          : row.last_committed_schema_version;
 		if (first_snapshot != -1 && start_snapshot <= current_snapshot) {
-			schema_version = ResolveSchemaVersion(conn, data.catalog_name, start_snapshot);
-			const auto base_schema_version = ResolveSchemaVersion(conn, data.catalog_name, last_snapshot);
+			schema_version = RequiredInt64(resolved.start_schema_version, "schema_version");
 			// `start_snapshot` itself can be a schema-change snapshot
 			// (e.g. consumer just committed past the previous boundary
 			// and is now reading the ALTER). The window includes it
 			// regardless of `stop_at_schema_change`; we only need to
 			// surface `schema_changes_pending = true` so callers know
 			// the window straddles a schema version transition.
-			if (SnapshotIsExternalSchemaChange(conn, data.catalog_name, start_snapshot)) {
+			if (resolved.start_is_schema_change) {
 				schema_changes_pending = true;
 			}
-			const auto next_schema_change = NextExternalSchemaChangeSnapshot(conn, data.catalog_name, start_snapshot,
-			                                                                 current_snapshot, base_schema_version);
+			const auto next_schema_change = resolved.next_schema_change;
 			if (next_schema_change != -1 && next_schema_change <= end_snapshot) {
 				schema_changes_pending = true;
 				if (stop_at_schema_change) {
 					end_snapshot = next_schema_change - 1;
 				}
 				boundary_next_snapshot = next_schema_change;
-				boundary_next_schema_version = ResolveSchemaVersion(conn, data.catalog_name, next_schema_change);
+				boundary_next_schema_version = resolved.next_schema_change_schema_version;
 			}
 		}
 		const bool has_changes = end_snapshot >= start_snapshot;
@@ -1675,17 +1883,17 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		// boundary.
 		int64_t end_schema_version_for_notice = -1;
 		if (schema_changes_pending && boundary_next_snapshot != -1) {
-			end_schema_version_for_notice = has_changes ? ResolveSchemaVersion(conn, data.catalog_name, end_snapshot)
-			                                            : ResolveSchemaVersion(conn, data.catalog_name, last_snapshot);
+			end_schema_version_for_notice = RequiredInt64(
+			    has_changes ? resolved.end_schema_version : resolved.last_schema_version, "schema_version");
 		}
 		// Emit the CDC_SCHEMA_BOUNDARY notice after COMMIT so a downstream
 		// caller's logging side-effect can never roll back the metadata
 		// write the lease UPDATE just landed.
 		if (schema_changes_pending && boundary_next_snapshot != -1 &&
-		    end_schema_version_for_notice != boundary_next_schema_version) {
+		    end_schema_version_for_notice != RequiredInt64(boundary_next_schema_version, "schema_version")) {
 			EmitSchemaBoundaryNotice(data.consumer_name, has_changes ? end_snapshot : last_snapshot,
 			                         end_schema_version_for_notice, boundary_next_snapshot,
-			                         boundary_next_schema_version);
+			                         RequiredInt64(boundary_next_schema_version, "schema_version"));
 		}
 		return {duckdb::Value::BIGINT(start_snapshot), duckdb::Value::BIGINT(end_snapshot),
 		        duckdb::Value::BOOLEAN(has_changes), duckdb::Value::BIGINT(schema_version),
