@@ -28,8 +28,13 @@ class CatalogConfig(DuckLakeModel):
         return ()
 
 
-class LocalCatalog(CatalogConfig):
-    """A file-backed DuckLake catalog."""
+DuckDBConfigValue: TypeAlias = str | bool | int | float | list[str]
+DuckDBSettingValue: TypeAlias = str | bool | int | float
+DuckDBSettings: TypeAlias = Mapping[str, DuckDBSettingValue]
+
+
+class DuckDBCatalog(CatalogConfig):
+    """A DuckDB-backed DuckLake catalog."""
 
     path: str | Path
 
@@ -82,26 +87,6 @@ class PostgresCatalog(CatalogConfig):
         return ("postgres",)
 
 
-class RawCatalog(CatalogConfig):
-    """An already-formed DuckLake ATTACH URI."""
-
-    uri: str
-    extensions: tuple[str, ...] = ()
-
-    @field_validator("uri")
-    @classmethod
-    def _uri_must_not_be_empty(cls, value: str) -> str:
-        if not value:
-            raise ValueError("uri must not be empty")
-        return value
-
-    def attach_uri(self) -> str:
-        return self.uri
-
-    def required_extensions(self) -> tuple[str, ...]:
-        return self.extensions
-
-
 class StorageConfig(DuckLakeModel):
     """Base class for DuckLake data storage configuration."""
 
@@ -115,7 +100,7 @@ class StorageConfig(DuckLakeModel):
         return ()
 
 
-class LocalStorage(StorageConfig):
+class FileStorage(StorageConfig):
     """Local filesystem data storage."""
 
     path: str | Path
@@ -187,6 +172,42 @@ class S3Storage(StorageConfig):
         return (f"CREATE OR REPLACE SECRET {quote_identifier(secret_name)} ({rendered})",)
 
 
+class DuckDBConfig(DuckLakeModel):
+    """DuckDB connection and runtime settings for a DuckLake client."""
+
+    database: str | Path = ":memory:"
+    config: Mapping[str, DuckDBConfigValue] = Field(default_factory=dict)
+    extensions: tuple[str, ...] = ()
+    settings: DuckDBSettings = Field(default_factory=dict)
+    install_extensions: bool = True
+    threads: int | None = None
+    memory_limit: str | None = None
+    max_temp_directory_size: str | None = None
+    temp_directory: str | Path | None = None
+    s3_uploader_max_filesize: str | None = None
+
+    def runtime_settings(self) -> dict[str, DuckDBSettingValue]:
+        settings = dict(self.settings)
+        explicit_settings: dict[str, DuckDBSettingValue] = {}
+        if self.threads is not None:
+            explicit_settings["threads"] = self.threads
+        if self.memory_limit is not None:
+            explicit_settings["memory_limit"] = self.memory_limit
+        if self.max_temp_directory_size is not None:
+            explicit_settings["max_temp_directory_size"] = self.max_temp_directory_size
+        if self.temp_directory is not None:
+            explicit_settings["temp_directory"] = str(self.temp_directory)
+        if self.s3_uploader_max_filesize is not None:
+            explicit_settings["s3_uploader_max_filesize"] = self.s3_uploader_max_filesize
+
+        duplicates = set(settings).intersection(explicit_settings)
+        if duplicates:
+            names = ", ".join(sorted(duplicates))
+            raise DuckLakeConfigError(f"DuckDB settings specified more than once: {names}")
+        settings.update(explicit_settings)
+        return settings
+
+
 CatalogInput: TypeAlias = str | CatalogConfig
 StorageInput: TypeAlias = str | StorageConfig
 
@@ -199,17 +220,17 @@ def parse_catalog(catalog: CatalogInput) -> CatalogConfig:
 
     parsed = urlsplit(catalog)
     scheme = parsed.scheme.lower()
-    if catalog.startswith("ducklake:"):
-        return RawCatalog(uri=catalog)
     if scheme in {"postgres", "postgresql"}:
         return PostgresCatalog(dsn=catalog)
     if scheme == "sqlite":
         return SqliteCatalog(path=_file_url_path(parsed))
+    if scheme == "duckdb":
+        return DuckDBCatalog(path=_file_url_path(parsed))
     if scheme == "file":
-        return LocalCatalog(path=_file_url_path(parsed))
+        return DuckDBCatalog(path=_file_url_path(parsed))
     if scheme:
         raise DuckLakeConfigError(f"unsupported DuckLake catalog URL scheme: {parsed.scheme!r}")
-    return LocalCatalog(path=catalog)
+    return DuckDBCatalog(path=catalog)
 
 
 def parse_storage(storage: StorageInput) -> StorageConfig:
@@ -223,10 +244,10 @@ def parse_storage(storage: StorageInput) -> StorageConfig:
     if scheme == "s3":
         return _parse_s3_storage(parsed)
     if scheme == "file":
-        return LocalStorage(path=_file_url_path(parsed))
+        return FileStorage(path=_file_url_path(parsed))
     if scheme:
         raise DuckLakeConfigError(f"unsupported DuckLake storage URL scheme: {parsed.scheme!r}")
-    return LocalStorage(path=storage)
+    return FileStorage(path=storage)
 
 
 def quote_identifier(value: str) -> str:

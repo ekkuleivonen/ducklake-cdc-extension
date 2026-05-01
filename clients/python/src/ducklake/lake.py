@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
-from ducklake._connection import ConnectionManager, DuckDBSettings
+from ducklake._connection import ConnectionManager
 from ducklake.config import (
     CatalogInput,
+    DuckDBConfig,
     StorageInput,
     parse_catalog,
     parse_storage,
@@ -19,40 +19,27 @@ from ducklake.session import Session, Transaction
 from ducklake.table import Table
 
 
-@dataclass
 class DuckLake:
     """A lazy DuckLake connection wrapper."""
 
-    _manager: ConnectionManager
-    alias: str = "lake"
-
-    @classmethod
-    def open(
-        cls,
+    def __init__(
+        self,
         *,
         catalog: CatalogInput,
         storage: StorageInput,
         alias: str = "lake",
-        database: str = ":memory:",
-        duckdb_config: Mapping[str, str | bool | int | float | list[str]] | None = None,
-        duckdb_settings: DuckDBSettings | None = None,
+        duckdb: DuckDBConfig | None = None,
         attach_options: Mapping[str, object] | None = None,
-        install_extensions: bool = True,
-    ) -> DuckLake:
+    ) -> None:
         parsed_catalog = parse_catalog(catalog)
         parsed_storage = parse_storage(storage)
-        return cls(
-            ConnectionManager(
-                catalog=parsed_catalog,
-                storage=parsed_storage,
-                alias=alias,
-                database=database,
-                duckdb_config=duckdb_config,
-                duckdb_settings=duckdb_settings,
-                attach_options=attach_options,
-                install_extensions=install_extensions,
-            ),
+        self.alias = alias
+        self._manager = ConnectionManager(
+            catalog=parsed_catalog,
+            storage=parsed_storage,
             alias=alias,
+            duckdb=duckdb or DuckDBConfig(),
+            attach_options=attach_options,
         )
 
     def sql(self, query: str, *parameters: object, **named_parameters: object) -> Result:
@@ -61,6 +48,11 @@ class DuckLake:
             query,
             _normalize_parameters(parameters, named_parameters),
         )
+
+    def execute(self, query: str, parameters: object | None = None) -> Any:
+        if parameters is None:
+            return self.raw_connection().execute(query)
+        return self.raw_connection().execute(query, parameters)
 
     def session(self) -> Session:
         return Session(self)
@@ -118,6 +110,9 @@ class DuckLake:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw_connection(), name)
 
 
 def _normalize_parameters(

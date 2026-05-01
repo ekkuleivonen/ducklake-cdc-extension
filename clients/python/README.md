@@ -7,32 +7,39 @@ This package is scaffolded for early client work and is not published yet.
 ## DuckLake Quickstart
 
 ```python
-from ducklake import DuckLake
+from ducklake import DuckDBConfig, DuckLake
 
-lake = DuckLake.open(
+lake = DuckLake(
     catalog="postgresql://user:pw@host/db",
     storage="s3://my-bucket?endpoint=https://s3.example.com&region=us-east-1",
-    duckdb_settings={
-        "enable_http_metadata_cache": True,
-        "enable_object_cache": True,
-    },
+    duckdb=DuckDBConfig(
+        threads=8,
+        memory_limit="8GB",
+        max_temp_directory_size="20GB",
+        settings={"enable_http_metadata_cache": True},
+    ),
 )
 
 rows = lake.sql("SELECT * FROM events WHERE ts > $cutoff", cutoff="2025-01-01").list()
+df = lake.execute("SELECT 1 AS ok").df()
 
 with lake.transaction() as tx:
     tx.sql("INSERT INTO events VALUES ($id, $payload)", id=1, payload="hello").list()
     tx.sql("UPDATE events SET seen = true WHERE id = $id", id=1).list()
 ```
 
-`DuckLake.open()` is lazy: it validates configuration immediately, then creates
-the DuckDB connection and attaches DuckLake on the first query. Use
+`DuckLake(...)` is lazy: it validates configuration immediately, then creates
+the DuckDB connection and attaches DuckLake on the first query. It exposes common
+DuckDB connection methods directly, including `execute(...)`, and delegates other
+connection attributes to the underlying `duckdb.DuckDBPyConnection`. Use
 `lake.raw_connection()` when you need the underlying `duckdb.DuckDBPyConnection`.
 Use `lake.transaction()` to group multiple statements into one DuckLake commit;
 it commits on success and rolls back when the block raises.
 
-`duckdb_settings` mirrors DuckDB runtime settings directly. Each entry is applied
-as `SET name = value` before DuckLake is attached.
+`DuckDBConfig` mirrors DuckDB runtime setting names directly. Common settings
+such as `threads`, `memory_limit`, `max_temp_directory_size`, and
+`s3_uploader_max_filesize` are first-class fields; extra `settings` entries are
+applied as `SET name = value` before DuckLake is attached.
 
 ## Demo
 

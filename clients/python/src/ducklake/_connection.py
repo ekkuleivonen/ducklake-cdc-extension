@@ -5,15 +5,18 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias, cast
+from typing import Any, cast
 
 from ducklake._attach import build_attach_sql
-from ducklake.config import CatalogConfig, StorageConfig, quote_literal
+from ducklake.config import (
+    CatalogConfig,
+    DuckDBConfig,
+    DuckDBSettingValue,
+    StorageConfig,
+    quote_literal,
+)
 from ducklake.exceptions import DuckLakeConnectionError
 
-DuckDBConfig: TypeAlias = dict[str, str | bool | int | float | list[str]]
-DuckDBSettingValue: TypeAlias = str | bool | int | float
-DuckDBSettings: TypeAlias = Mapping[str, DuckDBSettingValue]
 _SETTING_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -22,11 +25,8 @@ class ConnectionManager:
     catalog: CatalogConfig
     storage: StorageConfig
     alias: str
-    database: str = ":memory:"
-    duckdb_config: Mapping[str, str | bool | int | float | list[str]] | None = None
-    duckdb_settings: DuckDBSettings | None = None
+    duckdb: DuckDBConfig = field(default_factory=DuckDBConfig)
     attach_options: Mapping[str, object] | None = None
-    install_extensions: bool = True
     _connection: Any | None = field(default=None, init=False, repr=False)
 
     def get(self) -> Any:
@@ -43,16 +43,16 @@ class ConnectionManager:
         try:
             import duckdb
 
-            config = cast(DuckDBConfig | None, self.duckdb_config)
+            config = cast(dict[str, str | bool | int | float | list[str]], dict(self.duckdb.config))
             conn = (
-                duckdb.connect(self.database, config=config)
-                if config is not None
-                else duckdb.connect(self.database)
+                duckdb.connect(str(self.duckdb.database), config=config)
+                if config
+                else duckdb.connect(str(self.duckdb.database))
             )
-            for name, value in (self.duckdb_settings or {}).items():
+            for name, value in self.duckdb.runtime_settings().items():
                 conn.execute(_setting_sql(name, value))
             for extension in self._required_extensions():
-                if self.install_extensions:
+                if self.duckdb.install_extensions:
                     conn.execute(f"INSTALL {extension}")
                 conn.execute(f"LOAD {extension}")
             for statement in self.storage.setup_statements(secret_name=f"{self.alias}_storage"):
@@ -75,6 +75,7 @@ class ConnectionManager:
             "parquet",
             *self.catalog.required_extensions(),
             *self.storage.required_extensions(),
+            *self.duckdb.extensions,
         ]
         return tuple(dict.fromkeys(names))
 

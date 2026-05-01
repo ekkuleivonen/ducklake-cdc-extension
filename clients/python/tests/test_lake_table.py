@@ -49,8 +49,8 @@ class FailingCommitConnection(FakeConnection):
         return super().execute(query, parameters)
 
 
-def test_open_is_lazy() -> None:
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+def test_constructor_is_lazy() -> None:
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
 
     assert lake.alias == "lake"
 
@@ -70,7 +70,7 @@ def test_table_value_objects_are_pydantic_models() -> None:
 
 
 def test_lake_sql_accepts_named_parameters() -> None:
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
     lake._manager.get = lambda: object()  # type: ignore[method-assign]
 
     result = lake.sql("SELECT $value", value=1)
@@ -80,7 +80,7 @@ def test_lake_sql_accepts_named_parameters() -> None:
 
 def test_transaction_commits_successful_block() -> None:
     connection = FakeConnection()
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
     lake._manager.get = lambda: connection  # type: ignore[method-assign]
 
     with lake.transaction() as tx:
@@ -95,7 +95,7 @@ def test_transaction_commits_successful_block() -> None:
 
 def test_transaction_rolls_back_failed_block() -> None:
     connection = FakeConnection()
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
     lake._manager.get = lambda: connection  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="boom"):
@@ -110,7 +110,7 @@ def test_transaction_rolls_back_failed_block() -> None:
 
 def test_transaction_wraps_commit_failures() -> None:
     connection = FailingCommitConnection()
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
     lake._manager.get = lambda: connection  # type: ignore[method-assign]
 
     with pytest.raises(DuckLakeQueryError, match="transaction commit failed"):
@@ -126,7 +126,7 @@ def test_transaction_wraps_commit_failures() -> None:
 
 def test_transaction_handle_cannot_run_after_exit() -> None:
     connection = FakeConnection()
-    lake = DuckLake.open(catalog="catalog.ducklake", storage="data")
+    lake = DuckLake(catalog="catalog.ducklake", storage="data")
     lake._manager.get = lambda: connection  # type: ignore[method-assign]
 
     with lake.transaction() as tx:

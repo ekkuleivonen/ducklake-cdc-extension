@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlsplit
 
-from ducklake import DuckLake, DuckLakeError, SqliteCatalog
+from ducklake import DuckDBConfig, DuckLake, DuckLakeError, SqliteCatalog
 
 WORK_DIR = Path(__file__).resolve().parent / ".work"
 CATALOG_PATH = WORK_DIR / "demo.sqlite"
@@ -29,13 +29,17 @@ def open_demo_lake(
     catalog_backend: str | None = None,
     storage: str | None = None,
 ) -> DuckLake:
-    config = {"allow_unsigned_extensions": "true"} if allow_unsigned_extensions else None
+    duckdb = (
+        DuckDBConfig(settings={"allow_unsigned_extensions": True})
+        if allow_unsigned_extensions
+        else None
+    )
     catalog_input = resolve_catalog(catalog=catalog, catalog_backend=catalog_backend)
     storage_input = resolve_storage(storage=storage)
-    return DuckLake.open(
+    return DuckLake(
         catalog=catalog_input,
         storage=storage_input,
-        duckdb_config=config,
+        duckdb=duckdb,
     )
 
 
@@ -104,7 +108,7 @@ def reset_postgres_database(dsn: str) -> None:
     except ImportError as exc:
         raise RuntimeError("Postgres demo reset requires the psycopg package") from exc
 
-    params = conninfo_to_dict(dsn)
+    params = {key: str(value) for key, value in conninfo_to_dict(dsn).items() if value is not None}
     database = params.get("dbname")
     if not database:
         raise ValueError("Postgres demo catalog DSN must include a database name")

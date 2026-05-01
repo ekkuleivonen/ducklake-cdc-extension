@@ -1,5 +1,16 @@
+import pytest
+
 from ducklake._attach import build_attach_sql
-from ducklake.config import PostgresCatalog, S3Storage, parse_catalog, parse_storage
+from ducklake.config import (
+    DuckDBCatalog,
+    DuckDBConfig,
+    FileStorage,
+    PostgresCatalog,
+    S3Storage,
+    parse_catalog,
+    parse_storage,
+)
+from ducklake.exceptions import DuckLakeConfigError
 
 
 def test_config_models_are_pydantic_models() -> None:
@@ -10,12 +21,26 @@ def test_config_models_are_pydantic_models() -> None:
     assert storage.model_dump()["bucket"] == "bucket"
 
 
+def test_plain_catalog_path_maps_to_duckdb_catalog() -> None:
+    catalog = parse_catalog("catalog.ducklake")
+
+    assert isinstance(catalog, DuckDBCatalog)
+    assert catalog.attach_uri() == "ducklake:catalog.ducklake"
+
+
 def test_postgres_catalog_url_maps_to_ducklake_attach_uri() -> None:
     catalog = parse_catalog("postgresql://user:pw@host/db")
 
     assert isinstance(catalog, PostgresCatalog)
     assert catalog.attach_uri() == "ducklake:postgres:postgresql://user:pw@host/db"
     assert catalog.required_extensions() == ("postgres",)
+
+
+def test_file_storage_url_maps_to_file_storage() -> None:
+    storage = parse_storage("file:///tmp/ducklake-data")
+
+    assert isinstance(storage, FileStorage)
+    assert storage.data_path() == "/tmp/ducklake-data"
 
 
 def test_s3_storage_url_maps_to_data_path_and_secret() -> None:
@@ -46,3 +71,28 @@ def test_attach_sql_quotes_catalog_alias_and_data_path() -> None:
         "ATTACH 'ducklake:catalog''s.ducklake' AS \"my lake\" "
         "(DATA_PATH 'data path', DATA_INLINING_ROW_LIMIT 100)"
     )
+
+
+def test_duckdb_config_uses_exact_setting_names() -> None:
+    config = DuckDBConfig(
+        threads=4,
+        memory_limit="4GB",
+        max_temp_directory_size="20GB",
+        temp_directory="/tmp/duckdb",
+        s3_uploader_max_filesize="50GB",
+        settings={"enable_http_metadata_cache": True},
+    )
+
+    assert config.runtime_settings() == {
+        "enable_http_metadata_cache": True,
+        "threads": 4,
+        "memory_limit": "4GB",
+        "max_temp_directory_size": "20GB",
+        "temp_directory": "/tmp/duckdb",
+        "s3_uploader_max_filesize": "50GB",
+    }
+
+
+def test_duckdb_config_rejects_duplicate_setting_names() -> None:
+    with pytest.raises(DuckLakeConfigError, match="threads"):
+        DuckDBConfig(threads=4, settings={"threads": 8}).runtime_settings()
