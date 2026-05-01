@@ -55,6 +55,14 @@ def test_client_load_extension_is_explicit() -> None:
     assert lake.connection.calls == ["INSTALL ducklake_cdc", "LOAD ducklake_cdc"]
 
 
+def test_client_load_extension_accepts_local_path() -> None:
+    lake = FakeLake()
+
+    CDCClient(cast(DuckLake, lake)).load_extension(path="/tmp/ducklake_cdc.duckdb_extension")
+
+    assert lake.connection.calls == ["LOAD '/tmp/ducklake_cdc.duckdb_extension'"]
+
+
 def test_consumer_create_returns_subscription_models_and_renders_sql() -> None:
     lake = FakeLake()
     cdc = CDCClient(cast(DuckLake, lake))

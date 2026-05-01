@@ -24,7 +24,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "duckdb>=1.5.1",
+    "duckdb==1.5.1",
     "pydantic>=2.13.3",
     "pytz>=2026.1.post1",
 ]

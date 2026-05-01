@@ -28,18 +28,31 @@ the DuckDB connection and attaches DuckLake on the first query. Use
 `duckdb_settings` mirrors DuckDB runtime settings directly. Each entry is applied
 as `SET name = value` before DuckLake is attached.
 
-## Playground
+## Demo
 
-Run the zero-infra local playground from this directory:
+Run the demo scripts from this directory:
 
 ```bash
-uv run python playground/01_local_ducklake.py
+uv run python demo/producer.py
+uv run python demo/consumer.py
 ```
 
-The script creates a local DuckLake catalog under `playground/.work/`, seeds a
-small `events` table, and exercises the client API with `lake.sql(...)`,
-`lake.tables()`, `lake.table("events").schema()`, `.head()`, `.row_count()`,
-and `lake.snapshots()`.
+`producer.py` is a placeholder for now. `consumer.py` creates a local DuckLake
+catalog under `demo/.work/`, loads `ducklake_cdc`, and calls `cdc_doctor`.
+
+Until the latest extension build is available from DuckDB community extensions,
+load a local build by path. By default the demo looks for:
+
+```text
+../../build/release/extension/ducklake_cdc/ducklake_cdc.duckdb_extension
+```
+
+Override it with:
+
+```bash
+DUCKLAKE_CDC_EXTENSION=/path/to/ducklake_cdc.duckdb_extension \
+  uv run python demo/consumer.py
+```
 
 ## Development
 

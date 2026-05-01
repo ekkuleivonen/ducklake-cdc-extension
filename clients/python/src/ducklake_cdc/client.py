@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TypeVar
 
 from ducklake import DuckLake, Result
@@ -37,8 +38,11 @@ class CDCClient:
         self.lake = lake
         self.catalog = catalog or lake.alias
 
-    def load_extension(self, *, install: bool = True) -> None:
+    def load_extension(self, path: str | Path | None = None, *, install: bool = True) -> None:
         connection = self.lake.raw_connection()
+        if path is not None:
+            connection.execute(f"LOAD {str(Path(path))!r}")
+            return
         if install:
             connection.execute("INSTALL ducklake_cdc")
         connection.execute("LOAD ducklake_cdc")
