@@ -25,7 +25,13 @@ classifiers = [
 ]
 dependencies = [
     "duckdb>=1.5.1",
+    "pydantic>=2.13.3",
 ]
+
+[project.optional-dependencies]
+arrow = ["pyarrow"]
+pandas = ["pandas"]
+polars = ["polars", "pyarrow"]
 
 [project.urls]
 Homepage = "https://github.com/ekkuleivonen/ducklake-cdc-extension"
@@ -43,7 +49,7 @@ dev = [
 package = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ducklake_cdc"]
+packages = ["src/ducklake", "src/ducklake_cdc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
