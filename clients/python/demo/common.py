@@ -30,7 +30,7 @@ def open_demo_lake(
     storage: str | None = None,
 ) -> DuckLake:
     duckdb = (
-        DuckDBConfig(settings={"allow_unsigned_extensions": True})
+        DuckDBConfig(config={"allow_unsigned_extensions": True})
         if allow_unsigned_extensions
         else None
     )

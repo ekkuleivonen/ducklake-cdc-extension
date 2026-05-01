@@ -78,9 +78,15 @@ std::unordered_set<int64_t> WAIT_WARNED_CONNECTIONS;
 // Lease / cache helpers
 //===--------------------------------------------------------------------===//
 
+std::string ConnectionCachePrefix(duckdb::ClientContext &context) {
+	std::ostringstream out;
+	out << context.db.get() << ":" << context.GetConnectionId();
+	return out.str();
+}
+
 std::string TokenCacheKey(duckdb::ClientContext &context, const std::string &catalog_name,
                           const std::string &consumer_name) {
-	return std::to_string(context.GetConnectionId()) + ":" + catalog_name + ":" + consumer_name;
+	return ConnectionCachePrefix(context) + ":" + catalog_name + ":" + consumer_name;
 }
 
 std::string CachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
@@ -136,7 +142,7 @@ std::mutex BACKEND_CACHE_MUTEX;
 std::unordered_map<std::string, StateBackendKind> BACKEND_CACHE;
 
 std::string BackendCacheKey(duckdb::ClientContext &context, const std::string &catalog_name) {
-	return std::to_string(context.GetConnectionId()) + ":" + catalog_name;
+	return ConnectionCachePrefix(context) + ":" + catalog_name;
 }
 
 StateBackendKind DetectStateBackend(duckdb::Connection &conn, const std::string &catalog_name) {
