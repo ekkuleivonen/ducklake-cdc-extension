@@ -79,6 +79,13 @@ std::vector<ConsumerSubscriptionRow> LoadConsumerSubscriptions(duckdb::Connectio
                                                                const std::string &catalog_name,
                                                                const std::string &consumer_name = std::string());
 
+//! Load raw active DML subscription facts for hot DML read/listen paths.
+//! Unlike LoadConsumerSubscriptions, this does not decorate rows with current
+//! object names or renamed/dropped status.
+std::vector<ConsumerSubscriptionRow> LoadDmlConsumerSubscriptions(duckdb::Connection &conn,
+                                                                  const std::string &catalog_name,
+                                                                  const std::string &consumer_name);
+
 bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_t schema_id, int64_t table_id,
                              const std::string &event_category);
 
@@ -110,6 +117,11 @@ std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                    const std::string &consumer_name, int64_t timeout_ms);
+
+std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                      const std::string &catalog_name, const std::string &consumer_name,
+                                                      int64_t timeout_ms,
+                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions);
 
 //! Reactively coalesce integrated listen calls after this process observes a
 //! burst of quick, small non-empty results for the same consumer/stream.

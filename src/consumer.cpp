@@ -1802,40 +1802,47 @@ duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &c
 	return std::move(result);
 }
 
-std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	if (data.timeout_ms < 0) {
+std::vector<duckdb::Value>
+WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                     const std::string &catalog_name, const std::string &consumer_name,
+                                     int64_t timeout_ms, const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	CheckCatalogOrThrow(context, catalog_name);
+	if (timeout_ms < 0) {
 		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
 	}
-	const auto timeout_ms = std::min<int64_t>(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
-	if (data.timeout_ms > HARD_WAIT_TIMEOUT_MS) {
-		EmitWaitTimeoutClampedNotice(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
+	const auto clamped_timeout_ms = std::min<int64_t>(timeout_ms, HARD_WAIT_TIMEOUT_MS);
+	if (timeout_ms > HARD_WAIT_TIMEOUT_MS) {
+		EmitWaitTimeoutClampedNotice(timeout_ms, HARD_WAIT_TIMEOUT_MS);
 	}
-	if (timeout_ms > 0) {
-		MaybeEmitWaitSharedConnectionWarning(context, timeout_ms);
+	if (clamped_timeout_ms > 0) {
+		MaybeEmitWaitSharedConnectionWarning(context, clamped_timeout_ms);
 	}
 	auto interval_ms = WAIT_INITIAL_INTERVAL_MS;
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-	duckdb::Connection conn(*context.db);
-	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(clamped_timeout_ms);
 	while (true) {
 		if (context.interrupted) {
 			throw duckdb::InterruptException();
 		}
-		const auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		const auto next_matching = NextMatchingSnapshot(conn, data.catalog_name, row, subscriptions);
+		const auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+		const auto next_matching = NextMatchingSnapshot(conn, catalog_name, row, subscriptions);
 		if (!next_matching.empty() && !next_matching[0].IsNull()) {
 			return next_matching;
 		}
 		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline || timeout_ms == 0) {
+		if (now >= deadline || clamped_timeout_ms == 0) {
 			return {duckdb::Value()};
 		}
 		const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
 		std::this_thread::sleep_for(std::chrono::milliseconds(std::min(interval_ms, remaining_ms)));
 		interval_ms = std::min<int64_t>(interval_ms * 2, WAIT_MAX_INTERVAL_MS);
 	}
+}
+
+std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
+	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	return WaitForNextSnapshotWithSubscriptions(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
+	                                            subscriptions);
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListenWaitInit(duckdb::ClientContext &context,
@@ -2153,6 +2160,42 @@ LoadConsumerSubscriptions(duckdb::Connection &conn, const std::string &catalog_n
 	return out;
 }
 
+std::vector<ConsumerSubscriptionRow> LoadDmlConsumerSubscriptions(duckdb::Connection &conn,
+                                                                  const std::string &catalog_name,
+                                                                  const std::string &consumer_name) {
+	std::vector<ConsumerSubscriptionRow> out;
+	std::ostringstream query;
+	query << "SELECT c.consumer_name, c.consumer_id, s.subscription_id, s.scope_kind, s.schema_id, s.table_id, "
+	      << "s.event_category, s.change_type, s.original_qualified_name, c.consumer_kind FROM "
+	      << StateTable(conn, catalog_name, CONSUMERS_TABLE) << " c JOIN "
+	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE) << " s ON s.consumer_id = c.consumer_id "
+	      << "WHERE c.consumer_name = " << QuoteLiteral(consumer_name)
+	      << " AND s.event_category = 'dml' AND s.scope_kind = 'table' AND s.table_id IS NOT NULL "
+	      << "ORDER BY c.consumer_id ASC, s.subscription_id ASC";
+	auto result = conn.Query(query.str());
+	if (!result || result->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        result ? result->GetError() : "DML consumer subscription lookup failed");
+	}
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		ConsumerSubscriptionRow row;
+		row.consumer_name = result->GetValue(0, i).ToString();
+		row.consumer_kind = result->GetValue(9, i).ToString();
+		row.consumer_id = result->GetValue(1, i).GetValue<int64_t>();
+		row.subscription_id = result->GetValue(2, i).GetValue<int64_t>();
+		row.scope_kind = result->GetValue(3, i).ToString();
+		row.schema_id = result->GetValue(4, i);
+		row.table_id = result->GetValue(5, i);
+		row.event_category = result->GetValue(6, i).ToString();
+		row.change_type = result->GetValue(7, i).ToString();
+		row.original_qualified_name = result->GetValue(8, i);
+		row.current_qualified_name = duckdb::Value();
+		row.status = "active";
+		out.push_back(std::move(row));
+	}
+	return out;
+}
+
 bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_t schema_id, int64_t table_id,
                              const std::string &event_category) {
 	if (subscription.status == "dropped" || subscription.event_category != event_category) {
@@ -2295,6 +2338,13 @@ std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &contex
 	data.consumer_name = consumer_name;
 	data.timeout_ms = timeout_ms;
 	return WaitForNextSnapshot(context, data);
+}
+
+std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                      const std::string &catalog_name, const std::string &consumer_name,
+                                                      int64_t timeout_ms,
+                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	return WaitForNextSnapshotWithSubscriptions(context, conn, catalog_name, consumer_name, timeout_ms, subscriptions);
 }
 
 int64_t AdaptiveListenDelayMs(const std::string &catalog_name, const std::string &consumer_name,

@@ -379,8 +379,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::Client
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<DmlTicksData>();
 	auto max_snapshots = data.max_snapshots;
+	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	if (data.listen && !data.explicit_window) {
-		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		auto ready = WaitForDmlConsumerSnapshot(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
+		                                        subscriptions);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}
@@ -391,7 +394,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::Client
 		}
 	}
 
-	duckdb::Connection conn(*context.db);
 	int64_t start_snapshot;
 	int64_t end_snapshot;
 	bool has_changes;
@@ -412,7 +414,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::Client
 	if (!has_changes) {
 		return std::move(result);
 	}
-	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	AppendDmlTickRows(conn, data.catalog_name, data.consumer_name, start_snapshot, end_snapshot, &subscriptions,
 	                  nullptr, result->rows, true);
 	if (data.listen && !data.explicit_window) {
@@ -677,8 +678,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> GenericDmlInit(duckdb::Clie
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<GenericDmlChangesData>();
 	auto max_snapshots = data.max_snapshots;
+	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	if (data.listen && !data.explicit_window) {
-		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		auto ready = WaitForDmlConsumerSnapshot(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
+		                                        subscriptions);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}
@@ -708,8 +712,6 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> GenericDmlInit(duckdb::Clie
 	if (!has_changes) {
 		return std::move(result);
 	}
-	duckdb::Connection conn(*context.db);
-	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	std::unordered_set<int64_t> visited;
 	for (const auto &subscription : subscriptions) {
 		if (subscription.event_category != "dml" || subscription.table_id.IsNull() || subscription.schema_id.IsNull()) {
