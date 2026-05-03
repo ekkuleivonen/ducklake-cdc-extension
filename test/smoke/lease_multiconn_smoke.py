@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
 	}
 
 	RequireOk(a, "CREATE TABLE lake.multi_conn_probe(id INTEGER)");
-	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'multi_conn', table_names := ['multi_conn_probe'])");
+	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'multi_conn', table_name := 'multi_conn_probe')");
 	RequireOk(a, "INSERT INTO lake.multi_conn_probe VALUES (1)");
 	auto window = RequireOk(a, "SELECT * FROM cdc_window('lake', 'multi_conn')");
 	auto &window_result = window->Cast<MaterializedQueryResult>();

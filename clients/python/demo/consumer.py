@@ -1,10 +1,18 @@
-"""Stream demo DuckLake CDC changes to stdout via the high-level Python API."""
+"""Stream demo DuckLake CDC changes to stdout via the high-level Python API.
+
+DML consumers are pinned to a single table by contract — see
+``cdc_dml_consumer_create`` in the SQL extension. This demo therefore
+spawns one :class:`DMLConsumer` per discovered table and processes them
+in turn, sharing a single :class:`DemoStats` aggregator so the rendered
+summary still reads as one end-to-end run.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import time
 from collections.abc import Sequence
 from datetime import date, datetime
@@ -30,7 +38,7 @@ from ducklake_cdc import (
 )
 from ducklake_cdc.lowlevel import CDCClient
 
-CONSUMER_NAME = "stdout_demo"
+CONSUMER_NAME_PREFIX = "stdout_demo"
 DEFAULT_CDC_EXTENSION = (
     Path(__file__).resolve().parents[3]
     / "build"
@@ -108,31 +116,40 @@ def main() -> None:
                     "Run producer.py first."
                 )
 
-            sinks: list[DMLSink] = [_StatsSink(stats)]
-            if args.output_mode == "stdout":
-                sinks.append(StdoutDMLSink())
-
-            consumer = DMLConsumer(
-                lake,
-                CONSUMER_NAME,
-                tables=tables,
-                start_at=parse_start_at(args.start_at),
-                on_exists="replace",
-                sinks=sinks,
-                client=cdc,
-                retry=retry_on_lock,
-            )
-
-            with consumer:
+            start_at = parse_start_at(args.start_at)
+            for table in tables:
+                consumer_name = _consumer_name_for(table)
+                sinks: list[DMLSink] = [_StatsSink(stats)]
                 if args.output_mode == "stdout":
-                    print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
-                consumer.run(
-                    infinite=True,
-                    timeout_ms=args.timeout_ms,
-                    max_snapshots=args.max_snapshots,
-                    max_batches=args.max_batches,
-                    idle_timeout=args.idle_timeout,
+                    sinks.append(StdoutDMLSink())
+
+                consumer = DMLConsumer(
+                    lake,
+                    consumer_name,
+                    table=table,
+                    start_at=start_at,
+                    on_exists="replace",
+                    sinks=sinks,
+                    client=cdc,
+                    retry=retry_on_lock,
                 )
+
+                with consumer:
+                    if args.output_mode == "stdout":
+                        print_json(
+                            {
+                                "type": "consumer_ready",
+                                "consumer": consumer_name,
+                                "table": table,
+                            }
+                        )
+                    consumer.run(
+                        infinite=True,
+                        timeout_ms=args.timeout_ms,
+                        max_snapshots=args.max_snapshots,
+                        max_batches=args.max_batches,
+                        idle_timeout=args.idle_timeout,
+                    )
         except KeyboardInterrupt:
             pass
         except Exception as exc:
@@ -142,6 +159,22 @@ def main() -> None:
         lake.close()
         stats.finish()
         emit_summary(stats, output=args.summary_output)
+
+
+_CONSUMER_NAME_SAFE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _consumer_name_for(qualified_table: str) -> str:
+    """Map ``schema.table`` to a deterministic, catalog-safe consumer name.
+
+    The SQL extension stores consumer names as VARCHAR; dots in the
+    qualified name are fine, but we sanitise to ``[A-Za-z0-9_]`` so that
+    ``cdc_consumer_drop`` / lease-tooling examples in docs can quote the
+    name without escaping.
+    """
+
+    safe = _CONSUMER_NAME_SAFE.sub("_", qualified_table)
+    return f"{CONSUMER_NAME_PREFIX}__{safe}"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

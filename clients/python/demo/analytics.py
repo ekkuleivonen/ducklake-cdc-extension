@@ -52,7 +52,6 @@ class DemoStats:
     cdc_ddl_changes_read_calls: int = 0
     cdc_dml_ticks_read_calls: int = 0
     lake_tables_calls: int = 0
-    cdc_dml_table_changes_read_calls: int = 0
     cdc_commit_calls: int = 0
     ddl_events: int = 0
     snapshot_events: int = 0
@@ -239,7 +238,6 @@ class DemoStats:
             "cdc_ddl_changes_read_calls": self.cdc_ddl_changes_read_calls,
             "cdc_dml_ticks_read_calls": self.cdc_dml_ticks_read_calls,
             "lake_tables_calls": self.lake_tables_calls,
-            "cdc_dml_table_changes_read_calls": self.cdc_dml_table_changes_read_calls,
             "cdc_commit_calls": self.cdc_commit_calls,
             "ddl_events": self.ddl_events,
             "snapshot_events": self.snapshot_events,
@@ -325,7 +323,6 @@ class DemoStats:
             self.cdc_dml_changes_listen_calls
             + self.cdc_ddl_changes_read_calls
             + self.cdc_dml_ticks_read_calls
-            + self.cdc_dml_table_changes_read_calls
             + self.cdc_commit_calls
         )
 
@@ -492,7 +489,6 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
             )
         for name, description in (
             ("cdc_window", "per-call cdc_window cost"),
-            ("cdc_dml_table_changes_read", "legacy per-table read cost"),
             ("cdc_commit", "per-call cdc_commit cost"),
         ):
             metrics = operation_ms.get(name)

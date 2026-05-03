@@ -71,7 +71,7 @@ def main() -> int:
 
         setup = open_conn(lake, data)
         setup.execute("CREATE TABLE lake.events(id INTEGER, payload VARCHAR)")
-        setup.execute("SELECT * FROM cdc_dml_consumer_create('lake', 'adaptive', table_names := ['events'])")
+        setup.execute("SELECT * FROM cdc_dml_consumer_create('lake', 'adaptive', table_name := 'events')")
         setup.execute("INSERT INTO lake.events VALUES (0, 'seed')")
 
         consumer = setup.cursor()

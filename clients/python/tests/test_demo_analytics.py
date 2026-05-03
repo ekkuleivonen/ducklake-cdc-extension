@@ -90,7 +90,6 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["cdc_ddl_changes_read_calls"] == 1
     assert summary["cdc_dml_ticks_read_calls"] == 1
     assert summary["lake_tables_calls"] == 1
-    assert summary["cdc_dml_table_changes_read_calls"] == 0
     assert summary["cdc_commit_calls"] == 1
     assert summary["ddl_events"] == 1
     assert summary["snapshot_events"] == 2

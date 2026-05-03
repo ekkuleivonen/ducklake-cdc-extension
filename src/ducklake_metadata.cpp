@@ -422,12 +422,17 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 //===--------------------------------------------------------------------===//
 
 std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema) {
+	// `table_id` is the single subscribed table for DML consumers (one
+	// DML consumer = one table, by contract). It is NULL for DDL
+	// consumers — DDL consumers can subscribe to schemas, tables, or the
+	// whole catalog and route those facts through
+	// `__ducklake_cdc_consumer_subscriptions`.
 	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
 	       " ("
 	       "consumer_name VARCHAR, "
 	       "consumer_kind VARCHAR NOT NULL, "
 	       "consumer_id BIGINT NOT NULL, "
-	       "stop_at_schema_change BOOLEAN NOT NULL, "
+	       "table_id BIGINT, "
 	       "last_committed_snapshot BIGINT, "
 	       "last_committed_schema_version BIGINT, "
 	       "owner_token UUID, "

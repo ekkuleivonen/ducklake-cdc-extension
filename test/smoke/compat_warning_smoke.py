@@ -27,7 +27,7 @@ What this script does (no Docker, no PyPI deps; all stdlib):
    `LoadInternal` at session start, after the initial database is
    visible. The probe then hits the seeded `__ducklake_metadata_<name>`
    schema, reads `'99.99'`, and emits the structured notice on stderr.
-3. Calls `cdc_dml_consumer_create('<catalog>', 'test', table_names := ...)`
+3. Calls `cdc_dml_consumer_create('<catalog>', 'test', table_name := ...)`
    against the same seeded incompatible catalog and asserts the call-time
    gate throws the same structured prefix before any catalog write.
 4. Asserts both outputs contain the `CDC_INCOMPATIBLE_CATALOG:` prefix
@@ -163,7 +163,7 @@ def capture_call_time_error(db_path: Path, catalog_name: str) -> str:
             "-unsigned",
             str(db_path),
             "-c",
-            f"SELECT * FROM cdc_dml_consumer_create('{catalog_name}', 'test', table_names := ['probe']);",
+            f"SELECT * FROM cdc_dml_consumer_create('{catalog_name}', 'test', table_name := 'probe');",
         ],
         capture_output=True,
         text=True,

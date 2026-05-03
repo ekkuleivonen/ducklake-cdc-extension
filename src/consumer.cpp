@@ -150,23 +150,22 @@ ConsumerRow ConsumerRowFromResult(duckdb::MaterializedQueryResult &result, duckd
 	row.consumer_name = result.GetValue(0, row_index).ToString();
 	row.consumer_kind = result.GetValue(1, row_index).ToString();
 	row.consumer_id = result.GetValue(2, row_index).GetValue<int64_t>();
-	auto snapshot_value = result.GetValue(3, row_index);
+	row.table_id = result.GetValue(3, row_index);
+	auto snapshot_value = result.GetValue(4, row_index);
 	row.last_committed_snapshot = snapshot_value.IsNull() ? -1 : snapshot_value.GetValue<int64_t>();
-	auto schema_value = result.GetValue(4, row_index);
+	auto schema_value = result.GetValue(5, row_index);
 	row.last_committed_schema_version = schema_value.IsNull() ? -1 : schema_value.GetValue<int64_t>();
-	row.owner_token = result.GetValue(5, row_index);
-	row.owner_acquired_at = result.GetValue(6, row_index);
-	row.owner_heartbeat_at = result.GetValue(7, row_index);
-	row.lease_interval_seconds = result.GetValue(8, row_index).GetValue<int64_t>();
-	const auto stop_value = result.GetValue(9, row_index);
-	row.stop_at_schema_change = stop_value.IsNull() ? true : stop_value.GetValue<bool>();
+	row.owner_token = result.GetValue(6, row_index);
+	row.owner_acquired_at = result.GetValue(7, row_index);
+	row.owner_heartbeat_at = result.GetValue(8, row_index);
+	row.lease_interval_seconds = result.GetValue(9, row_index).GetValue<int64_t>();
 	return row;
 }
 
 std::string ConsumerRowProjection() {
-	return "consumer_name, consumer_kind, consumer_id, last_committed_snapshot, last_committed_schema_version, "
-	       "owner_token, "
-	       "owner_acquired_at, owner_heartbeat_at, lease_interval_seconds, stop_at_schema_change";
+	return "consumer_name, consumer_kind, consumer_id, table_id, last_committed_snapshot, "
+	       "last_committed_schema_version, owner_token, owner_acquired_at, owner_heartbeat_at, "
+	       "lease_interval_seconds";
 }
 
 enum class StateBackendKind { DuckDB, SQLite, Postgres, Unknown };
@@ -353,13 +352,18 @@ struct ConsumerCreateData : public duckdb::TableFunctionData {
 	std::string consumer_name;
 	std::string consumer_kind;
 	std::string start_at;
+	// DDL-only scope inputs (lists of identifiers — DDL consumers
+	// natively scope across multiple schemas/tables).
 	duckdb::Value schemas;
 	duckdb::Value schema_ids;
 	duckdb::Value table_names;
 	duckdb::Value table_ids;
+	// DML-only scope inputs (one DML consumer = one table). Exactly one
+	// of {table_name, table_id} must be set on cdc_dml_consumer_create.
+	duckdb::Value table_name;
+	duckdb::Value table_id;
 	duckdb::Value change_types;
 	duckdb::Value metadata;
-	bool stop_at_schema_change = false;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<ConsumerCreateData>();
@@ -371,9 +375,10 @@ struct ConsumerCreateData : public duckdb::TableFunctionData {
 		result->schema_ids = schema_ids;
 		result->table_names = table_names;
 		result->table_ids = table_ids;
+		result->table_name = table_name;
+		result->table_id = table_id;
 		result->change_types = change_types;
 		result->metadata = metadata;
-		result->stop_at_schema_change = stop_at_schema_change;
 		return std::move(result);
 	}
 
@@ -460,10 +465,21 @@ duckdb::unique_ptr<duckdb::FunctionData> DmlConsumerCreateBind(duckdb::ClientCon
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->consumer_kind = "dml";
 	result->start_at = StartAtParameter(input);
-	result->table_names = NamedParameterValue(input, "table_names");
-	result->table_ids = NamedParameterValue(input, "table_ids");
+	// One DML consumer = one table. We accept either `table_name` or
+	// `table_id` so callers can pin to identity (id) or convenience
+	// (name); both being set is a configuration error.
+	result->table_name = NamedParameterValue(input, "table_name");
+	result->table_id = NamedParameterValue(input, "table_id");
 	result->change_types = NamedParameterValue(input, "change_types");
 	result->metadata = NamedParameterValue(input, "metadata");
+	if (!result->table_name.IsNull() && !result->table_id.IsNull()) {
+		throw duckdb::InvalidInputException(
+		    "cdc_dml_consumer_create: pass exactly one of `table_name` or `table_id`, not both");
+	}
+	if (result->table_name.IsNull() && result->table_id.IsNull()) {
+		throw duckdb::InvalidInputException(
+		    "cdc_dml_consumer_create: requires `table_name` or `table_id` (one DML consumer = one table)");
+	}
 	ConsumerCreateReturnTypes(return_types, names);
 	return std::move(result);
 }
@@ -629,38 +645,37 @@ void AddResolvedSubscription(std::vector<ResolvedSubscriptionInput> &out, const 
 	out.push_back(std::move(sub));
 }
 
+//! Resolve the single table identity that a DML consumer is being pinned
+//! to, fan out one base subscription per requested change_type. Bind has
+//! already enforced that exactly one of `data.table_name` /
+//! `data.table_id` is set; this function just turns identity inputs into
+//! `(schema_id, table_id, current qualified name)` and emits the
+//! per-change-type subscription rows.
 std::vector<ResolvedSubscriptionInput> ResolveDmlCreateSubscriptions(duckdb::Connection &conn,
                                                                      const std::string &catalog_name,
                                                                      const ConsumerCreateData &data,
                                                                      int64_t snapshot_id) {
-	std::vector<ResolvedSubscriptionInput> out;
 	const auto change_types = DmlChangeTypeList(data.change_types);
-	for (const auto &table_name : StringListParameter(data.table_names)) {
-		const auto qualified = QualifyTableInput(table_name, duckdb::Value());
-		int64_t schema_id = 0;
-		int64_t table_id = 0;
-		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
-			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live", qualified);
-		}
-		for (const auto &change_type : change_types) {
-			AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id),
-			                        "dml", change_type, duckdb::Value(qualified));
-		}
-	}
-	for (const auto &table_id : Int64ListParameter(data.table_ids)) {
-		int64_t schema_id = 0;
-		std::string current_name;
-		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, current_name)) {
+	int64_t schema_id = 0;
+	int64_t table_id = 0;
+	std::string qualified;
+	if (!data.table_id.IsNull()) {
+		table_id = data.table_id.GetValue<int64_t>();
+		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, qualified)) {
 			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
 			                                    static_cast<long long>(table_id));
 		}
-		for (const auto &change_type : change_types) {
-			AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id),
-			                        "dml", change_type, duckdb::Value(current_name));
+	} else {
+		qualified = QualifyTableInput(data.table_name.GetValue<std::string>(), duckdb::Value());
+		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
+			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live", qualified);
 		}
 	}
-	if (out.empty()) {
-		throw duckdb::InvalidInputException("cdc_dml_consumer_create requires table_names or table_ids");
+	std::vector<ResolvedSubscriptionInput> out;
+	out.reserve(change_types.size());
+	for (const auto &change_type : change_types) {
+		AddResolvedSubscription(out, "table", duckdb::Value::BIGINT(schema_id), duckdb::Value::BIGINT(table_id), "dml",
+		                        change_type, duckdb::Value(qualified));
 	}
 	return out;
 }
@@ -744,7 +759,6 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 	details << "{\"consumer_kind\":\"" << JsonEscape(data.consumer_kind) << "\",\"start_at\":\""
 	        << JsonEscape(data.start_at) << "\",\"start_at_resolved_snapshot\":" << resolved_snapshot;
 	details << ",\"subscriptions\":" << SubscriptionJsonArray(subscriptions);
-	details << ",\"stop_at_schema_change\":" << (data.stop_at_schema_change ? "true" : "false");
 	details << "}";
 
 	try {
@@ -757,15 +771,23 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		}
 		auto next_id_result = conn.Query("SELECT COALESCE(MAX(consumer_id), 0) + 1 FROM " + consumers);
 		int64_t consumer_id = SingleInt64(*next_id_result, "next consumer_id");
+		// Pin the single subscribed table_id on the consumer row for DML
+		// consumers (subscriptions[0] is the canonical entry — multiple
+		// rows may exist when filtering specific change_types, but they
+		// all share the same table_id by construction). DDL consumers
+		// store NULL.
+		std::string table_id_sql = "NULL";
+		if (data.consumer_kind == "dml" && !subscriptions.empty() && !subscriptions.front().table_id.IsNull()) {
+			table_id_sql = subscriptions.front().table_id.ToString();
+		}
 		ExecuteChecked(conn, "INSERT INTO " + consumers +
-		                         " (consumer_name, consumer_kind, consumer_id, last_committed_snapshot, "
+		                         " (consumer_name, consumer_kind, consumer_id, table_id, last_committed_snapshot, "
 		                         "last_committed_schema_version, created_at, created_by, updated_at, "
-		                         "lease_interval_seconds, stop_at_schema_change, metadata) VALUES (" +
+		                         "lease_interval_seconds, metadata) VALUES (" +
 		                         quoted_name + ", " + QuoteLiteral(data.consumer_kind) + ", " +
-		                         std::to_string(consumer_id) + ", " + std::to_string(resolved_snapshot) + ", " +
-		                         std::to_string(schema_version) + ", now(), " + actor_sql + ", now(), 60, " +
-		                         (data.stop_at_schema_change ? "TRUE" : "FALSE") + ", " + JsonValue(data.metadata) +
-		                         ")");
+		                         std::to_string(consumer_id) + ", " + table_id_sql + ", " +
+		                         std::to_string(resolved_snapshot) + ", " + std::to_string(schema_version) +
+		                         ", now(), " + actor_sql + ", now(), 60, " + JsonValue(data.metadata) + ")");
 		for (size_t i = 0; i < subscriptions.size(); ++i) {
 			const auto &sub = subscriptions[i];
 			ExecuteChecked(conn, "INSERT INTO " + subscriptions_table +
@@ -1068,9 +1090,11 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcWindowBind(duckdb::ClientContext &co
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->max_snapshots = MaxSnapshotsParameter(input);
 
-	names = {"start_snapshot", "end_snapshot", "has_changes", "schema_version", "schema_changes_pending"};
-	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN,
-	                duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
+	names = {"start_snapshot",         "end_snapshot", "has_changes",         "schema_version",
+	         "schema_changes_pending", "terminal",     "terminal_at_snapshot"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT,  duckdb::LogicalType::BOOLEAN,
+	                duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN, duckdb::LogicalType::BOOLEAN,
+	                duckdb::LogicalType::BIGINT};
 	return std::move(result);
 }
 
@@ -1940,16 +1964,22 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListenWaitInit(duckdb::Clie
 //===--------------------------------------------------------------------===//
 
 void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duckdb::vector<duckdb::string> &names) {
+	// `table_id` and `table_name` are populated for DML consumers (one
+	// table per DML consumer, by contract) and NULL for DDL consumers.
+	// `table_name` is the *current* qualified name in the DuckLake
+	// catalog so an orchestrator never has to chase renames separately.
 	names = {"consumer_name",
 	         "consumer_kind",
 	         "consumer_id",
+	         "table_id",
+	         "table_name",
 	         "subscription_count",
 	         "subscriptions_active",
 	         "subscriptions_renamed",
 	         "subscriptions_dropped",
-	         "stop_at_schema_change",
 	         "last_committed_snapshot",
 	         "last_committed_schema_version",
+	         "terminal_at_snapshot",
 	         "owner_token",
 	         "owner_acquired_at",
 	         "owner_heartbeat_at",
@@ -1960,11 +1990,12 @@ void ConsumerListReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, 
 	         "metadata"};
 	return_types = {
 	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::BIGINT,
 	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BOOLEAN,      duckdb::LogicalType::BIGINT,
-	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ,
-	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ,
-	    duckdb::LogicalType::VARCHAR,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
+	    duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,       duckdb::LogicalType::BIGINT,
+	    duckdb::LogicalType::UUID,         duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::TIMESTAMP_TZ,
+	    duckdb::LogicalType::INTEGER,      duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR,
+	    duckdb::LogicalType::TIMESTAMP_TZ, duckdb::LogicalType::VARCHAR};
 }
 
 struct ConsumerListData : public duckdb::TableFunctionData {
@@ -2002,7 +2033,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
-	auto query = "SELECT consumer_name, consumer_kind, consumer_id, stop_at_schema_change, "
+	// SELECT order:
+	//   0 consumer_name, 1 consumer_kind, 2 consumer_id, 3 table_id,
+	//   4 last_committed_snapshot, 5 last_committed_schema_version,
+	//   6 owner_token, 7 owner_acquired_at, 8 owner_heartbeat_at,
+	//   9 lease_interval_seconds, 10 created_at, 11 created_by,
+	//   12 updated_at, 13 metadata.
+	auto query = "SELECT consumer_name, consumer_kind, consumer_id, table_id, "
 	             "last_committed_snapshot, last_committed_schema_version, owner_token, owner_acquired_at, "
 	             "owner_heartbeat_at, lease_interval_seconds, created_at, created_by, updated_at, metadata FROM " +
 	             StateTable(conn, data.catalog_name, CONSUMERS_TABLE) + " ORDER BY consumer_id ASC";
@@ -2010,8 +2047,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 	if (!query_result || query_result->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, query_result ? query_result->GetError() : query);
 	}
+	int64_t current_snapshot = -1;
 	for (duckdb::idx_t row_idx = 0; row_idx < query_result->RowCount(); ++row_idx) {
 		const auto consumer_name = query_result->GetValue(0, row_idx).ToString();
+		const auto consumer_kind = query_result->GetValue(1, row_idx).ToString();
+		const auto table_id_value = query_result->GetValue(3, row_idx);
+		const auto last_committed_value = query_result->GetValue(4, row_idx);
+		const int64_t last_committed_snapshot =
+		    last_committed_value.IsNull() ? -1 : last_committed_value.GetValue<int64_t>();
 		const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, consumer_name);
 		int64_t active = 0;
 		int64_t renamed = 0;
@@ -2025,18 +2068,51 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 				dropped++;
 			}
 		}
+		// Resolve the *current* qualified name for DML consumers'
+		// pinned table so the orchestrator never has to chase renames.
+		// Costs one catalog lookup per DML consumer; not on a hot path.
+		duckdb::Value table_name_value;
+		if (consumer_kind == "dml" && !table_id_value.IsNull()) {
+			if (current_snapshot < 0) {
+				current_snapshot = CurrentSnapshot(conn, data.catalog_name);
+			}
+			const auto qualified = CurrentQualifiedTableName(conn, data.catalog_name,
+			                                                 table_id_value.GetValue<int64_t>(), current_snapshot);
+			if (!qualified.empty()) {
+				table_name_value = duckdb::Value(qualified);
+			}
+		}
+		// terminal_at_snapshot is only meaningful for DML consumers and
+		// only when there is a pending shape boundary for the
+		// consumer's subscribed table. Compute lazily so DDL consumers
+		// (and DML consumers with no pending boundary) cost nothing.
+		duckdb::Value terminal_at_snapshot;
+		if (consumer_kind == "dml" && last_committed_snapshot >= 0) {
+			if (current_snapshot < 0) {
+				current_snapshot = CurrentSnapshot(conn, data.catalog_name);
+			}
+			const auto dml_subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, consumer_name);
+			const auto boundary = NextDmlSubscribedSchemaChangeSnapshot(
+			    conn, data.catalog_name, last_committed_snapshot, current_snapshot, dml_subscriptions);
+			if (boundary != -1) {
+				terminal_at_snapshot = duckdb::Value::BIGINT(boundary);
+			}
+		}
 		std::vector<duckdb::Value> row;
-		row.push_back(query_result->GetValue(0, row_idx));
-		row.push_back(query_result->GetValue(1, row_idx));
-		row.push_back(query_result->GetValue(2, row_idx));
+		row.push_back(query_result->GetValue(0, row_idx)); // consumer_name
+		row.push_back(query_result->GetValue(1, row_idx)); // consumer_kind
+		row.push_back(query_result->GetValue(2, row_idx)); // consumer_id
+		row.push_back(table_id_value);                     // table_id
+		row.push_back(table_name_value);                   // table_name
 		row.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(subscriptions.size())));
 		row.push_back(duckdb::Value::BIGINT(active));
 		row.push_back(duckdb::Value::BIGINT(renamed));
 		row.push_back(duckdb::Value::BIGINT(dropped));
-		for (duckdb::idx_t col_idx = 0; col_idx < query_result->ColumnCount(); ++col_idx) {
-			if (col_idx < 3) {
-				continue;
-			}
+		row.push_back(query_result->GetValue(4, row_idx)); // last_committed_snapshot
+		row.push_back(query_result->GetValue(5, row_idx)); // last_committed_schema_version
+		row.push_back(terminal_at_snapshot);
+		// Owner / lease / audit / metadata: SELECT cols 6..13.
+		for (duckdb::idx_t col_idx = 6; col_idx < query_result->ColumnCount(); ++col_idx) {
 			row.push_back(query_result->GetValue(col_idx, row_idx));
 		}
 		result->rows.push_back(std::move(row));
@@ -2280,7 +2356,18 @@ std::vector<ConsumerSubscriptionRow> LoadDmlConsumerSubscriptions(duckdb::Connec
 
 bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_t schema_id, int64_t table_id,
                              const std::string &event_category) {
-	if (subscription.status == "dropped" || subscription.event_category != event_category) {
+	// A "dropped" status means the table/schema no longer exists at HEAD,
+	// but the original subscription still applies for any pre-drop snapshot
+	// the consumer hasn't drained yet. We must NOT gate by `status` here:
+	// the schema-shape boundary detector caps the readable window strictly
+	// BEFORE the drop snapshot, so callers either:
+	//   - read a pre-drop snapshot (the subscription was active then), or
+	//   - try to read past the boundary (already rejected upstream by the
+	//     terminal cdc_window contract).
+	// Filtering "dropped" out here would orphan the still-drainable backlog
+	// of a terminated DML consumer (regression: see Rule 6 in
+	// `dml_schema_shape_pinning.test`).
+	if (subscription.event_category != event_category) {
 		return false;
 	}
 	if (subscription.scope_kind == "catalog") {
@@ -2314,7 +2401,11 @@ int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const st
 	if (dml_subscriptions.empty() || start_snapshot > current_snapshot) {
 		return -1;
 	}
+	// Collect both the subscribed `table_id`s and the subscriptions'
+	// `schema_id`s so we can also catch `dropped_schema:<id>` tokens that
+	// implicitly take a subscribed table down with them.
 	std::unordered_set<int64_t> subscribed_table_ids;
+	std::unordered_set<int64_t> subscribed_schema_ids;
 	for (const auto &subscription : dml_subscriptions) {
 		if (subscription.event_category != "dml" || subscription.scope_kind != "table") {
 			continue;
@@ -2323,6 +2414,9 @@ int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const st
 			continue;
 		}
 		subscribed_table_ids.insert(subscription.table_id.GetValue<int64_t>());
+		if (!subscription.schema_id.IsNull()) {
+			subscribed_schema_ids.insert(subscription.schema_id.GetValue<int64_t>());
+		}
 	}
 	if (subscribed_table_ids.empty()) {
 		return -1;
@@ -2334,6 +2428,20 @@ int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const st
 	if (!result || result->HasError()) {
 		return -1;
 	}
+	// DuckLake 1.0 token vocabulary (per the `ducklake_snapshot_changes`
+	// spec) reduces to three shape-affecting tokens for a DML consumer:
+	//   - `altered_table:<table_id>` — covers ALTER … ADD/DROP COLUMN and
+	//     ALTER … RENAME (renames are encoded as ALTER, not a separate
+	//     `renamed_table:` token).
+	//   - `dropped_table:<table_id>` — direct drop of a subscribed table.
+	//   - `dropped_schema:<schema_id>` — drop of a subscribed table's
+	//     containing schema. DROP SCHEMA … CASCADE in DuckLake also emits
+	//     per-table `dropped_table:<id>` tokens; matching the schema id
+	//     here keeps detection stable in case that decomposition ever
+	//     changes.
+	// `created_table` / `inserted_into_table` / `deleted_from_table` /
+	// `compacted_table` / view tokens / `created_schema` are NOT shape
+	// changes for the consumer's existing subscriptions and are skipped.
 	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
 		const auto snapshot_value = result->GetValue(0, i);
 		const auto changes_value = result->GetValue(1, i);
@@ -2343,10 +2451,18 @@ int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const st
 		const auto snapshot_id = snapshot_value.GetValue<int64_t>();
 		for (const auto &token : SplitListenChangeTokens(changes_value.ToString())) {
 			int64_t table_id = 0;
-			for (const auto &prefix : {"altered_table:", "dropped_table:"}) {
-				if (ParseListenTableIdToken(token, prefix, table_id) && subscribed_table_ids.count(table_id) > 0) {
-					return snapshot_id;
-				}
+			if (ParseListenTableIdToken(token, "altered_table:", table_id) &&
+			    subscribed_table_ids.count(table_id) > 0) {
+				return snapshot_id;
+			}
+			if (ParseListenTableIdToken(token, "dropped_table:", table_id) &&
+			    subscribed_table_ids.count(table_id) > 0) {
+				return snapshot_id;
+			}
+			int64_t schema_id = 0;
+			if (ParseListenTableIdToken(token, "dropped_schema:", schema_id) &&
+			    subscribed_schema_ids.count(schema_id) > 0) {
+				return snapshot_id;
 			}
 		}
 	}
@@ -2378,7 +2494,6 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		row = AcquireLease(conn, data.catalog_name, data.consumer_name, cached_token, backend);
 	}
 	const auto last_snapshot = row.last_committed_snapshot;
-	const auto stop_at_schema_change = row.stop_at_schema_change;
 	const auto consumer_kind = row.consumer_kind;
 	const auto owner_token = row.owner_token.ToString();
 	CacheToken(context, data.catalog_name, data.consumer_name, owner_token);
@@ -2403,55 +2518,61 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	auto schema_version = last_snapshot <= current_snapshot
 	                          ? RequiredInt64(resolved.last_schema_version, "schema_version")
 	                          : row.last_committed_schema_version;
+	const bool is_dml = consumer_kind == "dml";
 	// DML consumers are pinned to the schema shape of their subscribed
-	// tables. When the next snapshot in the visible range carries an
-	// `altered_table:<id>` or `dropped_table:<id>` token for a subscribed
-	// table_id, the window collapses unconditionally and the consumer is
+	// tables. The boundary detector flags an `altered_table:<id>`,
+	// `dropped_table:<id>`, or `dropped_schema:<id>` token in the visible
+	// range whose target intersects the consumer's subscriptions. When it
+	// fires, the window collapses unconditionally and the consumer is
 	// terminal: no more DML for the old shape, no advance possible.
-	// Catalog-wide DDL (other tables) does NOT terminate a DML consumer;
-	// the DML listen path auto-advances past those snapshots.
+	// Catalog-wide DDL on unsubscribed objects does NOT terminate a DML
+	// consumer; the DML listen path auto-advances past those snapshots.
 	int64_t dml_boundary_snapshot = -1;
-	if (consumer_kind == "dml" && first_snapshot != -1 && start_snapshot <= current_snapshot) {
+	if (is_dml && first_snapshot != -1 && start_snapshot <= current_snapshot) {
 		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 		dml_boundary_snapshot = NextDmlSubscribedSchemaChangeSnapshot(conn, data.catalog_name, last_snapshot,
 		                                                              current_snapshot, subscriptions);
 	}
 	if (first_snapshot != -1 && start_snapshot <= current_snapshot) {
 		schema_version = RequiredInt64(resolved.start_schema_version, "schema_version");
-		// `start_snapshot` itself can be a schema-change snapshot
-		// (e.g. a DDL consumer just committed past the previous boundary
-		// and is now reading the ALTER). The window includes it
-		// regardless of `stop_at_schema_change`; we only need to
-		// surface `schema_changes_pending = true` so callers know
-		// the window straddles a schema version transition.
-		if (resolved.start_is_schema_change) {
-			schema_changes_pending = true;
-		}
-		const auto next_schema_change = resolved.next_schema_change;
-		if (next_schema_change != -1 && next_schema_change <= end_snapshot) {
-			schema_changes_pending = true;
-			if (stop_at_schema_change) {
-				end_snapshot = next_schema_change - 1;
-			}
-			boundary_next_snapshot = next_schema_change;
-			boundary_next_schema_version = resolved.next_schema_change_schema_version;
-		}
-		if (dml_boundary_snapshot != -1) {
-			schema_changes_pending = true;
-			// Force the collapse, regardless of stop_at_schema_change. DML
-			// consumers don't get a knob here: a shape change for a
-			// subscribed table is always terminal.
-			if (dml_boundary_snapshot - 1 < end_snapshot) {
-				end_snapshot = dml_boundary_snapshot - 1;
-			}
-			if (boundary_next_snapshot == -1 || dml_boundary_snapshot < boundary_next_snapshot) {
+		if (is_dml) {
+			// DML consumers: schema_changes_pending strictly tracks
+			// shape changes for the consumer's subscribed tables.
+			// Catalog-wide DDL on unsubscribed objects is invisible
+			// here and the listen path auto-advances past it.
+			if (dml_boundary_snapshot != -1) {
+				schema_changes_pending = true;
+				if (dml_boundary_snapshot - 1 < end_snapshot) {
+					end_snapshot = dml_boundary_snapshot - 1;
+				}
 				boundary_next_snapshot = dml_boundary_snapshot;
 				boundary_next_schema_version =
 				    duckdb::Value::BIGINT(ResolveSchemaVersion(conn, data.catalog_name, dml_boundary_snapshot));
 			}
+		} else {
+			// DDL consumers: surface any catalog-wide schema-version
+			// transition in the visible range. The schema-change
+			// snapshot stays inside the window so the DDL events for
+			// the transition can be drained on the same call.
+			if (resolved.start_is_schema_change) {
+				schema_changes_pending = true;
+			}
+			const auto next_schema_change = resolved.next_schema_change;
+			if (next_schema_change != -1 && next_schema_change <= end_snapshot) {
+				schema_changes_pending = true;
+				boundary_next_snapshot = next_schema_change;
+				boundary_next_schema_version = resolved.next_schema_change_schema_version;
+			}
 		}
 	}
 	const bool has_changes = end_snapshot >= start_snapshot;
+	// `terminal` is the canonical "this DML consumer cannot advance any
+	// further on the current shape" signal. By construction it is only
+	// ever true for DML consumers: DDL consumers are designed to ride
+	// schema changes.
+	const bool terminal = is_dml && !has_changes && schema_changes_pending && dml_boundary_snapshot != -1;
+	const duckdb::Value terminal_at_snapshot =
+	    is_dml && dml_boundary_snapshot != -1 ? duckdb::Value::BIGINT(dml_boundary_snapshot) : duckdb::Value();
 	// docs/errors.md spells the notice as "window ends at snapshot N
 	// (schema_version X); the next snapshot is at schema_version Y".
 	// `schema_version` is the schema at `start_snapshot` (kept that
@@ -2472,9 +2593,13 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		                         end_schema_version_for_notice, boundary_next_snapshot,
 		                         RequiredInt64(boundary_next_schema_version, "schema_version"));
 	}
-	return {duckdb::Value::BIGINT(start_snapshot), duckdb::Value::BIGINT(end_snapshot),
-	        duckdb::Value::BOOLEAN(has_changes), duckdb::Value::BIGINT(schema_version),
-	        duckdb::Value::BOOLEAN(schema_changes_pending)};
+	return {duckdb::Value::BIGINT(start_snapshot),
+	        duckdb::Value::BIGINT(end_snapshot),
+	        duckdb::Value::BOOLEAN(has_changes),
+	        duckdb::Value::BIGINT(schema_version),
+	        duckdb::Value::BOOLEAN(schema_changes_pending),
+	        duckdb::Value::BOOLEAN(terminal),
+	        terminal_at_snapshot};
 }
 
 std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
@@ -2594,8 +2719,10 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 	    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 	    RowScanExecute, DmlConsumerCreateBind, ConsumerCreateInit);
 	dml_create_function.named_parameters["start_at"] = duckdb::LogicalType::VARCHAR;
-	dml_create_function.named_parameters["table_names"] = varchar_list;
-	dml_create_function.named_parameters["table_ids"] = bigint_list;
+	// Scalar (singular) — one DML consumer = one table. Pass exactly one
+	// of `table_name` or `table_id`; bind rejects both-set / neither-set.
+	dml_create_function.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
+	dml_create_function.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
 	dml_create_function.named_parameters["change_types"] = varchar_list;
 	dml_create_function.named_parameters["metadata"] = duckdb::LogicalType::VARCHAR;
 	loader.RegisterFunction(dml_create_function);

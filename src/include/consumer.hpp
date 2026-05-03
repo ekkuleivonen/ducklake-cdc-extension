@@ -25,19 +25,25 @@
 namespace duckdb_cdc {
 
 //! Single row from the `__ducklake_cdc_consumers` state table, normalised
-//! into typed fields. Routing intent lives in
-//! `__ducklake_cdc_consumer_subscriptions`, not on this row.
+//! into typed fields. Cross-cutting routing intent (schema_id, change_type
+//! filters, rename/drop status) lives in
+//! `__ducklake_cdc_consumer_subscriptions`. The single subscribed
+//! `table_id` is denormalised onto this row because every DML consumer
+//! has exactly one table — it lets `cdc_list_consumers` and the
+//! per-listen hot path resolve the table without a join.
 struct ConsumerRow {
 	std::string consumer_name;
 	std::string consumer_kind;
 	int64_t consumer_id;
+	//! Subscribed table_id. Populated for DML consumers (always exactly
+	//! one); always NULL for DDL consumers.
+	duckdb::Value table_id;
 	int64_t last_committed_snapshot;
 	int64_t last_committed_schema_version;
 	duckdb::Value owner_token;
 	duckdb::Value owner_acquired_at;
 	duckdb::Value owner_heartbeat_at;
 	int64_t lease_interval_seconds;
-	bool stop_at_schema_change = true;
 };
 
 //! One durable row from `__ducklake_cdc_consumer_subscriptions`.
@@ -95,10 +101,14 @@ std::vector<std::string> MatchingDmlChangeTypes(const std::vector<ConsumerSubscr
 //! Per-subscribed-table schema-shape boundary for DML consumers.
 //!
 //! Returns the first snapshot in `(start_snapshot, current_snapshot]` whose
-//! `changes_made` token list includes a shape-affecting DDL targeting any of
-//! `dml_subscriptions`' subscribed table_ids: `altered_table:<id>` or
-//! `dropped_table:<id>`. Renames are NOT shape-affecting here — DML
-//! subscriptions follow renames via the `renamed` status.
+//! `changes_made` token list includes a shape-affecting DDL touching any of
+//! `dml_subscriptions`' subscribed table_ids or schema_ids:
+//!   - `altered_table:<id>` for a subscribed table_id (covers ALTER … ADD/DROP
+//!     COLUMN and ALTER … RENAME — DuckLake encodes renames as ALTER per the
+//!     `ducklake_snapshot_changes` spec),
+//!   - `dropped_table:<id>` for a subscribed table_id,
+//!   - `dropped_schema:<id>` for a subscription's schema_id (DROP SCHEMA
+//!     CASCADE may bring the subscribed table down with it).
 //!
 //! Returns `-1` if no such snapshot exists in the range, or if the consumer
 //! has no table-scoped DML subscriptions.
@@ -118,12 +128,21 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input);
 
 //! Run the cdc_window state machine: reuse a fresh cached lease or
-//! acquire/extend the consumer's lease, compute the visible
-//! `[start_snapshot, end_snapshot]` range under the consumer's
-//! `stop_at_schema_change` policy, and emit a
-//! `CDC_SCHEMA_BOUNDARY` notice if the window straddles a DDL boundary.
-//! Returns the row payload `[start_snapshot, end_snapshot, has_changes,
-//! schema_version, schema_changes_pending]` callers can index directly.
+//! acquire/extend the consumer's lease and compute the visible
+//! `[start_snapshot, end_snapshot]` range. For DML consumers the range
+//! collapses at the first schema-shape boundary touching a subscribed
+//! table (terminal state). For DDL consumers the range always includes
+//! the schema-change snapshot itself; `schema_changes_pending` flags a
+//! catalog-wide schema change inside the range. Emits a
+//! `CDC_SCHEMA_BOUNDARY` notice when the window straddles a relevant
+//! schema-version transition.
+//!
+//! Returns the row payload
+//! `[start_snapshot, end_snapshot, has_changes, schema_version,
+//!   schema_changes_pending, terminal, terminal_at_snapshot]`
+//! callers can index directly. `terminal` is true only for DML consumers
+//! pinned at a subscribed-table boundary; `terminal_at_snapshot` is the
+//! snapshot id of the offending shape change (or NULL when not terminal).
 std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data);
 
 std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,

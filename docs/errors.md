@@ -43,11 +43,15 @@ extension knows how to read safely.
 
 ### `CDC_SCHEMA_TERMINATED`
 
-A DML consumer is pinned to the schema shape of its subscribed tables at
-creation time. The shape is the column set those tables have at the
-consumer's `last_committed_snapshot`. Once any subscribed table is
-altered or dropped, the consumer terminates: it stops returning DML and
-its cursor is parked at the snapshot before the schema change.
+A DML consumer is pinned to the schema shape of its subscribed table at
+creation time (one DML consumer = one table by contract). The shape is
+the column set the table has at the consumer's
+`last_committed_snapshot`. Once the subscribed table is altered,
+dropped, or has its containing schema dropped, the consumer terminates:
+it stops returning DML and its cursor is parked at the snapshot before
+the shape change. `cdc_window` reports the boundary on
+`terminal_at_snapshot` and flips `terminal = true` once the cursor is
+parked at `boundary - 1`.
 
 This error fires when a caller tries to drive the cursor past the boundary:
 
@@ -65,9 +69,15 @@ orchestration from a DDL consumer that surfaces the boundary event. See
 
 ### `CDC_SCHEMA_BOUNDARY`
 
-`cdc_window` returned a window with `schema_changes_pending = true`. Consumers
-that process both stream types should read/apply DDL with
+`cdc_window` returned a window that straddles a schema-version transition.
+For DDL consumers this means `schema_changes_pending = true` because a
+catalog-wide schema change exists in the visible range; consumers that
+process both stream types should read/apply DDL with
 `cdc_ddl_changes_read` before applying DML from the same snapshot range.
+For DML consumers it means a shape change for the *pinned* table is
+pending — the next `cdc_window` call past the boundary will return
+`terminal = true` and the consumer must be replaced (see
+`CDC_SCHEMA_TERMINATED`).
 
 ### `CDC_WAIT_TIMEOUT_CLAMPED`
 

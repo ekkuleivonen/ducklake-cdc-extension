@@ -308,13 +308,19 @@ bool LeaseIsAlive(duckdb::Connection &conn, const duckdb::Value &heartbeat, int6
 
 bool HasPendingSchemaBoundary(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &consumer,
                               int64_t current_snapshot) {
-	if (!consumer.stop_at_schema_change) {
-		return false;
-	}
 	const auto first_snapshot =
 	    FirstSnapshotAfter(conn, catalog_name, consumer.last_committed_snapshot, current_snapshot);
 	if (first_snapshot == -1) {
 		return false;
+	}
+	if (consumer.consumer_kind == "dml") {
+		// For DML consumers the boundary is scoped strictly to the
+		// consumer's subscribed tables. A catalog-wide schema change on
+		// some other table is not a doctor-level concern for this
+		// consumer (the listen path auto-advances past it).
+		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, catalog_name, consumer.consumer_name);
+		return NextDmlSubscribedSchemaChangeSnapshot(conn, catalog_name, consumer.last_committed_snapshot,
+		                                             current_snapshot, subscriptions) != -1;
 	}
 	if (SnapshotIsExternalSchemaChange(conn, catalog_name, first_snapshot)) {
 		return true;

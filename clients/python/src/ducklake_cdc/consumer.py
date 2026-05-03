@@ -1,14 +1,22 @@
-"""High-level DML consumer for the ducklake-cdc extension.
+"""High-level consumers for the ducklake-cdc extension.
 
-A :class:`DMLConsumer` is a context manager that owns the consumer's
-lifecycle: it creates (or attaches to) a durable consumer in the extension,
-opens its sinks, runs a sink-gated listen+deliver+commit loop, and closes
-the sinks on exit.
+This module exposes :class:`DMLConsumer` and :class:`DDLConsumer`. Both are
+context managers that own a consumer's lifecycle: they create (or attach to)
+a durable consumer in the extension, open the attached sinks, run a
+sink-gated listen+deliver+commit loop, and close the sinks on exit.
 
 The headline shape::
 
-    with DMLConsumer(lake, "orders", tables=["public.orders"], sinks=[StdoutDMLSink()]) as c:
+    with DMLConsumer(lake, "orders", table="public.orders", sinks=[...]) as c:
         c.run()
+
+DML consumers are pinned to exactly one table by contract — see
+``cdc_dml_consumer_create`` in the SQL extension. Multi-table fan-out is
+the orchestrator's job: spawn one :class:`DMLConsumer` per table and join
+downstream of the sinks. This keeps the schema-shape termination
+contract (``cdc_window.terminal``) crisp: if the pinned table's shape
+changes, that one consumer hard-stops and the orchestrator spawns a
+successor at the boundary snapshot.
 
 Sinks are the only output path. Returning from ``sink.write`` acks; raising
 nacks and the batch is left uncommitted (so it will be redelivered on the
@@ -20,76 +28,95 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import TracebackType
-from typing import Literal, TypeVar
+from typing import Any, Literal, Self, TypeVar
 
 from ducklake import DuckLake
-
-from ducklake_cdc.lowlevel import CDCClient, ChangeRow
-from ducklake_cdc.types import Change, DMLBatch, DMLSink, SinkContext
+from ducklake_cdc.lowlevel import (
+    CDCClient,
+    ChangeRow,
+    ConsumerListEntry,
+    SchemaChangeRow,
+)
+from ducklake_cdc.types import (
+    Change,
+    DDLBatch,
+    DDLSink,
+    DMLBatch,
+    DMLSink,
+    SchemaChange,
+    SinkContext,
+)
 
 T = TypeVar("T")
 
 OnExists = Literal["error", "use", "replace"]
+LeasePolicy = Literal["wait", "takeover", "error"]
 StartAt = str | int
 
 RetryPolicy = Callable[[Callable[[], object]], object]
 
 _LOG = logging.getLogger(__name__)
+_DEFAULT_LEASE_WAIT_TIMEOUT = 30.0
+_LEASE_WAIT_POLL_INTERVAL = 0.5
+_LEASE_FRESHNESS_GRACE_SECONDS = 5.0
 
 
-class DMLConsumer:
-    """Durable consumer for row-level DML changes.
+class _ConsumerBase:
+    """Shared lifecycle and run loop for DML and DDL consumers.
 
-    Construction is cheap — no SQL is issued. The ``with`` block does the
-    work: it creates or attaches to the consumer, opens sinks, and (on exit)
-    closes sinks.
+    The base is intentionally not parameterized over the batch / sink
+    types: mypy cannot pair two independent ``TypeVar``s the way we need
+    (DML batch ↔ DML sink, DDL batch ↔ DDL sink), so we keep the precise
+    typing on the public :class:`DMLConsumer` / :class:`DDLConsumer`
+    surface and use ``Any`` internally. Subclasses provide:
 
-    ``on_exists`` controls creation/attachment behavior:
-
-    - ``"use"`` (default): attach to an existing consumer if present, else
-      create. Filters are not changed.
-    - ``"error"``: fail if the consumer already exists.
-    - ``"replace"``: drop and recreate. Force-releases the lease first.
-
-    ``start_at`` accepts ``"now"``, ``"beginning"``, ``"oldest"``, or a
-    snapshot id. The consumer is created with ``start_at="now"`` and then
-    reset to the requested point — the SQL extension's reset accepts the
-    full vocabulary. ``start_at`` is ignored for ``on_exists="use"`` when
-    the consumer already exists, to avoid silently rewinding an existing
-    durable cursor.
+    - ``_kind`` (``"dml"`` or ``"ddl"``) for error messages.
+    - ``_create_consumer`` to call ``cdc_*_consumer_create``.
+    - ``_listen_op`` to call the appropriate ``cdc_*_changes_listen``.
+    - ``_build_batch`` to package raw rows into the batch type.
     """
+
+    _kind: str
 
     def __init__(
         self,
         lake: DuckLake,
         name: str,
         *,
-        tables: Sequence[str] | None = None,
-        change_types: Sequence[str] | None = None,
         start_at: StartAt = "now",
         on_exists: OnExists = "use",
-        sinks: Sequence[DMLSink] = (),
+        lease_policy: LeasePolicy = "wait",
+        lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
+        sinks: Sequence[Any] = (),
         client: CDCClient | None = None,
         retry: RetryPolicy | None = None,
     ) -> None:
         if not name:
-            raise ValueError("DMLConsumer requires a non-empty name")
+            raise ValueError(f"{type(self).__name__} requires a non-empty name")
         if not sinks:
             raise ValueError(
-                "DMLConsumer requires at least one sink — sinks are the only "
-                "output path. Pass StdoutDMLSink() if you just want to see "
+                f"{type(self).__name__} requires at least one sink — sinks are "
+                "the only output path. Pass a built-in sink (e.g. "
+                "StdoutDMLSink() or StdoutDDLSink()) if you just want to see "
                 "events."
             )
+        if lease_policy not in ("wait", "takeover", "error"):
+            raise ValueError(
+                f"lease_policy must be 'wait', 'takeover', or 'error'; "
+                f"got {lease_policy!r}"
+            )
+        if lease_wait_timeout < 0:
+            raise ValueError("lease_wait_timeout must be >= 0")
 
         self._lake = lake
         self._name = name
-        self._tables = list(tables) if tables else None
-        self._change_types = list(change_types) if change_types else None
         self._start_at = start_at
         self._on_exists = on_exists
-        self._sinks: list[DMLSink] = list(sinks)
+        self._lease_policy: LeasePolicy = lease_policy
+        self._lease_wait_timeout = lease_wait_timeout
+        self._sinks: list[Any] = list(sinks)
         self._client = client
         self._retry_policy = retry
         self._opened = False
@@ -102,15 +129,17 @@ class DMLConsumer:
     def client(self) -> CDCClient:
         if self._client is None:
             raise RuntimeError(
-                "DMLConsumer.client is only available inside a `with` block"
+                f"{type(self).__name__}.client is only available inside a "
+                "`with` block"
             )
         return self._client
 
-    def __enter__(self) -> DMLConsumer:
+    def __enter__(self) -> Self:
         if self._client is None:
             self._client = CDCClient(self._lake)
         try:
             self._setup_consumer()
+            self._apply_lease_policy()
             self._open_sinks()
             self._opened = True
         except BaseException:
@@ -193,17 +222,54 @@ class DMLConsumer:
         self._create_and_position(client)
 
     def _create_and_position(self, client: CDCClient) -> None:
-        client.cdc_dml_consumer_create(
-            self._name,
-            table_names=self._tables,
-            change_types=self._change_types,
-            start_at="now",
-        )
+        self._create_consumer(client)
         if self._start_at != "now":
             client.cdc_consumer_reset(self._name, to_snapshot=self._start_at)
 
+    def _apply_lease_policy(self) -> None:
+        """Resolve a held lease per ``lease_policy`` before listening.
+
+        ``replace`` already force-releases as part of `_setup_consumer`, so
+        the policy is effectively bypassed for that path; we still re-check
+        here in case a third party reacquired the lease in the gap.
+        """
+
+        client = self._require_client()
+        entry = self._lookup_consumer(client)
+        if entry is None or not _lease_is_alive(entry):
+            return
+
+        if self._lease_policy == "error":
+            raise RuntimeError(
+                f"consumer {self._name!r} is leased by {entry.owner_token} "
+                "and lease_policy='error' was requested"
+            )
+
+        if self._lease_policy == "takeover":
+            client.cdc_consumer_force_release(self._name)
+            return
+
+        deadline = time.monotonic() + self._lease_wait_timeout
+        while True:
+            entry = self._lookup_consumer(client)
+            if entry is None or not _lease_is_alive(entry):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out after {self._lease_wait_timeout:.1f}s waiting "
+                    f"for consumer {self._name!r} lease (held by "
+                    f"{entry.owner_token})"
+                )
+            time.sleep(_LEASE_WAIT_POLL_INTERVAL)
+
+    def _lookup_consumer(self, client: CDCClient) -> ConsumerListEntry | None:
+        for entry in client.cdc_list_consumers():
+            if entry.consumer_name == self._name:
+                return entry
+        return None
+
     def _open_sinks(self) -> None:
-        opened: list[DMLSink] = []
+        opened: list[Any] = []
         try:
             for sink in self._sinks:
                 sink.open()
@@ -223,39 +289,7 @@ class DMLConsumer:
             except Exception:
                 _LOG.exception("error closing sink %r", _sink_name(sink))
 
-    def _build_batch(self, rows: list[ChangeRow]) -> DMLBatch:
-        start = min(
-            row.start_snapshot if row.start_snapshot is not None else row.snapshot_id
-            for row in rows
-        )
-        end = max(
-            row.end_snapshot if row.end_snapshot is not None else row.snapshot_id
-            for row in rows
-        )
-        snapshot_ids = tuple(sorted({row.snapshot_id for row in rows}))
-        changes = tuple(
-            Change(
-                kind=row.change_type,
-                snapshot_id=row.snapshot_id,
-                table=row.table_name,
-                schema=row.schema_name,
-                rowid=row.rowid,
-                snapshot_time=row.snapshot_time,
-                values=row.values,
-            )
-            for row in rows
-        )
-        return DMLBatch(
-            consumer_name=self._name,
-            batch_id=DMLBatch.derive_batch_id(self._name, start, end),
-            start_snapshot=start,
-            end_snapshot=end,
-            snapshot_ids=snapshot_ids,
-            received_at=datetime.now(timezone.utc),
-            changes=changes,
-        )
-
-    def _deliver(self, batch: DMLBatch) -> None:
+    def _deliver(self, batch: Any) -> None:
         ctx = SinkContext(
             consumer_name=self._name,
             batch_id=batch.batch_id,
@@ -280,19 +314,6 @@ class DMLConsumer:
             return
         self._retry(lambda: client.cdc_consumer_heartbeat(self._name))
 
-    def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[ChangeRow]]:
-        client = self._require_client()
-        name = self._name
-
-        def operation() -> list[ChangeRow]:
-            return client.cdc_dml_changes_listen(
-                name,
-                timeout_ms=timeout_ms,
-                max_snapshots=max_snapshots,
-            )
-
-        return operation
-
     def _commit_op(self, snapshot: int) -> Callable[[], object]:
         client = self._require_client()
         name = self._name
@@ -310,13 +331,289 @@ class DMLConsumer:
     def _require_open(self) -> None:
         if not self._opened:
             raise RuntimeError(
-                "DMLConsumer.run() must be called inside a `with consumer:` block"
+                f"{type(self).__name__}.run() must be called inside a "
+                "`with consumer:` block"
             )
 
     def _require_client(self) -> CDCClient:
         if self._client is None:
-            raise RuntimeError("DMLConsumer client is not initialized; use `with consumer:`")
+            raise RuntimeError(
+                f"{type(self).__name__} client is not initialized; use "
+                "`with consumer:`"
+            )
         return self._client
+
+    def _create_consumer(self, client: CDCClient) -> None:
+        raise NotImplementedError
+
+    def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[Any]]:
+        raise NotImplementedError
+
+    def _build_batch(self, rows: list[Any]) -> Any:
+        raise NotImplementedError
+
+
+class DMLConsumer(_ConsumerBase):
+    """Durable consumer for row-level DML changes.
+
+    Construction is cheap — no SQL is issued. The ``with`` block does the
+    work: it creates or attaches to the consumer, opens sinks, and (on exit)
+    closes sinks.
+
+    ``on_exists`` controls creation/attachment behavior:
+
+    - ``"use"`` (default): attach to an existing consumer if present, else
+      create. Filters are not changed.
+    - ``"error"``: fail if the consumer already exists.
+    - ``"replace"``: drop and recreate. Force-releases the lease first.
+
+    ``start_at`` accepts ``"now"``, ``"beginning"``, ``"oldest"``, or a
+    snapshot id. The consumer is created with ``start_at="now"`` and then
+    reset to the requested point — the SQL extension's reset accepts the
+    full vocabulary. ``start_at`` is ignored for ``on_exists="use"`` when
+    the consumer already exists, to avoid silently rewinding an existing
+    durable cursor.
+
+    ``lease_policy`` controls how the consumer reconciles a lease that is
+    already held by someone else:
+
+    - ``"wait"`` (default): poll up to ``lease_wait_timeout`` seconds for
+      the holder to release. ``TimeoutError`` is raised on timeout.
+    - ``"takeover"``: force-release the existing lease.
+    - ``"error"``: raise immediately if a lease is held.
+    """
+
+    _kind = "dml"
+
+    def __init__(
+        self,
+        lake: DuckLake,
+        name: str,
+        *,
+        table: str | None = None,
+        table_id: int | None = None,
+        change_types: Sequence[str] | None = None,
+        start_at: StartAt = "now",
+        on_exists: OnExists = "use",
+        lease_policy: LeasePolicy = "wait",
+        lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
+        sinks: Sequence[DMLSink] = (),
+        client: CDCClient | None = None,
+        retry: RetryPolicy | None = None,
+    ) -> None:
+        # Run name / sinks / lease validation first via the base class, so
+        # callers see those (simpler) errors instead of the more specific
+        # "exactly one of table / table_id" message when they pass
+        # multiple invalid arguments at once.
+        super().__init__(
+            lake,
+            name,
+            start_at=start_at,
+            on_exists=on_exists,
+            lease_policy=lease_policy,
+            lease_wait_timeout=lease_wait_timeout,
+            sinks=sinks,
+            client=client,
+            retry=retry,
+        )
+        # The "exactly one of table / table_id" check is enforced by the
+        # SQL extension at create time; we mirror it here so the error
+        # surfaces before we open sinks (cheaper to fail-fast in the
+        # constructor than mid-`__enter__`).
+        if (table is None) == (table_id is None):
+            raise ValueError(
+                "DMLConsumer requires exactly one of table=… or table_id=… "
+                "(DML consumers are pinned to a single table)."
+            )
+        self._table = table
+        self._table_id = table_id
+        self._change_types = list(change_types) if change_types else None
+
+    def _create_consumer(self, client: CDCClient) -> None:
+        client.cdc_dml_consumer_create(
+            self._name,
+            table_name=self._table,
+            table_id=self._table_id,
+            change_types=self._change_types,
+            start_at="now",
+        )
+
+    def _listen_op(
+        self, timeout_ms: int, max_snapshots: int
+    ) -> Callable[[], list[ChangeRow]]:
+        client = self._require_client()
+        name = self._name
+
+        def operation() -> list[ChangeRow]:
+            return client.cdc_dml_changes_listen(
+                name,
+                timeout_ms=timeout_ms,
+                max_snapshots=max_snapshots,
+            )
+
+        return operation
+
+    def _build_batch(self, rows: list[ChangeRow]) -> DMLBatch:
+        start = min(
+            row.start_snapshot if row.start_snapshot is not None else row.snapshot_id
+            for row in rows
+        )
+        end = max(
+            row.end_snapshot if row.end_snapshot is not None else row.snapshot_id
+            for row in rows
+        )
+        snapshot_ids = tuple(sorted({row.snapshot_id for row in rows}))
+        changes = tuple(
+            Change(
+                kind=row.change_type,
+                snapshot_id=row.snapshot_id,
+                table=row.table_name,
+                table_id=row.table_id,
+                rowid=row.rowid,
+                snapshot_time=row.snapshot_time,
+                values=row.values,
+            )
+            for row in rows
+        )
+        return DMLBatch(
+            consumer_name=self._name,
+            batch_id=DMLBatch.derive_batch_id(self._name, start, end),
+            start_snapshot=start,
+            end_snapshot=end,
+            snapshot_ids=snapshot_ids,
+            received_at=datetime.now(UTC),
+            changes=changes,
+        )
+
+
+class DDLConsumer(_ConsumerBase):
+    """Durable consumer for catalog/schema/table DDL events.
+
+    Mirrors :class:`DMLConsumer` but consumes :class:`SchemaChange` events
+    out of ``cdc_ddl_changes_listen``. Filters are scoped at construction
+    time:
+
+    - ``schemas=[...]`` — watch DDL for those schemas.
+    - ``tables=[...]`` — watch DDL touching those table identities.
+    - both omitted — watch all DDL for the catalog.
+
+    The ``on_exists``, ``start_at``, and ``lease_policy`` arguments behave
+    the same as on :class:`DMLConsumer`.
+    """
+
+    _kind = "ddl"
+
+    def __init__(
+        self,
+        lake: DuckLake,
+        name: str,
+        *,
+        schemas: Sequence[str] | None = None,
+        tables: Sequence[str] | None = None,
+        start_at: StartAt = "now",
+        on_exists: OnExists = "use",
+        lease_policy: LeasePolicy = "wait",
+        lease_wait_timeout: float = _DEFAULT_LEASE_WAIT_TIMEOUT,
+        sinks: Sequence[DDLSink] = (),
+        client: CDCClient | None = None,
+        retry: RetryPolicy | None = None,
+    ) -> None:
+        super().__init__(
+            lake,
+            name,
+            start_at=start_at,
+            on_exists=on_exists,
+            lease_policy=lease_policy,
+            lease_wait_timeout=lease_wait_timeout,
+            sinks=sinks,
+            client=client,
+            retry=retry,
+        )
+        self._schemas = list(schemas) if schemas else None
+        self._tables = list(tables) if tables else None
+
+    def _create_consumer(self, client: CDCClient) -> None:
+        client.cdc_ddl_consumer_create(
+            self._name,
+            schemas=self._schemas,
+            table_names=self._tables,
+            start_at="now",
+        )
+
+    def _listen_op(
+        self, timeout_ms: int, max_snapshots: int
+    ) -> Callable[[], list[SchemaChangeRow]]:
+        client = self._require_client()
+        name = self._name
+
+        def operation() -> list[SchemaChangeRow]:
+            return client.cdc_ddl_changes_listen(
+                name,
+                timeout_ms=timeout_ms,
+                max_snapshots=max_snapshots,
+            )
+
+        return operation
+
+    def _build_batch(self, rows: list[SchemaChangeRow]) -> DDLBatch:
+        start = min(
+            row.start_snapshot if row.start_snapshot is not None else row.snapshot_id
+            for row in rows
+        )
+        end = max(
+            row.end_snapshot if row.end_snapshot is not None else row.snapshot_id
+            for row in rows
+        )
+        snapshot_ids = tuple(sorted({row.snapshot_id for row in rows}))
+        changes = tuple(
+            SchemaChange(
+                event_kind=row.event_kind,
+                object_kind=row.object_kind,
+                snapshot_id=row.snapshot_id,
+                snapshot_time=row.snapshot_time,
+                schema_id=row.schema_id,
+                schema_name=row.schema_name,
+                object_id=row.object_id,
+                object_name=row.object_name,
+                details=row.details,
+            )
+            for row in rows
+        )
+        return DDLBatch(
+            consumer_name=self._name,
+            batch_id=DDLBatch.derive_batch_id(self._name, start, end),
+            start_snapshot=start,
+            end_snapshot=end,
+            snapshot_ids=snapshot_ids,
+            received_at=datetime.now(UTC),
+            changes=changes,
+        )
+
+
+def _lease_is_alive(entry: ConsumerListEntry) -> bool:
+    """Return ``True`` if the consumer entry still has a live lease holder.
+
+    A row with no ``owner_token`` was never leased (or just had the lease
+    cleared). When a token is present we look at the heartbeat: if the
+    catalog's most recent heartbeat is older than
+    ``lease_interval_seconds + grace`` we treat the lease as stale and let
+    the next listen call reacquire it without surprising the caller.
+    """
+
+    if entry.owner_token is None:
+        return False
+    if entry.owner_heartbeat_at is None:
+        return True
+
+    interval = entry.lease_interval_seconds or 0
+    grace = max(_LEASE_FRESHNESS_GRACE_SECONDS, float(interval) * 0.5)
+    cutoff_age = float(interval) + grace
+    now = datetime.now(UTC)
+    heartbeat = entry.owner_heartbeat_at
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=UTC)
+    age = (now - heartbeat).total_seconds()
+    return age <= cutoff_age
 
 
 def _sink_name(sink: object) -> str:
