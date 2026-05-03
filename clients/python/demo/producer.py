@@ -67,17 +67,19 @@ class Args:
     catalog: str | None
     catalog_backend: str | None
     storage: str | None
+    reset: bool
 
 
 def main() -> None:
     args = parse_args()
     rng = random.Random(RANDOM_SEED)
 
-    reset_demo_state(
-        catalog=args.catalog,
-        catalog_backend=args.catalog_backend,
-        storage=args.storage,
-    )
+    if args.reset:
+        reset_demo_state(
+            catalog=args.catalog,
+            catalog_backend=args.catalog_backend,
+            storage=args.storage,
+        )
 
     lake = open_demo_lake(
         catalog=args.catalog,
@@ -134,6 +136,15 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         "--storage",
         help=f"DuckLake storage path or URL; defaults to ${STORAGE_ENV} or demo/.work/demo_data",
     )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "drop the metadata catalog + storage tree before writing. Defaults "
+            "to off so a long-running consumer.py stays attached across "
+            "producer runs; use this only when you want a clean baseline."
+        ),
+    )
     namespace = parser.parse_args(argv)
     if namespace.batch_min > namespace.batch_max:
         parser.error("--batch_min must be <= --batch_max")
@@ -151,6 +162,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
         catalog=namespace.catalog,
         catalog_backend=namespace.catalog_backend,
         storage=namespace.storage,
+        reset=namespace.reset,
     )
 
 
@@ -162,11 +174,12 @@ def create_layout(lake: DuckLake, args: Args) -> list[TableRef]:
         for table_idx in range(args.tables):
             table = f"events_{table_idx + 1:02d}"
             ref = TableRef(schema=schema, table=table)
-            retry_sql(lake, f"DROP TABLE IF EXISTS {ref.qualified}")
+            # Idempotent so subsequent producer runs (without --reset)
+            # don't drop tables out from under a long-running consumer.
             retry_sql(
                 lake,
                 f"""
-                CREATE TABLE {ref.qualified} (
+                CREATE TABLE IF NOT EXISTS {ref.qualified} (
                     id INTEGER,
                     payload VARCHAR,
                     updated_count INTEGER,

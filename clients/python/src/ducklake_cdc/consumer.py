@@ -26,6 +26,7 @@ next listen call).
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -164,6 +165,7 @@ class _ConsumerBase:
         timeout_ms: int = 1_000,
         max_snapshots: int = 100,
         idle_timeout: float = 0.0,
+        stop_event: threading.Event | None = None,
     ) -> int:
         """Run the listen+deliver+commit loop.
 
@@ -173,6 +175,10 @@ class _ConsumerBase:
         - ``max_batches > 0`` and that many batches have been delivered.
         - ``idle_timeout > 0`` and that many seconds have passed without a
           non-empty batch.
+        - ``stop_event`` is set (cooperative shutdown for runtime hosts like
+          :class:`ducklake_cdc.CDCApp`). The flag is checked between listen
+          calls, so the listen ``timeout_ms`` is also the maximum delay
+          between a stop being requested and the loop returning.
         - ``KeyboardInterrupt`` (caller's responsibility to handle).
 
         Returns the number of batches delivered.
@@ -183,8 +189,12 @@ class _ConsumerBase:
         last_activity = time.monotonic()
 
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return delivered
             rows = self._retry(self._listen_op(timeout_ms, max_snapshots))
             if not rows:
+                if stop_event is not None and stop_event.is_set():
+                    return delivered
                 if not infinite:
                     return delivered
                 if idle_timeout > 0 and (time.monotonic() - last_activity) >= idle_timeout:

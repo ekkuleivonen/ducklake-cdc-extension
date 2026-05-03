@@ -144,9 +144,15 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input);
 //! pinned at a subscribed-table boundary; `terminal_at_snapshot` is the
 //! snapshot id of the offending shape change (or NULL when not terminal).
 std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data);
+std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                    const CdcWindowData &data);
 
 std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                   const std::string &consumer_name, int64_t snapshot_id);
+std::vector<duckdb::Value> CommitConsumerSnapshotWithConnection(duckdb::ClientContext &context,
+                                                                duckdb::Connection &conn,
+                                                                const std::string &catalog_name,
+                                                                const std::string &consumer_name, int64_t snapshot_id);
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                    const std::string &consumer_name, int64_t timeout_ms);
@@ -161,6 +167,10 @@ std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &con
 void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
                                  const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
                                  int64_t max_snapshots, int64_t first_matching_snapshot);
+void MaybeCoalesceConsumerListenWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                               const std::string &catalog_name, const std::string &consumer_name,
+                                               const std::string &stream_key, int64_t timeout_ms, int64_t max_snapshots,
+                                               int64_t first_matching_snapshot);
 
 //! Update process-local adaptive listen state. This state is only a performance
 //! hint; correctness remains entirely governed by cdc_window/cdc_commit.

@@ -1291,6 +1291,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	}
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	if (data.ticks) {
 		AppendDdlTickRows(conn, data.catalog_name, data.consumer_name, start_snapshot, end_snapshot, subscriptions,
 		                  nullptr, result->rows, true);
@@ -1478,6 +1479,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeDdlBind(duckdb::ClientContext &
 	result->table_ids = DdlInt64ListNamedParameter(input, "table_ids");
 	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	result->to_snapshot = RangeDdlToSnapshotParameter(conn, input, result->catalog_name, 2);
 	ValidateDdlRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot);
 
@@ -1494,6 +1496,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeDdlInit(duckdb::Cli
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcRangeDdlData>();
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	ExtractDdlRows(conn, data.catalog_name, data.from_snapshot, data.to_snapshot, std::string(), result->rows);
 	const auto filter = BuildDdlQueryFilter(conn, data);
 	ApplyDdlQueryFilter(result->rows, filter);
@@ -1516,6 +1519,7 @@ duckdb::unique_ptr<duckdb::FunctionData> DdlTicksQueryBind(duckdb::ClientContext
 	result->table_ids = DdlInt64ListNamedParameter(input, "table_ids");
 	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	result->to_snapshot = input.inputs.size() > 2 && !input.inputs[2].IsNull()
 	                          ? input.inputs[2].GetValue<int64_t>()
 	                          : CurrentSnapshot(conn, result->catalog_name);
@@ -1541,6 +1545,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DdlTicksQueryInit(duckdb::C
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcRangeDdlData>();
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const std::vector<ConsumerSubscriptionRow> no_subscriptions;
 	const auto filter = BuildDdlQueryFilter(conn, data);
 	const auto *filter_ptr = filter.Empty() ? nullptr : &filter;
@@ -1648,6 +1653,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 	auto &data = input.bind_data->Cast<CdcSchemaDiffData>();
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto target_ids =
 	    ResolveTableIdsForFilter(conn, data.catalog_name, data.table_filter, data.from_snapshot, data.to_snapshot);
 	if (target_ids.empty()) {

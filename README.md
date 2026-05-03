@@ -109,14 +109,14 @@ FROM cdc_ddl_changes_listen('lake', 'schema_watch', timeout_ms := 30000);
 
 ## Python
 
+Single consumer (DML consumers are pinned to a single table by contract):
+
 ```python
 from ducklake import DuckLake
 from ducklake_cdc import DMLConsumer, StdoutDMLSink
 
 lake = DuckLake("ducklake:my.ducklake", alias="lake")
 
-# DML consumers are pinned to a single table by contract. Spawn one
-# consumer per table; multi-table fan-out is the orchestrator's job.
 with DMLConsumer(
     lake,
     "orders_sink",
@@ -124,7 +124,26 @@ with DMLConsumer(
     change_types=["insert", "update_postimage", "delete"],
     sinks=[StdoutDMLSink()],
 ) as consumer:
-    consumer.run(infinite=False, timeout_ms=30_000)
+    consumer.run(infinite=True)
+```
+
+Multiple consumers in one process — `CDCApp` runs them concurrently with
+shared lifecycle and `SIGINT` / `SIGTERM` handling:
+
+```python
+from ducklake import DuckLake
+from ducklake_cdc import CDCApp, DMLConsumer, StdoutDMLSink
+
+lake = DuckLake("ducklake:my.ducklake", alias="lake")
+
+consumers = [
+    DMLConsumer(lake, f"sink_{table.name}", table=f"{table.schema_name}.{table.name}",
+                sinks=[StdoutDMLSink()])
+    for table in lake.tables()
+]
+
+with CDCApp(consumers=consumers) as app:
+    app.run(infinite=True)  # blocks until Ctrl+C; drains in-flight batches on exit
 ```
 
 For raw extension access, the low-level mirror lives at

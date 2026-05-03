@@ -19,6 +19,7 @@ listen + deliver + commit loop.
 """
 
 from ducklake_cdc._version import __version__
+from ducklake_cdc.app import CDCApp, ConsumerHealth
 from ducklake_cdc.combinators import (
     FanoutDDLSink,
     FanoutDMLSink,
@@ -65,8 +66,10 @@ __all__ = [
     "BaseDMLSink",
     "CallableDDLSink",
     "CallableDMLSink",
+    "CDCApp",
     "Change",
     "ChangeType",
+    "ConsumerHealth",
     "DDLBatch",
     "DDLConsumer",
     "DDLSink",

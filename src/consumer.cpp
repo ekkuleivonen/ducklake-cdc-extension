@@ -743,6 +743,7 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto subscriptions_table = StateTable(conn, data.catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE);
 	const auto quoted_name = QuoteLiteral(data.consumer_name);
@@ -922,6 +923,7 @@ std::vector<duckdb::Value> ResetConsumer(duckdb::ClientContext &context, const C
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	int64_t resolved_snapshot = ResolveResetSnapshot(conn, data.catalog_name, data.to_snapshot);
@@ -989,6 +991,7 @@ std::vector<duckdb::Value> DropConsumer(duckdb::ClientContext &context, const Co
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto subscriptions = StateTable(conn, data.catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
@@ -1051,6 +1054,7 @@ std::vector<duckdb::Value> ForceReleaseConsumer(duckdb::ClientContext &context, 
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	const auto details = "{\"previous_token\":" + JsonValue(row.owner_token) +
@@ -1515,10 +1519,10 @@ bool TryCommitPostgresNative(duckdb::Connection &conn, const std::string &catalo
 	return true;
 }
 
-std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
+std::vector<duckdb::Value> CommitWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                      const CdcCommitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 
-	duckdb::Connection conn(*context.db);
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	// Look up the consumer once before any UPDATE: the per-subscribed-table
@@ -1571,6 +1575,12 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	        duckdb::Value::BIGINT(schema_version)};
 }
 
+std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
+	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
+	return CommitWindowWithConnection(context, conn, data);
+}
+
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcCommitInit(duckdb::ClientContext &context,
                                                                    duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
@@ -1619,6 +1629,7 @@ std::vector<duckdb::Value> HeartbeatConsumer(duckdb::ClientContext &context, con
 	CheckCatalogOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
@@ -1946,6 +1957,7 @@ WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Con
 
 std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	return WaitForNextSnapshotWithSubscriptions(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
 	                                            subscriptions);
@@ -2033,6 +2045,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	// SELECT order:
 	//   0 consumer_name, 1 consumer_kind, 2 consumer_id, 3 table_id,
 	//   4 last_committed_snapshot, 5 last_committed_schema_version,
@@ -2179,6 +2192,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerSubscriptionsInit(d
 	CheckCatalogOrThrow(context, data.catalog_name);
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	for (const auto &sub : LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name)) {
 		result->rows.push_back({duckdb::Value(sub.consumer_name), duckdb::Value(sub.consumer_kind),
 		                        duckdb::Value::BIGINT(sub.consumer_id), duckdb::Value::BIGINT(sub.subscription_id),
@@ -2477,7 +2491,8 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 	return entry->second.GetValue<int64_t>();
 }
 
-std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data) {
+std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                    const CdcWindowData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 	if (data.max_snapshots > HARD_MAX_SNAPSHOTS) {
 		ThrowMaxSnapshotsExceeded(data.max_snapshots);
@@ -2486,7 +2501,6 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 		throw duckdb::InvalidInputException("cdc_window max_snapshots must be >= 1");
 	}
 
-	duckdb::Connection conn(*context.db);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	ConsumerRow row;
 	if (!TryUseFreshCachedLease(conn, data.catalog_name, data.consumer_name, cached_token, row)) {
@@ -2602,6 +2616,12 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	        terminal_at_snapshot};
 }
 
+std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcWindowData &data) {
+	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
+	return ReadWindowWithConnection(context, conn, data);
+}
+
 std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
                                                   const std::string &consumer_name, int64_t snapshot_id) {
 	CdcCommitData data;
@@ -2609,6 +2629,17 @@ std::vector<duckdb::Value> CommitConsumerSnapshot(duckdb::ClientContext &context
 	data.consumer_name = consumer_name;
 	data.snapshot_id = snapshot_id;
 	return CommitWindow(context, data);
+}
+
+std::vector<duckdb::Value> CommitConsumerSnapshotWithConnection(duckdb::ClientContext &context,
+                                                                duckdb::Connection &conn,
+                                                                const std::string &catalog_name,
+                                                                const std::string &consumer_name, int64_t snapshot_id) {
+	CdcCommitData data;
+	data.catalog_name = catalog_name;
+	data.consumer_name = consumer_name;
+	data.snapshot_id = snapshot_id;
+	return CommitWindowWithConnection(context, conn, data);
 }
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
@@ -2642,15 +2673,15 @@ int64_t AdaptiveListenDelayMs(const std::string &catalog_name, const std::string
 	return std::min<int64_t>(std::min<int64_t>(delay_ms, ADAPTIVE_LISTEN_MAX_COALESCE_MS), timeout_ms);
 }
 
-void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
-                                 const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
-                                 int64_t max_snapshots, int64_t first_matching_snapshot) {
+void MaybeCoalesceConsumerListenWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                               const std::string &catalog_name, const std::string &consumer_name,
+                                               const std::string &stream_key, int64_t timeout_ms, int64_t max_snapshots,
+                                               int64_t first_matching_snapshot) {
 	const auto coalesce_ms = AdaptiveListenDelayMs(catalog_name, consumer_name, stream_key, timeout_ms);
 	if (coalesce_ms <= 0 || max_snapshots <= 1 || first_matching_snapshot < 0) {
 		return;
 	}
 
-	duckdb::Connection conn(*context.db);
 	auto current_snapshot = CurrentSnapshot(conn, catalog_name);
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(coalesce_ms);
 	while (std::chrono::steady_clock::now() < deadline) {
@@ -2666,6 +2697,15 @@ void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::stri
 			current_snapshot = next_snapshot;
 		}
 	}
+}
+
+void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
+                                 const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
+                                 int64_t max_snapshots, int64_t first_matching_snapshot) {
+	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
+	MaybeCoalesceConsumerListenWithConnection(context, conn, catalog_name, consumer_name, stream_key, timeout_ms,
+	                                          max_snapshots, first_matching_snapshot);
 }
 
 void RecordConsumerListenResult(const std::string &catalog_name, const std::string &consumer_name,
