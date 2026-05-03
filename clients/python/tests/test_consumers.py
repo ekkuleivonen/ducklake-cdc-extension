@@ -19,7 +19,7 @@ from ducklake_cdc import (
     StdoutDDLSink,
     StdoutDMLSink,
 )
-from ducklake_cdc.consumer import _lease_is_alive
+from ducklake_cdc.consumer import _AdaptiveSnapshotWindow, _lease_is_alive
 from ducklake_cdc.lowlevel import ConsumerListEntry
 
 
@@ -144,6 +144,58 @@ def test_consumer_enter_applies_retry_policy_to_setup() -> None:
     assert attempts == 2
     assert client.list_calls == 3
     assert client.created == 1
+
+
+def test_adaptive_snapshot_window_starts_below_ceiling() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+
+    assert window.current == 8
+
+
+def test_adaptive_snapshot_window_grows_on_fast_full_window() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+
+    window.observe_batch(row_count=100, snapshot_span=8, listen_elapsed_ms=20.0)
+
+    assert window.current == 16
+
+
+def test_adaptive_snapshot_window_shrinks_on_slow_listen() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+    window.observe_batch(row_count=100, snapshot_span=8, listen_elapsed_ms=20.0)
+    assert window.current == 16
+
+    window.observe_batch(row_count=100, snapshot_span=16, listen_elapsed_ms=200.0)
+
+    assert window.current == 8
+
+
+def test_adaptive_snapshot_window_shrinks_on_very_large_batch() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+    window.observe_batch(row_count=100, snapshot_span=8, listen_elapsed_ms=20.0)
+    assert window.current == 16
+
+    window.observe_batch(row_count=12_000, snapshot_span=1, listen_elapsed_ms=20.0)
+
+    assert window.current == 8
+
+
+def test_adaptive_snapshot_window_does_not_shrink_on_typical_dense_batch() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+    window.observe_batch(row_count=100, snapshot_span=8, listen_elapsed_ms=20.0)
+    assert window.current == 16
+
+    window.observe_batch(row_count=900, snapshot_span=8, listen_elapsed_ms=20.0)
+
+    assert window.current == 16
+
+
+def test_adaptive_snapshot_window_shrinks_on_empty_listen() -> None:
+    window = _AdaptiveSnapshotWindow(100)
+
+    window.observe_empty()
+
+    assert window.current == 4
 
 
 def test_lease_is_alive_treats_missing_token_as_free() -> None:

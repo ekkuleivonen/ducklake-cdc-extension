@@ -863,13 +863,18 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 		where_clause << ")";
 	}
 
-	auto query =
-	    std::string("SELECT ") + column_list.str() +
-	    ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info FROM " +
-	    DuckLakeTableChangesCall(data.catalog_name, scan_table_name, start_snapshot, end_snapshot) + " tc LEFT JOIN " +
-	    MetadataTable(data.catalog_name, "ducklake_snapshot") + " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
-	    MetadataTable(data.catalog_name, "ducklake_snapshot_changes") + " c ON c.snapshot_id = tc.snapshot_id" +
-	    where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
+	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
+	const auto changes_table = MetadataTable(data.catalog_name, "ducklake_snapshot_changes");
+	auto query = std::string("WITH tc AS MATERIALIZED (SELECT * FROM ") +
+	             DuckLakeTableChangesCall(data.catalog_name, scan_table_name, start_snapshot, end_snapshot) +
+	             "), snapshot_meta AS MATERIALIZED ("
+	             "SELECT ids.snapshot_id, s.snapshot_time, c.author, c.commit_message, c.commit_extra_info "
+	             "FROM (SELECT DISTINCT snapshot_id FROM tc) ids LEFT JOIN " +
+	             snapshot_table + " s ON s.snapshot_id = ids.snapshot_id LEFT JOIN " + changes_table +
+	             " c ON c.snapshot_id = ids.snapshot_id) SELECT " + column_list.str() +
+	             ", sm.snapshot_time, sm.author, sm.commit_message, sm.commit_extra_info FROM tc LEFT JOIN "
+	             "snapshot_meta sm ON sm.snapshot_id = tc.snapshot_id" +
+	             where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,

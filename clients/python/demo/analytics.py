@@ -64,6 +64,8 @@ class DemoStats:
     dml_build_batch_ms: list[float] = field(default_factory=list)
     dml_sink_ms: list[float] = field(default_factory=list)
     dml_commit_ms: list[float] = field(default_factory=list)
+    dml_snapshot_spans: list[int] = field(default_factory=list)
+    dml_listen_max_snapshots: list[int] = field(default_factory=list)
     delivered_batches: int = 0
     consumed_changes: int = 0
     rows_per_batch: list[int] = field(default_factory=list)
@@ -130,14 +132,18 @@ class DemoStats:
         # call sites.
         return None
 
-    def record_dml_listen(self, *, elapsed_ms: float, row_count: int) -> None:
+    def record_dml_listen(
+        self, *, elapsed_ms: float, row_count: int, max_snapshots: int
+    ) -> None:
+        self.dml_listen_max_snapshots.append(max_snapshots)
         if row_count > 0:
             self.dml_listen_nonempty_ms.append(elapsed_ms)
         else:
             self.dml_listen_empty_ms.append(elapsed_ms)
 
-    def record_dml_build_batch(self, *, elapsed_ms: float) -> None:
+    def record_dml_build_batch(self, *, elapsed_ms: float, snapshot_span: int) -> None:
         self.dml_build_batch_ms.append(elapsed_ms)
+        self.dml_snapshot_spans.append(snapshot_span)
 
     def record_dml_sink(self, *, elapsed_ms: float) -> None:
         self.dml_sink_ms.append(elapsed_ms)
@@ -239,6 +245,12 @@ class DemoStats:
             "dml_build_batch_ms": metric_summary(self.dml_build_batch_ms).to_json(),
             "dml_sink_ms": metric_summary(self.dml_sink_ms).to_json(),
             "dml_commit_ms": metric_summary(self.dml_commit_ms).to_json(),
+            "dml_snapshot_span": metric_summary(
+                [float(span) for span in self.dml_snapshot_spans]
+            ).to_json(),
+            "dml_listen_max_snapshots": metric_summary(
+                [float(value) for value in self.dml_listen_max_snapshots]
+            ).to_json(),
             "rows_per_batch": metric_summary(
                 [float(count) for count in self.rows_per_batch]
             ).to_json(),
@@ -487,6 +499,31 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
                 "consumer_listen_ms_p95",
                 format_float(listen_nonempty["p95"]),
                 "extension listen/read + Python row fetch for non-empty windows",
+            )
+        )
+    snapshot_span = summary.get("dml_snapshot_span")
+    if _has_observations(snapshot_span):
+        pipeline.append(
+            (
+                "consumer_snapshot_span_p95",
+                format_float(snapshot_span["p95"]),
+                "snapshots coalesced per delivered DML batch",
+            )
+        )
+        pipeline.append(
+            (
+                "consumer_snapshot_span_max",
+                format_float(snapshot_span["max"]),
+                "largest DML snapshot window delivered",
+            )
+        )
+    listen_max_snapshots = summary.get("dml_listen_max_snapshots")
+    if _has_observations(listen_max_snapshots):
+        pipeline.append(
+            (
+                "consumer_listen_max_snapshots_p50",
+                format_float(listen_max_snapshots["p50"]),
+                "requested DML listen coalescing window",
             )
         )
     build_batch = summary.get("dml_build_batch_ms")

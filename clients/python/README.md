@@ -58,12 +58,18 @@ uv run python demo/producer.py --schemas 1 --tables 2 --inserts 1000
 ```
 
 By default the demo uses the included Postgres-backed DuckLake metadata
-catalog on `localhost:5435` plus local data files under `demo/.work/`.
-Start the demo catalog first:
+catalog through PgBouncer on `localhost:5435` plus local data files under
+`demo/.work/`. Start the demo catalog first:
 
 ```bash
 docker compose up -d --wait
 ```
+
+PgBouncer listens on `5435` for normal DuckLake traffic. Direct Postgres is
+also exposed on `5436` for local admin/reset operations; `consumer.py` uses
+that direct port when resetting the default catalog. If you override the
+catalog with `DUCKLAKE_DEMO_CATALOG`, set `DUCKLAKE_DEMO_CATALOG_ADMIN` when
+the reset path should use a different direct Postgres DSN.
 
 Use `--catalog-backend sqlite` (on either script) to opt into the local
 SQLite catalog. You can still override either process with
@@ -94,12 +100,14 @@ uv run python demo/producer.py \
 ```
 
 `consumer.py` discovers the lake's tables, builds one `DMLConsumer` per
-table, and runs them concurrently under a single `CDCApp`. On `Ctrl+C`
-(or `SIGTERM`) it drains the in-flight batch, prints a summary of
-throughput and end-to-end latency, and optionally writes the same
-summary as JSON via `--summary-output`. The only flags it accepts are
-infrastructure (`--catalog`, `--catalog-backend`, `--storage`) and
-`--summary-output` — there are no workload knobs on the consumer side.
+table, and runs them concurrently under a single `CDCApp`. Each DML
+consumer holds a dedicated DuckLake/DuckDB connection, so
+`--consumers-per-table 2` across 30 tables means roughly 61 long-lived
+connections including the DDL watcher. Use `--table-spawn-workers` to
+lower the startup burst when many tables appear at once. On `Ctrl+C`
+(or `SIGTERM`) the consumer drains the in-flight batch, prints a summary
+of throughput and end-to-end latency, and optionally writes the same
+summary as JSON via `--summary-output`.
 
 ```bash
 docker compose up -d --wait

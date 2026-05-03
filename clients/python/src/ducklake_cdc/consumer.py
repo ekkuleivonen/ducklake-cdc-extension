@@ -62,6 +62,47 @@ _LOG = logging.getLogger(__name__)
 _DEFAULT_LEASE_WAIT_TIMEOUT = 30.0
 _LEASE_WAIT_POLL_INTERVAL = 0.5
 _LEASE_FRESHNESS_GRACE_SECONDS = 5.0
+_ADAPTIVE_INITIAL_MAX_SNAPSHOTS = 8
+_ADAPTIVE_TARGET_ROWS = 2048
+_ADAPTIVE_TARGET_LISTEN_MS = 150.0
+_ADAPTIVE_FAST_LISTEN_MS = 75.0
+_ADAPTIVE_LARGE_BATCH_ROWS = 8192
+
+
+class _AdaptiveSnapshotWindow:
+    def __init__(self, ceiling: int) -> None:
+        self.ceiling = max(1, ceiling)
+        self.current = min(self.ceiling, _ADAPTIVE_INITIAL_MAX_SNAPSHOTS)
+
+    def observe_empty(self) -> None:
+        # Empty listens usually mean we are at head. Bias back toward
+        # low-latency single-snapshot reads until backlog appears again.
+        self.current = max(1, self.current // 2)
+
+    def observe_batch(
+        self,
+        *,
+        row_count: int,
+        snapshot_span: int,
+        listen_elapsed_ms: float,
+    ) -> None:
+        # Shrink only on *slow* reads or pathologically large single responses.
+        # Dense-but-normal batches (hundreds of rows per snapshot) must not
+        # force max_snapshots→1 every round, or fan-out workloads pay extra
+        # listen/commit trips with worse tail latency.
+        if (
+            listen_elapsed_ms >= _ADAPTIVE_TARGET_LISTEN_MS
+            or row_count >= _ADAPTIVE_LARGE_BATCH_ROWS
+        ):
+            self.current = max(1, self.current // 2)
+            return
+
+        if (
+            snapshot_span >= self.current
+            and row_count <= (_ADAPTIVE_TARGET_ROWS // 2)
+            and listen_elapsed_ms <= _ADAPTIVE_FAST_LISTEN_MS
+        ):
+            self.current = min(self.ceiling, max(self.current + 1, self.current * 2))
 
 
 class _ConsumerBase:
@@ -186,12 +227,24 @@ class _ConsumerBase:
         self._require_open()
         delivered = 0
         last_activity = time.monotonic()
+        adaptive_window = (
+            _AdaptiveSnapshotWindow(max_snapshots) if self._kind == "dml" else None
+        )
 
         while True:
             if stop_event is not None and stop_event.is_set():
                 return delivered
-            rows = self._retry(self._listen_op(timeout_ms, max_snapshots))
+            listen_max_snapshots = (
+                adaptive_window.current
+                if adaptive_window is not None
+                else max_snapshots
+            )
+            listen_started = time.perf_counter()
+            rows = self._retry(self._listen_op(timeout_ms, listen_max_snapshots))
+            listen_elapsed_ms = (time.perf_counter() - listen_started) * 1_000.0
             if not rows:
+                if adaptive_window is not None:
+                    adaptive_window.observe_empty()
                 if stop_event is not None and stop_event.is_set():
                     return delivered
                 if not infinite:
@@ -202,6 +255,12 @@ class _ConsumerBase:
 
             last_activity = time.monotonic()
             batch = self._build_batch(rows)
+            if adaptive_window is not None:
+                adaptive_window.observe_batch(
+                    row_count=len(rows),
+                    snapshot_span=max(1, batch.end_snapshot - batch.start_snapshot + 1),
+                    listen_elapsed_ms=listen_elapsed_ms,
+                )
             self._deliver(batch)
             self._retry(self._commit_op(batch.end_snapshot))
             delivered += 1

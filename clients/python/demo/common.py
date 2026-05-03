@@ -17,8 +17,10 @@ CATALOG_PATH = WORK_DIR / "demo.sqlite"
 DATA_PATH = WORK_DIR / "demo_data"
 LOCK_RETRY_SECONDS = 0.2
 CATALOG_ENV = "DUCKLAKE_DEMO_CATALOG"
+CATALOG_ADMIN_ENV = "DUCKLAKE_DEMO_CATALOG_ADMIN"
 STORAGE_ENV = "DUCKLAKE_DEMO_STORAGE"
 DEFAULT_POSTGRES_CATALOG = "postgresql://ducklake:ducklake@localhost:5435/ducklake"
+DEFAULT_POSTGRES_ADMIN_CATALOG = "postgresql://ducklake:ducklake@localhost:5436/ducklake"
 DEMO_PG_POOL_MAX_CONNECTIONS = 64
 T = TypeVar("T")
 
@@ -81,7 +83,7 @@ def reset_demo_catalog(*, catalog: str | SqliteCatalog) -> None:
         Path(catalog.path).unlink(missing_ok=True)
         return
     if _is_postgres_catalog(catalog):
-        reset_postgres_database(_strip_ducklake_postgres_prefix(catalog))
+        reset_postgres_database(_postgres_reset_dsn(catalog))
         return
     if catalog.startswith("sqlite://"):
         Path(urlsplit(catalog).path).unlink(missing_ok=True)
@@ -142,6 +144,17 @@ def _is_postgres_catalog(catalog: str) -> bool:
 
 def _strip_ducklake_postgres_prefix(catalog: str) -> str:
     return catalog.removeprefix("ducklake:postgres:")
+
+
+def _postgres_reset_dsn(catalog: str) -> str:
+    configured = environ.get(CATALOG_ADMIN_ENV)
+    if configured:
+        return _strip_ducklake_postgres_prefix(configured)
+
+    dsn = _strip_ducklake_postgres_prefix(catalog)
+    if dsn == DEFAULT_POSTGRES_CATALOG:
+        return DEFAULT_POSTGRES_ADMIN_CATALOG
+    return dsn
 
 
 def retry_on_lock(operation: Callable[[], T]) -> T:

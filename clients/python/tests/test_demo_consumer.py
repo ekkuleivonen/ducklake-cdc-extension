@@ -57,6 +57,7 @@ def test_table_spawn_sink_hot_adds_dml_consumers_for_new_tables(monkeypatch: Any
             catalog_backend=None,
             storage=None,
             consumers_per_table=1,
+            table_spawn_workers=demo_consumer.TABLE_SPAWN_MAX_WORKERS,
         ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=consumer_lakes,
@@ -123,6 +124,7 @@ def test_table_spawn_sink_can_attach_existing_tables_by_name(monkeypatch: Any) -
             catalog_backend=None,
             storage=None,
             consumers_per_table=1,
+            table_spawn_workers=demo_consumer.TABLE_SPAWN_MAX_WORKERS,
         ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
@@ -162,6 +164,7 @@ def test_table_spawn_sink_adds_multiple_consumers_per_table(monkeypatch: Any) ->
             catalog_backend=None,
             storage=None,
             consumers_per_table=3,
+            table_spawn_workers=demo_consumer.TABLE_SPAWN_MAX_WORKERS,
         ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
@@ -205,6 +208,7 @@ def test_table_spawn_sink_hot_adds_multiple_consumers_from_ddl(
             catalog_backend=None,
             storage=None,
             consumers_per_table=4,
+            table_spawn_workers=demo_consumer.TABLE_SPAWN_MAX_WORKERS,
         ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
@@ -270,6 +274,7 @@ def test_table_spawn_sink_retries_transient_add_failures(monkeypatch: Any) -> No
             catalog_backend=None,
             storage=None,
             consumers_per_table=1,
+            table_spawn_workers=demo_consumer.TABLE_SPAWN_MAX_WORKERS,
         ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
@@ -291,18 +296,23 @@ def test_parse_args_defaults_to_one_consumer_per_table() -> None:
     args = demo_consumer.parse_args([])
 
     assert args.consumers_per_table == 1
+    assert args.table_spawn_workers == demo_consumer.TABLE_SPAWN_MAX_WORKERS
 
 
 def test_parse_args_accepts_consumers_per_table() -> None:
-    args = demo_consumer.parse_args(["--consumers-per-table", "4"])
+    args = demo_consumer.parse_args(
+        ["--consumers-per-table", "4", "--table-spawn-workers", "2"]
+    )
 
     assert args.consumers_per_table == 4
+    assert args.table_spawn_workers == 2
 
 
 def test_spawn_worker_count_is_capped() -> None:
-    assert demo_consumer._spawn_worker_count(1) == 1
-    assert demo_consumer._spawn_worker_count(3) == 3
-    assert demo_consumer._spawn_worker_count(20) == 4
+    assert demo_consumer._spawn_worker_count(1, 4) == 1
+    assert demo_consumer._spawn_worker_count(3, 4) == 3
+    assert demo_consumer._spawn_worker_count(20, 4) == 4
+    assert demo_consumer._spawn_worker_count(20, 1) == 1
 
 
 def _wait_for(predicate: Any, *, timeout: float = 1.0) -> None:

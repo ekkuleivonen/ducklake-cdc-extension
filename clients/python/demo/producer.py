@@ -140,6 +140,8 @@ def main() -> None:
                 f"({args.inserts} inserts/table)",
                 flush=True,
             )
+        if args.workers > 1:
+            lake.close()
         run_batches(lake, batches, args)
     finally:
         lake.close()

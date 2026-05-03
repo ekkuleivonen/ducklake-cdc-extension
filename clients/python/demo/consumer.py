@@ -141,12 +141,20 @@ class _StatsSink(BaseDMLSink):
 class _TimedDMLConsumer(DMLConsumer):
     """Demo-only DML consumer that records pipeline timing by stage."""
 
-    def __init__(self, *args: Any, stats: DemoStats, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        stats: DemoStats,
+        fixed_max_snapshots: int | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._demo_stats = stats
+        self._fixed_max_snapshots = fixed_max_snapshots
 
     def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[Any]]:
-        operation = super()._listen_op(timeout_ms, max_snapshots)
+        effective_max_snapshots = self._fixed_max_snapshots or max_snapshots
+        operation = super()._listen_op(timeout_ms, effective_max_snapshots)
 
         def timed_operation() -> list[Any]:
             start_ns = time.monotonic_ns()
@@ -154,6 +162,7 @@ class _TimedDMLConsumer(DMLConsumer):
             self._demo_stats.record_dml_listen(
                 elapsed_ms=_elapsed_ms_since(start_ns),
                 row_count=len(rows),
+                max_snapshots=effective_max_snapshots,
             )
             return rows
 
@@ -162,7 +171,10 @@ class _TimedDMLConsumer(DMLConsumer):
     def _build_batch(self, rows: list[Any]) -> DMLBatch:
         start_ns = time.monotonic_ns()
         batch = super()._build_batch(rows)
-        self._demo_stats.record_dml_build_batch(elapsed_ms=_elapsed_ms_since(start_ns))
+        self._demo_stats.record_dml_build_batch(
+            elapsed_ms=_elapsed_ms_since(start_ns),
+            snapshot_span=max(1, batch.end_snapshot - batch.start_snapshot + 1),
+        )
         return batch
 
     def _deliver(self, batch: Any) -> None:
@@ -213,7 +225,10 @@ class _TableSpawnSink(BaseDDLSink):
 
     def open(self) -> None:
         self._stop_event.clear()
-        worker_count = _spawn_worker_count(self._args.consumers_per_table)
+        worker_count = _spawn_worker_count(
+            self._args.consumers_per_table,
+            self._args.table_spawn_workers,
+        )
         self._threads = [
             threading.Thread(
                 target=self._run_spawn_loop,
@@ -366,6 +381,11 @@ class _TableSpawnSink(BaseDDLSink):
                 sinks=[_StatsSink(self._stats)],
                 retry=retry_on_lock,
                 stats=self._stats,
+                fixed_max_snapshots=(
+                    getattr(self._args, "max_snapshots", 100)
+                    if getattr(self._args, "fixed_max_snapshots", False)
+                    else None
+                ),
                 **table_filter,
             )
             self._app.add_consumer(consumer)
@@ -432,6 +452,7 @@ def main() -> None:
             # up on process exit.
             app = CDCApp(
                 listen_timeout_ms=200,
+                max_snapshots=args.max_snapshots,
                 shutdown_timeout=2.0,
             )
             progress_thread = threading.Thread(
@@ -560,8 +581,8 @@ def _elapsed_ms_since(start_ns: int) -> float:
     return (time.monotonic_ns() - start_ns) / 1_000_000.0
 
 
-def _spawn_worker_count(consumers_per_table: int) -> int:
-    return max(1, min(consumers_per_table, TABLE_SPAWN_MAX_WORKERS))
+def _spawn_worker_count(consumers_per_table: int, requested_workers: int) -> int:
+    return max(1, min(consumers_per_table, requested_workers))
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -652,6 +673,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "number of independent DML consumers to spawn for each table. "
             "Values >1 duplicate delivery for fan-out stress testing."
+        ),
+    )
+    parser.add_argument(
+        "--table-spawn-workers",
+        type=positive_int,
+        default=TABLE_SPAWN_MAX_WORKERS,
+        help=(
+            "maximum concurrent table-consumer startup workers. Lower this to "
+            "reduce connection-open bursts when many tables appear at once."
+        ),
+    )
+    parser.add_argument(
+        "--max-snapshots",
+        type=positive_int,
+        default=100,
+        help=(
+            "maximum snapshots a listen call may coalesce. This is the "
+            "adaptive ceiling unless --fixed-max-snapshots is also set."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-max-snapshots",
+        action="store_true",
+        help=(
+            "bypass the Python DML adaptive window and request --max-snapshots "
+            "on every DML listen call"
         ),
     )
     return parser.parse_args(argv)

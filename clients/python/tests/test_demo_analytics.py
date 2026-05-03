@@ -65,9 +65,9 @@ def test_demo_stats_summary_is_json_ready() -> None:
         },
     )
     stats.record_commit()
-    stats.record_dml_listen(elapsed_ms=10.0, row_count=2)
-    stats.record_dml_listen(elapsed_ms=1.0, row_count=0)
-    stats.record_dml_build_batch(elapsed_ms=2.0)
+    stats.record_dml_listen(elapsed_ms=10.0, row_count=2, max_snapshots=8)
+    stats.record_dml_listen(elapsed_ms=1.0, row_count=0, max_snapshots=4)
+    stats.record_dml_build_batch(elapsed_ms=2.0, snapshot_span=8)
     stats.record_dml_sink(elapsed_ms=3.0)
     stats.record_dml_commit_duration(elapsed_ms=4.0)
     stats.finished_ns = 3_000_000_000
@@ -109,6 +109,8 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["dml_build_batch_ms"]["p95"] == 2.0
     assert summary["dml_sink_ms"]["p95"] == 3.0
     assert summary["dml_commit_ms"]["p95"] == 4.0
+    assert summary["dml_snapshot_span"]["p95"] == 8.0
+    assert summary["dml_listen_max_snapshots"]["p50"] == 6.0
     assert summary["fresh_latency_excluded_row_count"] == 0
     assert summary["stale_latency_row_count"] == 0
     assert stats.progress_snapshot()["consumed_changes"] == 2
@@ -203,8 +205,8 @@ def test_summary_table_renders_key_metrics() -> None:
             "benchmark_delete_percent": 0.0,
         },
     )
-    stats.record_dml_listen(elapsed_ms=10.0, row_count=4)
-    stats.record_dml_build_batch(elapsed_ms=2.0)
+    stats.record_dml_listen(elapsed_ms=10.0, row_count=4, max_snapshots=64)
+    stats.record_dml_build_batch(elapsed_ms=2.0, snapshot_span=64)
     stats.record_dml_sink(elapsed_ms=3.0)
     stats.record_dml_commit_duration(elapsed_ms=4.0)
 
@@ -224,6 +226,9 @@ def test_summary_table_renders_key_metrics() -> None:
     assert "| latency_fresh_ms_p50 " in table
     assert "| latency_fresh_ms_p95 " in table
     assert "| consumer_listen_ms_p95 " in table
+    assert "| consumer_snapshot_span_p95 " in table
+    assert "| consumer_snapshot_span_max " in table
+    assert "| consumer_listen_max_snapshots_p50 " in table
     assert "| consumer_build_ms_p95 " in table
     assert "| consumer_sink_ms_p95 " in table
     assert "| consumer_commit_ms_p95 " in table
