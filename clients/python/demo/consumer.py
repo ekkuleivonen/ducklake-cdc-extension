@@ -8,7 +8,7 @@ that's a library bug, not a demo flag.
 Usage::
 
     # one terminal — start the consumer first. It resets the demo state,
-    # then parks, polling the catalog until the producer creates tables.
+    # then parks a DDL consumer that discovers producer-created tables.
     python demo/consumer.py
 
     # another terminal — run a workload of any shape.
@@ -16,17 +16,18 @@ Usage::
 
     # back in the consumer terminal: Ctrl+C to stop and see the summary.
 
-The consumer attaches to each table at ``start_at="now"`` once tables
-appear, so what gets measured is *real-time* CDC latency: the time from
-a producer commit to the consumer's sink call. Run the producer with
-``--duration`` so commits are spread over time and the consumer is
-catching live writes rather than draining cold history.
+    # If attaching to an already-running producer, use:
+    python demo/consumer.py --no-reset
+
+The consumer starts one DDL watcher, then hot-adds a DML consumer whenever
+the producer creates a table. Each DML consumer starts at the table's DDL
+snapshot, so what gets measured is live writes for every producer-created
+table rather than a one-time startup table listing.
 
 DML consumers are pinned to a single table by contract — see
-``cdc_dml_consumer_create`` in the SQL extension. The demo discovers
-the lake's tables, builds one :class:`DMLConsumer` per table, and hands
-the lot to a :class:`CDCApp` so all consumers run concurrently in one
-process with shared signal handling.
+``cdc_dml_consumer_create`` in the SQL extension. The demo therefore runs
+one catalog-level :class:`DDLConsumer` plus one :class:`DMLConsumer` per
+created table in a single :class:`CDCApp`.
 """
 
 from __future__ import annotations
@@ -34,9 +35,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
+import threading
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -46,19 +50,25 @@ from common import (
     DEFAULT_POSTGRES_CATALOG,
     STORAGE_ENV,
     open_demo_lake,
-    retry_on_lock,
     reset_demo_state,
+    retry_on_lock,
 )
 
 from ducklake_cdc import (
+    BaseDDLSink,
     BaseDMLSink,
     CDCApp,
+    DDLBatch,
+    DDLConsumer,
+    DdlEventKind,
+    DdlObjectKind,
     DMLBatch,
     DMLConsumer,
     SinkContext,
 )
 
 CONSUMER_NAME_PREFIX = "demo"
+DDL_CONSUMER_NAME = f"{CONSUMER_NAME_PREFIX}__ddl"
 DEFAULT_CDC_EXTENSION = (
     Path(__file__).resolve().parents[3]
     / "build"
@@ -67,6 +77,13 @@ DEFAULT_CDC_EXTENSION = (
     / "ducklake_cdc"
     / "ducklake_cdc.duckdb_extension"
 )
+
+
+@dataclass(frozen=True)
+class _SpawnRequest:
+    table_id: int | None
+    table_name: str | None
+    start_at: str | int
 
 
 class _StatsSink(BaseDMLSink):
@@ -86,7 +103,7 @@ class _StatsSink(BaseDMLSink):
         consumed_ns = time.monotonic_ns()
         consumed_epoch_ns = time.time_ns()
         self._stats.record_consumer(batch.consumer_name)
-        self._stats.record_window(has_changes=bool(batch))
+        self._stats.record_window(has_changes=bool(batch), observed_ns=consumed_ns)
         self._stats.record_wait(has_snapshot=bool(batch))
 
         per_table: dict[str | None, int] = {}
@@ -114,52 +131,180 @@ class _StatsSink(BaseDMLSink):
         self._stats.record_commit()
 
 
+class _TableSpawnSink(BaseDDLSink):
+    """DDL sink that hot-adds DML consumers for newly-created tables."""
+
+    name = "demo_table_spawner"
+
+    def __init__(
+        self,
+        *,
+        app: CDCApp,
+        args: argparse.Namespace,
+        stats: DemoStats,
+        consumer_lakes: list[Any],
+    ) -> None:
+        self._app = app
+        self._args = args
+        self._stats = stats
+        self._consumer_lakes = consumer_lakes
+        self._seen_table_ids: set[int] = set()
+        self._seen_table_names: set[str] = set()
+        self._seen_lock = threading.Lock()
+        self._queue: queue.Queue[_SpawnRequest | None] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def open(self) -> None:
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_spawn_loop,
+            name="demo-table-spawner",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._queue.put(None)
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def write(self, batch: DDLBatch, ctx: SinkContext) -> None:
+        del ctx
+        for change in batch:
+            if (
+                change.event_kind != DdlEventKind.CREATED
+                or change.object_kind != DdlObjectKind.TABLE
+            ):
+                continue
+
+            table_id = change.object_id
+            table_name = _qualified_table_name(change.schema_name, change.object_name)
+            self.enqueue_table(
+                _SpawnRequest(
+                    table_id=table_id,
+                    table_name=table_name,
+                    start_at=change.snapshot_id,
+                )
+            )
+
+    def enqueue_table(self, request: _SpawnRequest) -> bool:
+        if not self._try_mark_seen(
+            table_id=request.table_id,
+            table_name=request.table_name,
+        ):
+            return False
+        self._queue.put(request)
+        return True
+
+    def add_table(
+        self,
+        *,
+        table_id: int | None,
+        table_name: str | None,
+        start_at: str | int,
+    ) -> bool:
+        if not self._try_mark_seen(table_id=table_id, table_name=table_name):
+            return False
+
+        self._add_table_consumer(
+            table_id=table_id,
+            table_name=table_name,
+            start_at=start_at,
+        )
+        return True
+
+    def _run_spawn_loop(self) -> None:
+        while True:
+            request = self._queue.get()
+            if request is None:
+                return
+            if self._stop_event.is_set():
+                return
+            try:
+                self._add_table_consumer(
+                    table_id=request.table_id,
+                    table_name=request.table_name,
+                    start_at=request.start_at,
+                )
+            except Exception as exc:
+                self._stats.record_error(exc)
+                print(
+                    "demo consumer: failed to start DML consumer for "
+                    f"{request.table_name or f'table_id={request.table_id}'}: {exc}",
+                    flush=True,
+                )
+
+    def _add_table_consumer(
+        self,
+        *,
+        table_id: int | None,
+        table_name: str | None,
+        start_at: str | int,
+    ) -> None:
+        lake = _open_lake(self._args)
+        try:
+            lake.load_extension(path=_local_extension_path())
+            table_filter = (
+                {"table_id": table_id}
+                if table_id is not None
+                else {"table": _require_table_name(table_name)}
+            )
+            consumer = DMLConsumer(
+                lake,
+                _consumer_name_for_table(table_id=table_id, table_name=table_name),
+                start_at=start_at,
+                on_exists="replace",
+                sinks=[_StatsSink(self._stats)],
+                retry=retry_on_lock,
+                **table_filter,
+            )
+            self._app.add_consumer(consumer)
+        except Exception:
+            lake.close()
+            raise
+
+        self._consumer_lakes.append(lake)
+        print(
+            "demo consumer: streaming "
+            f"{table_name or f'table_id={table_id}'} from snapshot {start_at}",
+            flush=True,
+        )
+
+    def _try_mark_seen(self, *, table_id: int | None, table_name: str | None) -> bool:
+        with self._seen_lock:
+            if table_id is not None and table_id in self._seen_table_ids:
+                return False
+            if table_name is not None and table_name in self._seen_table_names:
+                return False
+            if table_id is not None:
+                self._seen_table_ids.add(table_id)
+            if table_name is not None:
+                self._seen_table_names.add(table_name)
+            return True
+
 def main() -> None:
     args = parse_args()
-    reset_demo_state(
-        catalog=args.catalog,
-        catalog_backend=args.catalog_backend,
-        storage=args.storage,
-    )
-    discovery_lake = _open_lake(args)
+    if not args.no_reset:
+        reset_demo_state(
+            catalog=args.catalog,
+            catalog_backend=args.catalog_backend,
+            storage=args.storage,
+        )
+    ddl_lake = _open_lake(args)
     stats = DemoStats()
     consumer_lakes: list[Any] = []
+    app: CDCApp | None = None
 
     try:
         try:
-            discovery_lake.load_extension(path=_local_extension_path())
+            ddl_lake.load_extension(path=_local_extension_path())
             print(
-                "demo consumer: waiting for tables, "
+                "demo consumer: watching for producer-created tables, "
                 "press Ctrl+C to stop and see the summary",
                 flush=True,
             )
-            tables = _wait_for_tables(discovery_lake)
-            print(
-                f"demo consumer: streaming {len(tables)} table(s) at start_at='now'",
-                flush=True,
-            )
-
-            # Each consumer gets its own DuckLake (and therefore its own
-            # DuckDB connection) so concurrent ``cdc_dml_changes_listen``
-            # calls do not contend for the same handle. The extension
-            # explicitly recommends a dedicated connection per listener
-            # (CDC_WAIT_SHARED_CONNECTION).
-            consumers = []
-            for table in tables:
-                lake = _open_lake(args)
-                lake.load_extension(path=_local_extension_path())
-                consumer_lakes.append(lake)
-                consumers.append(
-                    DMLConsumer(
-                        lake,
-                        _consumer_name_for(table),
-                        table=table,
-                        start_at="now",
-                        on_exists="replace",
-                        sinks=[_StatsSink(stats)],
-                        retry=retry_on_lock,
-                    )
-                )
 
             # ``listen_timeout_ms=200`` keeps the per-listen GIL window
             # short enough that the main thread can always service signal
@@ -167,11 +312,44 @@ def main() -> None:
             # long ``__exit__`` waits for the in-flight listen call to
             # complete before printing the summary; daemon threads clean
             # up on process exit.
-            with CDCApp(
-                consumers=consumers,
+            app = CDCApp(
                 listen_timeout_ms=200,
                 shutdown_timeout=2.0,
-            ) as app:
+            )
+            spawner = _TableSpawnSink(
+                app=app,
+                args=args,
+                stats=stats,
+                consumer_lakes=consumer_lakes,
+            )
+            if args.no_reset:
+                existing = [
+                    f"{table.schema_name}.{table.name}" for table in ddl_lake.tables()
+                ]
+                for table_name in existing:
+                    spawner.add_table(
+                        table_id=None,
+                        table_name=table_name,
+                        start_at="now",
+                    )
+                if existing:
+                    print(
+                        "demo consumer: attached to "
+                        f"{len(existing)} existing table(s) at start_at='now'",
+                        flush=True,
+                    )
+            app.add_consumer(
+                DDLConsumer(
+                    ddl_lake,
+                    DDL_CONSUMER_NAME,
+                    start_at="now",
+                    on_exists="replace",
+                    sinks=[spawner],
+                    retry=retry_on_lock,
+                )
+            )
+
+            with app:
                 try:
                     app.run(infinite=True)
                 except KeyboardInterrupt:
@@ -188,39 +366,27 @@ def main() -> None:
             stats.record_error(exc)
             raise
     finally:
-        for lake in consumer_lakes:
+        has_running_workers = (
+            app is not None and any(health.running for health in app.stats())
+        )
+        if has_running_workers:
+            print(
+                "demo consumer: skipping explicit lake close because some "
+                "consumer threads are still unwinding",
+                flush=True,
+            )
+        else:
+            for lake in consumer_lakes:
+                try:
+                    lake.close()
+                except Exception:
+                    pass
             try:
-                lake.close()
+                ddl_lake.close()
             except Exception:
                 pass
-        try:
-            discovery_lake.close()
-        except Exception:
-            pass
         stats.finish()
         emit_summary(stats, output=args.summary_output)
-
-
-_WAIT_FOR_TABLES_INTERVAL_S = 0.2
-
-
-def _wait_for_tables(lake: Any) -> list[str]:
-    """Poll the lake until at least one table is visible.
-
-    The demo consumer is meant to be started before the producer so the
-    sink can capture live writes (sub-second latency). Until the producer
-    creates the first table we have nothing to subscribe to, so we just
-    sit in a short poll loop. ``KeyboardInterrupt`` exits cleanly via the
-    surrounding ``main`` handler.
-    """
-
-    while True:
-        tables = [
-            f"{table.schema_name}.{table.name}" for table in lake.tables()
-        ]
-        if tables:
-            return tables
-        time.sleep(_WAIT_FOR_TABLES_INTERVAL_S)
 
 
 def _open_lake(args: argparse.Namespace) -> Any:
@@ -235,8 +401,20 @@ def _open_lake(args: argparse.Namespace) -> Any:
 _CONSUMER_NAME_SAFE = re.compile(r"[^A-Za-z0-9_]")
 
 
-def _consumer_name_for(qualified_table: str) -> str:
-    """Map ``schema.table`` to a deterministic, catalog-safe consumer name.
+def _qualified_table_name(schema_name: str | None, object_name: str | None) -> str | None:
+    if schema_name is None or object_name is None:
+        return None
+    return f"{schema_name}.{object_name}"
+
+
+def _require_table_name(table_name: str | None) -> str:
+    if table_name is None:
+        raise ValueError("cannot create a demo DML consumer without table_id or name")
+    return table_name
+
+
+def _consumer_name_for_table(*, table_id: int | None, table_name: str | None) -> str:
+    """Map a table identity to a deterministic, catalog-safe consumer name.
 
     The SQL extension stores consumer names as VARCHAR; dots in the
     qualified name are fine, but we sanitise to ``[A-Za-z0-9_]`` so that
@@ -244,7 +422,10 @@ def _consumer_name_for(qualified_table: str) -> str:
     name without escaping.
     """
 
-    safe = _CONSUMER_NAME_SAFE.sub("_", qualified_table)
+    identity = f"table_id_{table_id}" if table_id is not None else table_name
+    if identity is None:
+        raise ValueError("cannot create a demo DML consumer without table_id or name")
+    safe = _CONSUMER_NAME_SAFE.sub("_", identity)
     return f"{CONSUMER_NAME_PREFIX}__{safe}"
 
 
@@ -270,6 +451,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--summary-output",
         type=Path,
         help="write aggregate metrics JSON to this path in addition to stdout",
+    )
+    parser.add_argument(
+        "--no-reset",
+        action="store_true",
+        help=(
+            "do not reset demo catalog/storage on startup; useful when attaching "
+            "to a producer that is already running"
+        ),
     )
     return parser.parse_args(argv)
 

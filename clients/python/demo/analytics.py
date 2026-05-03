@@ -45,7 +45,7 @@ class DemoStats:
 
     Field groups mirror the rendered :func:`summary_table`:
 
-    - throughput: ``consumed_changes`` / ``finished_ns`` - ``started_ns``;
+    - throughput: ``consumed_changes`` / ``finished_ns`` - ``first_delivered_ns``;
     - latency: ``fresh_action_latencies_ms``,
       ``producer_to_snapshot_ms``, ``snapshot_to_consumer_ms``;
     - shape: per-table counts, per-change-type counts, producer
@@ -53,6 +53,7 @@ class DemoStats:
     """
 
     started_ns: int = field(default_factory=time.monotonic_ns)
+    first_delivered_ns: int | None = None
     finished_ns: int | None = None
     fresh_action_latencies_ms: list[float] = field(default_factory=list)
     stale_row_latencies_ms: list[float] = field(default_factory=list)
@@ -90,8 +91,12 @@ class DemoStats:
         error_type = error if isinstance(error, str) else type(error).__name__
         self.error_type_counts[error_type] = self.error_type_counts.get(error_type, 0) + 1
 
-    def record_window(self, *, has_changes: bool) -> None:
+    def record_window(self, *, has_changes: bool, observed_ns: int | None = None) -> None:
         if has_changes:
+            if self.first_delivered_ns is None:
+                self.first_delivered_ns = (
+                    time.monotonic_ns() if observed_ns is None else observed_ns
+                )
             self.delivered_batches += 1
 
     def record_wait(self, *, has_snapshot: bool) -> None:
@@ -182,12 +187,19 @@ class DemoStats:
 
     def summary(self) -> dict[str, Any]:
         end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
-        actual_duration_seconds = max((end_ns - self.started_ns) / 1_000_000_000.0, 0.0)
+        run_duration_seconds = max((end_ns - self.started_ns) / 1_000_000_000.0, 0.0)
+        active_duration_seconds = (
+            max((end_ns - self.first_delivered_ns) / 1_000_000_000.0, 0.0)
+            if self.first_delivered_ns is not None
+            else 0.0
+        )
         return {
-            "actual_duration_seconds": actual_duration_seconds,
+            "actual_duration_seconds": run_duration_seconds,
+            "active_duration_seconds": active_duration_seconds,
+            "run_duration_seconds": run_duration_seconds,
             "consumed_changes": self.consumed_changes,
             "consumed_changes_per_second": divide(
-                self.consumed_changes, actual_duration_seconds
+                self.consumed_changes, active_duration_seconds
             ),
             "delivered_batches": self.delivered_batches,
             "fresh_action_latency_ms": metric_summary(
@@ -317,8 +329,13 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
         [
             (
                 "duration_s",
-                format_float(summary["actual_duration_seconds"]),
-                "wall time of the consumer run",
+                format_float(summary.get("active_duration_seconds", 0.0)),
+                "active time from first delivered batch to exit",
+            ),
+            (
+                "run_duration_s",
+                format_float(summary.get("run_duration_seconds", 0.0)),
+                "wall time of the consumer process",
             ),
             (
                 "changes",
@@ -328,7 +345,7 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
             (
                 "changes_per_s",
                 format_float(summary["consumed_changes_per_second"]),
-                "throughput across the run",
+                "throughput across the active delivery window",
             ),
             (
                 "batches",

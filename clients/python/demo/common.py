@@ -19,6 +19,7 @@ LOCK_RETRY_SECONDS = 0.2
 CATALOG_ENV = "DUCKLAKE_DEMO_CATALOG"
 STORAGE_ENV = "DUCKLAKE_DEMO_STORAGE"
 DEFAULT_POSTGRES_CATALOG = "postgresql://ducklake:ducklake@localhost:5435/ducklake"
+DEMO_PG_POOL_MAX_CONNECTIONS = 64
 T = TypeVar("T")
 
 
@@ -29,11 +30,15 @@ def open_demo_lake(
     catalog_backend: str | None = None,
     storage: str | None = None,
 ) -> DuckLake:
-    duckdb = (
-        DuckDBConfig(config={"allow_unsigned_extensions": True})
-        if allow_unsigned_extensions
-        else None
-    )
+    duckdb_config: dict[str, int | bool] = {
+        # The postgres-scanner pool defaults to 8 connections. The demo can
+        # legitimately run one DuckLake connection per producer/consumer worker,
+        # so lift the pool ceiling instead of making --workers 10 look hung.
+        "pg_pool_max_connections": DEMO_PG_POOL_MAX_CONNECTIONS,
+    }
+    if allow_unsigned_extensions:
+        duckdb_config["allow_unsigned_extensions"] = True
+    duckdb = DuckDBConfig(config=duckdb_config)
     catalog_input = resolve_catalog(catalog=catalog, catalog_backend=catalog_backend)
     storage_input = resolve_storage(storage=storage)
     return DuckLake(

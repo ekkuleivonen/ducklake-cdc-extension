@@ -367,9 +367,6 @@ def split_batches(batches: list[list[Action]], worker_count: int) -> list[list[l
 def split_batches_for_phase(
     batches: list[list[Action]], phase: str, requested_workers: int
 ) -> list[list[list[Action]]]:
-    if phase == "insert":
-        return split_batches(batches, min(requested_workers, len(batches)))
-
     table_groups: dict[TableRef, list[list[Action]]] = {}
     for batch in batches:
         if not batch:
@@ -418,7 +415,15 @@ def apply_batch(lake: DuckLake, batch: list[Action], args: Args) -> None:
             if not is_transient_ducklake_conflict(exc):
                 raise
             retry_count += 1
-            time.sleep(min(0.2 * retry_count, 2.0))
+            if retry_count % 10 == 0:
+                print(
+                    "producer demo: transient transaction conflict, "
+                    f"retry {retry_count} for {batch[0].kind} batch on "
+                    f"{batch[0].table.schema}.{batch[0].table.table}",
+                    flush=True,
+                )
+            jitter = random.uniform(0.0, 0.2)
+            time.sleep(min(0.2 * retry_count, 2.0) + jitter)
 
 
 def is_transient_ducklake_conflict(exc: BaseException) -> bool:

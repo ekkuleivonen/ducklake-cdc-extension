@@ -34,8 +34,8 @@ def test_metric_summary_handles_empty_values() -> None:
 def test_demo_stats_summary_is_json_ready() -> None:
     stats = DemoStats(started_ns=0)
     stats.record_consumer("consumer_a")
-    stats.record_window(has_changes=True)
-    stats.record_window(has_changes=True)
+    stats.record_window(has_changes=True, observed_ns=1_000_000_000)
+    stats.record_window(has_changes=True, observed_ns=1_500_000_000)
     stats.record_changes(2, table_name="main.orders")
     stats.record_error(ValueError("boom"))
     stats.record_change_observation(
@@ -65,11 +65,13 @@ def test_demo_stats_summary_is_json_ready() -> None:
         },
     )
     stats.record_commit()
-    stats.finished_ns = 2_000_000_000
+    stats.finished_ns = 3_000_000_000
 
     summary = stats.summary()
 
-    assert summary["actual_duration_seconds"] == 2.0
+    assert summary["actual_duration_seconds"] == 3.0
+    assert summary["active_duration_seconds"] == 2.0
+    assert summary["run_duration_seconds"] == 3.0
     assert summary["consumed_changes"] == 2
     assert summary["consumed_changes_per_second"] == 1.0
     assert summary["delivered_batches"] == 2
@@ -168,7 +170,7 @@ def test_summary_table_renders_key_metrics() -> None:
     stats = DemoStats(started_ns=0, finished_ns=2_000_000_000)
     stats.record_consumer("consumer_a")
     stats.record_changes(4)
-    stats.record_window(has_changes=True)
+    stats.record_window(has_changes=True, observed_ns=1_000_000_000)
     stats.record_change_latency(
         change_type="insert",
         produced_ns=1_000_000_000,
@@ -196,6 +198,7 @@ def test_summary_table_renders_key_metrics() -> None:
     assert "| metric " in table
     assert "| description " in table
     assert "| duration_s " in table
+    assert "| run_duration_s " in table
     assert "| changes " in table
     assert "| changes_per_s " in table
     assert "| batches " in table
