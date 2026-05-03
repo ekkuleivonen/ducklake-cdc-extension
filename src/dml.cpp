@@ -421,8 +421,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::Client
 		                           start_snapshot, end_snapshot, static_cast<int64_t>(result->rows.size()),
 		                           max_snapshots);
 	}
-	if (data.auto_commit && !data.explicit_window) {
-		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	if (!data.explicit_window) {
+		// Same auto-advance contract as cdc_dml_changes_listen: drain
+		// non-terminal empty windows so the cursor can't get pinned on a
+		// snapshot the consumer has nothing to do for. Terminal windows
+		// (has_changes = false from ReadWindow) are not auto-advanced.
+		if (data.auto_commit || (data.listen && has_changes && result->rows.empty())) {
+			CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+		}
 	}
 	return std::move(result);
 }
@@ -740,8 +746,19 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> GenericDmlInit(duckdb::Clie
 		                           start_snapshot, end_snapshot, static_cast<int64_t>(result->rows.size()),
 		                           max_snapshots);
 	}
-	if (data.auto_commit && !data.explicit_window) {
-		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	if (!data.explicit_window) {
+		// Auto-advance through windows that have visible snapshots but
+		// produce no DML rows for any subscribed table. These are
+		// snapshots whose changes are exclusively for unsubscribed tables
+		// (typical: an ALTER on table X for a consumer subscribed to Y).
+		// The terminal "subscribed-table shape change" case is handled
+		// upstream in ReadWindow by collapsing the window to has_changes
+		// = false; we do not auto-advance terminal windows here. That
+		// keeps the cursor parked at the boundary so cdc_commit raises
+		// CDC_SCHEMA_TERMINATED as documented.
+		if (data.auto_commit || (data.listen && has_changes && result->rows.empty())) {
+			CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+		}
 	}
 	return std::move(result);
 }
@@ -1176,8 +1193,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 		RecordConsumerListenResult(data.catalog_name, data.consumer_name, "dml_table_changes", row_count > 0,
 		                           start_snapshot, end_snapshot, row_count, max_snapshots);
 	}
-	if (data.auto_commit && !data.explicit_window) {
-		CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+	if (!data.explicit_window) {
+		// Same auto-advance contract as cdc_dml_changes_listen.
+		if (data.auto_commit || (data.listen && has_changes && row_count == 0)) {
+			CommitConsumerSnapshot(context, data.catalog_name, data.consumer_name, end_snapshot);
+		}
 	}
 	return std::move(result);
 }

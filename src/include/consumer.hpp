@@ -92,6 +92,20 @@ bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_
 std::vector<std::string> MatchingDmlChangeTypes(const std::vector<ConsumerSubscriptionRow> &subscriptions,
                                                 int64_t schema_id, int64_t table_id);
 
+//! Per-subscribed-table schema-shape boundary for DML consumers.
+//!
+//! Returns the first snapshot in `(start_snapshot, current_snapshot]` whose
+//! `changes_made` token list includes a shape-affecting DDL targeting any of
+//! `dml_subscriptions`' subscribed table_ids: `altered_table:<id>` or
+//! `dropped_table:<id>`. Renames are NOT shape-affecting here — DML
+//! subscriptions follow renames via the `renamed` status.
+//!
+//! Returns `-1` if no such snapshot exists in the range, or if the consumer
+//! has no table-scoped DML subscriptions.
+int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                              int64_t start_snapshot, int64_t current_snapshot,
+                                              const std::vector<ConsumerSubscriptionRow> &dml_subscriptions);
+
 std::string CurrentQualifiedTableName(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                                       int64_t snapshot_id);
 

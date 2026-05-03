@@ -1,11 +1,12 @@
-"""Stream demo DuckLake CDC changes to stdout."""
+"""Stream demo DuckLake CDC changes to stdout via the high-level Python API."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from collections.abc import Iterator, Sequence
+import time
+from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,15 @@ from common import (
     retry_on_lock,
 )
 
-from ducklake import DuckLake
 from ducklake_cdc import (
-    CDCClient,
-    ConsumerBatch,
-    iter_consumer_batches,
+    BaseDMLSink,
+    DMLBatch,
+    DMLConsumer,
+    DMLSink,
+    SinkContext,
+    StdoutDMLSink,
 )
+from ducklake_cdc.lowlevel import CDCClient
 
 CONSUMER_NAME = "stdout_demo"
 DEFAULT_CDC_EXTENSION = (
@@ -35,6 +39,51 @@ DEFAULT_CDC_EXTENSION = (
     / "ducklake_cdc"
     / "ducklake_cdc.duckdb_extension"
 )
+
+
+class _StatsSink(BaseDMLSink):
+    """Optional sink that drives DemoStats off batches + per-change.
+
+    ``require_ack=False`` so stats failures never gate delivery — the demo
+    is observability, not part of the delivery contract.
+    """
+
+    name = "demo_stats"
+    require_ack = False
+
+    def __init__(self, stats: DemoStats) -> None:
+        self._stats = stats
+
+    def write(self, batch: DMLBatch, ctx: SinkContext) -> None:
+        consumed_ns = time.monotonic_ns()
+        consumed_epoch_ns = time.time_ns()
+        self._stats.record_consumer(batch.consumer_name)
+        self._stats.record_window(has_changes=bool(batch))
+        self._stats.record_wait(has_snapshot=bool(batch))
+
+        per_table: dict[str | None, int] = {}
+        for change in batch:
+            per_table[change.table] = per_table.get(change.table, 0) + 1
+        self._stats.record_tables(len(per_table))
+        for table_name, count in per_table.items():
+            self._stats.record_changes(count, table_name=table_name)
+
+        for change in batch:
+            self._stats.record_change_observation(
+                change_type=change.kind,
+                table_name=change.table,
+                values=change.values,
+            )
+            self._stats.record_change_latency(
+                change_type=change.kind,
+                produced_ns=change.values.get("produced_ns"),
+                produced_epoch_ns=change.values.get("produced_epoch_ns"),
+                snapshot_time=change.snapshot_time,
+                consumed_ns=consumed_ns,
+                consumed_epoch_ns=consumed_epoch_ns,
+            )
+
+        self._stats.record_commit()
 
 
 def main() -> None:
@@ -49,22 +98,41 @@ def main() -> None:
 
     try:
         try:
+            lake.load_extension(path=_local_extension_path())
             cdc = CDCClient(lake)
-            cdc.load_extension(path=_local_extension_path())
-            ensure_consumer(cdc, lake=lake, start_at=args.start_at)
 
+            tables = [f"{table.schema_name}.{table.name}" for table in lake.tables()]
+            if not tables:
+                raise RuntimeError(
+                    "No DuckLake tables found for the DML demo consumer. "
+                    "Run producer.py first."
+                )
+
+            sinks: list[DMLSink] = [_StatsSink(stats)]
             if args.output_mode == "stdout":
-                print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
-            for batch in stream_changes(
-                cdc,
-                timeout_ms=args.timeout_ms,
-                max_snapshots=args.max_snapshots,
-                max_windows=args.max_windows,
-                idle_timeout=args.idle_timeout,
-                stats=stats,
-            ):
+                sinks.append(StdoutDMLSink())
+
+            consumer = DMLConsumer(
+                lake,
+                CONSUMER_NAME,
+                tables=tables,
+                start_at=parse_start_at(args.start_at),
+                on_exists="replace",
+                sinks=sinks,
+                client=cdc,
+                retry=retry_on_lock,
+            )
+
+            with consumer:
                 if args.output_mode == "stdout":
-                    print_batch(batch)
+                    print_json({"type": "consumer_ready", "consumer": CONSUMER_NAME})
+                consumer.run(
+                    infinite=True,
+                    timeout_ms=args.timeout_ms,
+                    max_snapshots=args.max_snapshots,
+                    max_batches=args.max_batches,
+                    idle_timeout=args.idle_timeout,
+                )
         except KeyboardInterrupt:
             pass
         except Exception as exc:
@@ -78,14 +146,24 @@ def main() -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--timeout-ms", type=int, default=1_000)
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=0,
+        help="listen timeout in milliseconds; 0 performs a nonblocking catch-up poll",
+    )
     parser.add_argument("--max-snapshots", type=int, default=100)
-    parser.add_argument("--max-windows", type=int, default=0, help="0 means run forever")
+    parser.add_argument(
+        "--max-batches",
+        type=non_negative_int,
+        default=1,
+        help="number of non-empty batches to consume; 0 means run forever",
+    )
     parser.add_argument(
         "--idle-timeout",
         type=non_negative_float,
         default=5.0,
-        help="exit after this many seconds without a new snapshot; 0 disables",
+        help="exit after this many seconds without a non-empty batch; 0 disables",
     )
     parser.add_argument(
         "--analytics",
@@ -127,81 +205,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def ensure_consumer(cdc: CDCClient, *, lake: DuckLake, start_at: str) -> list[str]:
-    table_names = [f"{table.schema_name}.{table.name}" for table in lake.tables()]
-    if not table_names:
-        raise RuntimeError(
-            "No DuckLake tables found for the DML demo consumer. Run producer.py first, "
-            "or start a DDL consumer that creates table-specific DML consumers after tables appear."
-        )
-
-    if consumer_exists(cdc, CONSUMER_NAME):
-        cdc.consumer_force_release(CONSUMER_NAME)
-        cdc.consumer_drop(CONSUMER_NAME)
-
-    def create() -> None:
-        cdc.dml_consumer_create(
-            CONSUMER_NAME,
-            table_names=table_names,
-            start_at="now",
-        )
-        if start_at != "now":
-            cdc.consumer_reset(CONSUMER_NAME, to_snapshot=parse_snapshot_arg(start_at))
-
-    create()
-    return table_names
-
-
-def consumer_exists(cdc: CDCClient, name: str) -> bool:
-    return any(consumer.consumer_name == name for consumer in cdc.consumer_list())
-
-
-def parse_snapshot_arg(value: str) -> str | int:
+def parse_start_at(value: str) -> str | int:
     return int(value) if value.isdigit() else value
-
-
-def stream_changes(
-    cdc: CDCClient,
-    *,
-    timeout_ms: int,
-    max_snapshots: int,
-    max_windows: int,
-    idle_timeout: float,
-    stats: DemoStats | None,
-) -> Iterator[ConsumerBatch]:
-    return iter_consumer_batches(
-        cdc,
-        CONSUMER_NAME,
-        timeout_ms=timeout_ms,
-        max_snapshots=max_snapshots,
-        max_windows=max_windows,
-        idle_timeout=idle_timeout,
-        retry=retry_on_lock,
-        stats=stats,
-    )
-
-
-def print_batch(batch: ConsumerBatch) -> None:
-    print_json({"type": "window", **batch.window.model_dump(mode="json")})
-    for ddl in batch.ddl_events:
-        print_json({"type": "ddl", **ddl.model_dump(mode="json")})
-    for event in batch.snapshot_events:
-        print_json({"type": "event", **event.model_dump(mode="json")})
-    for table in batch.table_changes:
-        for change in table.changes:
-            print_json(
-                {
-                    "type": "change",
-                    "table": table.table_name,
-                    **change.model_dump(mode="json"),
-                }
-            )
-    print_json(
-        {
-            "type": "commit",
-            "snapshot": batch.commit.committed_snapshot,
-        }
-    )
 
 
 def emit_summary(stats: DemoStats, *, output: Path | None) -> None:
@@ -224,6 +229,13 @@ def json_default(value: object) -> str:
 
 def non_negative_float(value: str) -> float:
     parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed

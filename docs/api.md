@@ -277,6 +277,30 @@ Name inputs are resolved at `start_at` and persisted as `table_id`. A table
 subscription follows the same `table_id` across renames. Drop + recreate with
 the same name is a new identity and requires a new subscription/consumer.
 
+DML consumers are pinned to the schema shape of their subscribed tables at
+creation time. The shape is implicit: it is whatever shape applies at
+`last_committed_snapshot`. The first snapshot strictly after the cursor that
+carries `altered_table:<id>` or `dropped_table:<id>` for any subscribed
+`<id>` is the consumer's terminal boundary. At that boundary:
+
+- `cdc_window` returns `has_changes = false` and `schema_changes_pending =
+  true`. The cursor is parked at `boundary - 1`.
+- The DML listen and read paths return zero rows.
+- `cdc_commit` to a snapshot at or past the boundary raises
+  `CDC_SCHEMA_TERMINATED`.
+- `cdc_consumer_reset` to a target on the other side of any boundary in the
+  cursor-to-target range raises `CDC_SCHEMA_TERMINATED`. Same-shape rewinds
+  are still allowed.
+
+To consume the post-change shape, create a new DML consumer with `start_at`
+at or after the boundary snapshot. DDL consumers are the discovery primitive
+that surfaces the boundary; orchestration sits in application code.
+
+Schema changes that do NOT touch any subscribed table (e.g. `ALTER TABLE` on
+some other table, or `CREATE TABLE` for a table the consumer does not
+subscribe to) are NOT terminal. The DML listen path auto-advances past them
+without delivering an empty batch.
+
 Returns the same row shape as `cdc_list_subscriptions`, limited to the created
 consumer.
 
@@ -292,6 +316,12 @@ Repositions the cursor and clears the lease.
 `to_snapshot` accepts `'now'`, `'beginning'`, `'oldest'`, or an explicit snapshot
 id. Resetting can replay older data, fast-forward a broken consumer, or recover
 from a retention gap.
+
+DML consumers refuse resets that would cross a schema-shape boundary for any
+subscribed table. The reset target must be in the same shape epoch as the
+current cursor. Crossing a boundary in either direction raises
+`CDC_SCHEMA_TERMINATED`; create a new consumer with `start_at` in the
+desired shape epoch instead.
 
 Returns:
 
@@ -379,6 +409,16 @@ schema_version BIGINT
 schema_changes_pending BOOLEAN
 ```
 
+For DML consumers, the window is bounded above by the consumer's
+schema-shape boundary: the next snapshot in the visible range that carries a
+shape-affecting DDL (`altered_table:<id>` / `dropped_table:<id>`) for any
+subscribed `<id>`. When the cursor is parked at `boundary - 1`, the next
+window is `[boundary, boundary - 1]` with `has_changes = false` and
+`schema_changes_pending = true`. That pair is the terminal signal: read
+paths return zero rows, `cdc_commit` past the boundary raises
+`CDC_SCHEMA_TERMINATED`, and the consumer must be replaced (see
+`cdc_dml_consumer_create`).
+
 ### `cdc_commit`
 
 ```sql
@@ -394,6 +434,11 @@ This is the safe at-least-once contract:
 ```text
 listen/read -> write sink durably -> cdc_commit
 ```
+
+For DML consumers, `cdc_commit` validates `snapshot_id` against the
+consumer's pinned schema-shape boundary. A commit that would land at or past
+the boundary raises `CDC_SCHEMA_TERMINATED` and the cursor stays parked.
+Idempotent commits to the current cursor are always allowed.
 
 Returns:
 
@@ -523,6 +568,16 @@ change_count BIGINT
 Consumer-level DML functions are generic and multi-table. They return a stable
 schema regardless of the subscribed tables. Use typed table DML functions when
 the caller wants DuckDB-typed user columns for one table.
+
+All DML listen functions auto-advance through *non-terminal* empty windows.
+A window is non-terminal when `cdc_window` reports `has_changes = true` but
+the listen scan returns zero rows (the in-window snapshots only carry
+changes for tables this consumer is not subscribed to). The extension
+commits the cursor to `end_snapshot` so the consumer does not get pinned on
+irrelevant catalog activity. Auto-advance does NOT fire on terminal windows
+(`has_changes = false` from `cdc_window`); those leave the cursor parked at
+the schema-shape boundary, and `cdc_commit` past the boundary raises
+`CDC_SCHEMA_TERMINATED`.
 
 ### `cdc_dml_changes_listen`
 

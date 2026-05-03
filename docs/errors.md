@@ -41,6 +41,26 @@ you are deliberately doing a large catch-up read.
 The attached DuckLake catalog is outside the catalog format range this
 extension knows how to read safely.
 
+### `CDC_SCHEMA_TERMINATED`
+
+A DML consumer is pinned to the schema shape of its subscribed tables at
+creation time. The shape is the column set those tables have at the
+consumer's `last_committed_snapshot`. Once any subscribed table is
+altered or dropped, the consumer terminates: it stops returning DML and
+its cursor is parked at the snapshot before the schema change.
+
+This error fires when a caller tries to drive the cursor past the boundary:
+
+- `cdc_commit(catalog, name, snapshot_id)` with `snapshot_id >= boundary`.
+- `cdc_consumer_reset(catalog, name, to_snapshot)` to a target on the other
+  side of any boundary in the cursor-to-target range. Same-shape rewinds
+  are still allowed.
+
+Recovery: create a fresh DML consumer with `start_at` at or after the
+boundary snapshot and let it consume the post-change shape. Drive the
+orchestration from a DDL consumer that surfaces the boundary event. See
+[`cdc_dml_consumer_create`](./api.md#cdc_dml_consumer_create).
+
 ## Notices and Warnings
 
 ### `CDC_SCHEMA_BOUNDARY`

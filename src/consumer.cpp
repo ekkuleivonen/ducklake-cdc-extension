@@ -63,6 +63,18 @@ bool CdcWindowData::Equals(const duckdb::FunctionData &other) const {
 namespace {
 
 //===--------------------------------------------------------------------===//
+// Forward declarations for the schema-shape pin enforcement helpers.
+// Definitions live further down in this translation unit; lifecycle paths
+// (cdc_consumer_reset, cdc_commit) call them, so a forward declaration is
+// needed to keep the file in topological order without a major reshuffle.
+//===--------------------------------------------------------------------===//
+
+void ValidateDmlConsumerShapeBoundary(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &row,
+                                      int64_t requested_snapshot);
+void ValidateDmlConsumerResetTarget(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &row,
+                                    int64_t target_snapshot);
+
+//===--------------------------------------------------------------------===//
 // Process-wide caches: owner-token (cdc_window/commit/heartbeat lease
 // continuity per (connection, catalog, consumer)) and the per-connection
 // shared-connection warning latch (listen calls).
@@ -891,6 +903,7 @@ std::vector<duckdb::Value> ResetConsumer(duckdb::ClientContext &context, const C
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	int64_t resolved_snapshot = ResolveResetSnapshot(conn, data.catalog_name, data.to_snapshot);
+	ValidateDmlConsumerResetTarget(conn, data.catalog_name, row, resolved_snapshot);
 	int64_t schema_version = ResolveSchemaVersion(conn, data.catalog_name, resolved_snapshot);
 	const auto details = "{\"from_snapshot\":" + std::to_string(row.last_committed_snapshot) +
 	                     ",\"to_snapshot\":" + std::to_string(resolved_snapshot) + ",\"reset_kind\":\"" +
@@ -1353,6 +1366,18 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcCommitBind(duckdb::ClientContext &co
 	return std::move(result);
 }
 
+void ThrowSchemaTerminated(const std::string &consumer_name, int64_t cursor, int64_t boundary_snapshot,
+                           int64_t requested_snapshot) {
+	throw duckdb::InvalidInputException(
+	    "CDC_SCHEMA_TERMINATED: consumer '%s' is pinned to the schema shape at snapshot %lld; snapshot %lld carries a "
+	    "shape change for a subscribed table. Cursor cannot advance past %lld. Refused cdc_commit to %lld. Create a "
+	    "new DML consumer with start_at >= %lld to consume the post-change shape; orchestrate this from a DDL "
+	    "consumer (see docs/api.md).",
+	    consumer_name, static_cast<long long>(cursor), static_cast<long long>(boundary_snapshot),
+	    static_cast<long long>(boundary_snapshot - 1), static_cast<long long>(requested_snapshot),
+	    static_cast<long long>(boundary_snapshot));
+}
+
 void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name,
                             int64_t current_cursor, int64_t snapshot_id) {
 	if (snapshot_id < current_cursor) {
@@ -1373,6 +1398,58 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 		    "cdc_commit snapshot_id %lld is newer than current snapshot %lld for catalog '%s'",
 		    static_cast<long long>(snapshot_id), static_cast<long long>(current_snapshot), catalog_name);
 	}
+}
+
+//! Refuse cdc_commit advances that would land at or past the consumer's
+//! pinned schema-shape boundary. Idempotent commits to the current cursor are
+//! always allowed.
+void ValidateDmlConsumerShapeBoundary(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &row,
+                                      int64_t requested_snapshot) {
+	if (row.consumer_kind != "dml") {
+		return;
+	}
+	if (requested_snapshot <= row.last_committed_snapshot) {
+		return;
+	}
+	const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+	const auto subscriptions = LoadDmlConsumerSubscriptions(conn, catalog_name, row.consumer_name);
+	const auto boundary = NextDmlSubscribedSchemaChangeSnapshot(conn, catalog_name, row.last_committed_snapshot,
+	                                                            current_snapshot, subscriptions);
+	if (boundary == -1 || requested_snapshot < boundary) {
+		return;
+	}
+	ThrowSchemaTerminated(row.consumer_name, row.last_committed_snapshot, boundary, requested_snapshot);
+}
+
+//! Refuse cdc_consumer_reset targets that would land in a different
+//! schema-shape epoch from the consumer's current cursor. The consumer is
+//! pinned; cross-shape repositioning requires a new consumer.
+void ValidateDmlConsumerResetTarget(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &row,
+                                    int64_t target_snapshot) {
+	if (row.consumer_kind != "dml") {
+		return;
+	}
+	const auto cursor = row.last_committed_snapshot;
+	if (target_snapshot == cursor) {
+		return;
+	}
+	const auto subscriptions = LoadDmlConsumerSubscriptions(conn, catalog_name, row.consumer_name);
+	if (subscriptions.empty()) {
+		return;
+	}
+	const auto lo = std::min(cursor, target_snapshot);
+	const auto hi = std::max(cursor, target_snapshot);
+	const auto boundary = NextDmlSubscribedSchemaChangeSnapshot(conn, catalog_name, lo, hi, subscriptions);
+	if (boundary == -1) {
+		return;
+	}
+	throw duckdb::InvalidInputException(
+	    "CDC_SCHEMA_TERMINATED: cdc_consumer_reset for DML consumer '%s' would cross a schema-shape boundary at "
+	    "snapshot %lld (between cursor %lld and target %lld). DML consumers are pinned to a single schema shape; "
+	    "create a new consumer with start_at >= %lld (or <= %lld) to consume that shape epoch.",
+	    row.consumer_name, static_cast<long long>(boundary), static_cast<long long>(cursor),
+	    static_cast<long long>(target_snapshot), static_cast<long long>(boundary),
+	    static_cast<long long>(boundary - 1));
 }
 
 duckdb::unique_ptr<duckdb::MaterializedQueryResult>
@@ -1420,6 +1497,11 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	duckdb::Connection conn(*context.db);
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	// Look up the consumer once before any UPDATE: the per-subscribed-table
+	// schema-shape boundary check must happen on every code path (fast,
+	// postgres-native, legacy) and must precede any state mutation.
+	auto initial_row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
+	ValidateDmlConsumerShapeBoundary(conn, data.catalog_name, initial_row, data.snapshot_id);
 	if (SupportsUpdateReturning(backend)) {
 		const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
@@ -2226,6 +2308,51 @@ std::vector<std::string> MatchingDmlChangeTypes(const std::vector<ConsumerSubscr
 	return change_types;
 }
 
+int64_t NextDmlSubscribedSchemaChangeSnapshot(duckdb::Connection &conn, const std::string &catalog_name,
+                                              int64_t start_snapshot, int64_t current_snapshot,
+                                              const std::vector<ConsumerSubscriptionRow> &dml_subscriptions) {
+	if (dml_subscriptions.empty() || start_snapshot > current_snapshot) {
+		return -1;
+	}
+	std::unordered_set<int64_t> subscribed_table_ids;
+	for (const auto &subscription : dml_subscriptions) {
+		if (subscription.event_category != "dml" || subscription.scope_kind != "table") {
+			continue;
+		}
+		if (subscription.table_id.IsNull() || subscription.status == "dropped") {
+			continue;
+		}
+		subscribed_table_ids.insert(subscription.table_id.GetValue<int64_t>());
+	}
+	if (subscribed_table_ids.empty()) {
+		return -1;
+	}
+	auto result =
+	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	               " WHERE snapshot_id > " + std::to_string(start_snapshot) +
+	               " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	if (!result || result->HasError()) {
+		return -1;
+	}
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		const auto snapshot_value = result->GetValue(0, i);
+		const auto changes_value = result->GetValue(1, i);
+		if (snapshot_value.IsNull() || changes_value.IsNull()) {
+			continue;
+		}
+		const auto snapshot_id = snapshot_value.GetValue<int64_t>();
+		for (const auto &token : SplitListenChangeTokens(changes_value.ToString())) {
+			int64_t table_id = 0;
+			for (const auto &prefix : {"altered_table:", "dropped_table:"}) {
+				if (ParseListenTableIdToken(token, prefix, table_id) && subscribed_table_ids.count(table_id) > 0) {
+					return snapshot_id;
+				}
+			}
+		}
+	}
+	return -1;
+}
+
 int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 	auto entry = input.named_parameters.find("max_snapshots");
 	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
@@ -2252,6 +2379,7 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	}
 	const auto last_snapshot = row.last_committed_snapshot;
 	const auto stop_at_schema_change = row.stop_at_schema_change;
+	const auto consumer_kind = row.consumer_kind;
 	const auto owner_token = row.owner_token.ToString();
 	CacheToken(context, data.catalog_name, data.consumer_name, owner_token);
 
@@ -2275,10 +2403,23 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 	auto schema_version = last_snapshot <= current_snapshot
 	                          ? RequiredInt64(resolved.last_schema_version, "schema_version")
 	                          : row.last_committed_schema_version;
+	// DML consumers are pinned to the schema shape of their subscribed
+	// tables. When the next snapshot in the visible range carries an
+	// `altered_table:<id>` or `dropped_table:<id>` token for a subscribed
+	// table_id, the window collapses unconditionally and the consumer is
+	// terminal: no more DML for the old shape, no advance possible.
+	// Catalog-wide DDL (other tables) does NOT terminate a DML consumer;
+	// the DML listen path auto-advances past those snapshots.
+	int64_t dml_boundary_snapshot = -1;
+	if (consumer_kind == "dml" && first_snapshot != -1 && start_snapshot <= current_snapshot) {
+		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+		dml_boundary_snapshot = NextDmlSubscribedSchemaChangeSnapshot(conn, data.catalog_name, last_snapshot,
+		                                                              current_snapshot, subscriptions);
+	}
 	if (first_snapshot != -1 && start_snapshot <= current_snapshot) {
 		schema_version = RequiredInt64(resolved.start_schema_version, "schema_version");
 		// `start_snapshot` itself can be a schema-change snapshot
-		// (e.g. consumer just committed past the previous boundary
+		// (e.g. a DDL consumer just committed past the previous boundary
 		// and is now reading the ALTER). The window includes it
 		// regardless of `stop_at_schema_change`; we only need to
 		// surface `schema_changes_pending = true` so callers know
@@ -2294,6 +2435,20 @@ std::vector<duckdb::Value> ReadWindow(duckdb::ClientContext &context, const CdcW
 			}
 			boundary_next_snapshot = next_schema_change;
 			boundary_next_schema_version = resolved.next_schema_change_schema_version;
+		}
+		if (dml_boundary_snapshot != -1) {
+			schema_changes_pending = true;
+			// Force the collapse, regardless of stop_at_schema_change. DML
+			// consumers don't get a knob here: a shape change for a
+			// subscribed table is always terminal.
+			if (dml_boundary_snapshot - 1 < end_snapshot) {
+				end_snapshot = dml_boundary_snapshot - 1;
+			}
+			if (boundary_next_snapshot == -1 || dml_boundary_snapshot < boundary_next_snapshot) {
+				boundary_next_snapshot = dml_boundary_snapshot;
+				boundary_next_schema_version =
+				    duckdb::Value::BIGINT(ResolveSchemaVersion(conn, data.catalog_name, dml_boundary_snapshot));
+			}
 		}
 	}
 	const bool has_changes = end_snapshot >= start_snapshot;
