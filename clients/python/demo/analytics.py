@@ -44,8 +44,8 @@ class DemoStats:
     snapshot_to_consumer_ms: list[float] = field(default_factory=list)
     latency_by_change_type_ms: dict[str, list[float]] = field(default_factory=dict)
     operation_ms: dict[str, list[float]] = field(default_factory=dict)
-    cdc_dml_ticks_listen_calls: int = 0
-    cdc_dml_ticks_listen_timeouts: int = 0
+    cdc_dml_changes_listen_calls: int = 0
+    cdc_dml_changes_listen_timeouts: int = 0
     cdc_window_calls: int = 0
     cdc_window_non_empty_calls: int = 0
     cdc_window_empty_calls: int = 0
@@ -97,9 +97,9 @@ class DemoStats:
         self.dropped_row_count += count
 
     def record_wait(self, *, has_snapshot: bool) -> None:
-        self.cdc_dml_ticks_listen_calls += 1
+        self.cdc_dml_changes_listen_calls += 1
         if not has_snapshot:
-            self.cdc_dml_ticks_listen_timeouts += 1
+            self.cdc_dml_changes_listen_timeouts += 1
 
     def record_window(self, *, has_changes: bool) -> None:
         self.cdc_window_calls += 1
@@ -121,7 +121,6 @@ class DemoStats:
         self.table_counts.append(count)
 
     def record_changes(self, count: int, *, table_name: str | None = None) -> None:
-        self.cdc_dml_table_changes_read_calls += 1
         self.consumed_changes += count
         self.rows_per_table.append(count)
         if table_name is not None:
@@ -231,8 +230,8 @@ class DemoStats:
             },
             "catalog_queries_estimated": catalog_queries_estimated,
             "catalog_qps_avg": divide(catalog_queries_estimated, actual_duration_seconds),
-            "cdc_dml_ticks_listen_calls": self.cdc_dml_ticks_listen_calls,
-            "cdc_dml_ticks_listen_timeouts": self.cdc_dml_ticks_listen_timeouts,
+            "cdc_dml_changes_listen_calls": self.cdc_dml_changes_listen_calls,
+            "cdc_dml_changes_listen_timeouts": self.cdc_dml_changes_listen_timeouts,
             "cdc_window_calls": self.cdc_window_calls,
             "cdc_window_non_empty_calls": self.cdc_window_non_empty_calls,
             "cdc_window_empty_calls": self.cdc_window_empty_calls,
@@ -323,11 +322,9 @@ class DemoStats:
 
     def catalog_queries_estimated(self) -> int:
         return (
-            self.cdc_dml_ticks_listen_calls
-            + self.cdc_window_calls
+            self.cdc_dml_changes_listen_calls
             + self.cdc_ddl_changes_read_calls
             + self.cdc_dml_ticks_read_calls
-            + self.lake_tables_calls
             + self.cdc_dml_table_changes_read_calls
             + self.cdc_commit_calls
         )
@@ -484,18 +481,18 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
     operation_ms = summary.get("operation_ms")
     per_call: list[tuple[str, str, str]] = []
     if isinstance(operation_ms, Mapping):
-        wait = operation_ms.get("cdc_dml_ticks_listen")
+        wait = operation_ms.get("cdc_dml_changes_listen")
         if isinstance(wait, Mapping):
             per_call.append(
                 (
-                    "cdc_dml_ticks_listen_ms_p50",
+                    "cdc_dml_changes_listen_ms_p50",
                     format_float(wait["p50"]),
-                    "typical inter-iteration wait (p95 inflated by idle timeouts)",
+                    "listen + read cost (p95 inflated by idle timeouts)",
                 )
             )
         for name, description in (
             ("cdc_window", "per-call cdc_window cost"),
-            ("cdc_dml_table_changes_read", "per-call cdc_dml_table_changes_read cost (per table)"),
+            ("cdc_dml_table_changes_read", "legacy per-table read cost"),
             ("cdc_commit", "per-call cdc_commit cost"),
         ):
             metrics = operation_ms.get(name)

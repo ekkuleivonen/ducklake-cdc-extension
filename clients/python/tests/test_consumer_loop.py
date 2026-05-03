@@ -6,12 +6,7 @@ from typing import Any, cast
 
 from ducklake_cdc import CDCClient, iter_consumer_batches
 from ducklake_cdc.enums import ChangeType
-from ducklake_cdc.models import (
-    ChangeRow,
-    ConsumerCommit,
-    ConsumerWindow,
-    SnapshotEvent,
-)
+from ducklake_cdc.models import ChangeRow, ConsumerCommit
 
 
 class FakeCDC:
@@ -19,44 +14,24 @@ class FakeCDC:
         self.calls: list[str] = []
         self.now = datetime(2026, 5, 1, tzinfo=UTC)
 
-    def dml_ticks_listen(self, name: str, *, timeout_ms: int) -> list[SnapshotEvent]:
-        self.calls.append(f"dml_ticks_listen:{name}:{timeout_ms}")
+    def dml_changes_listen_rows(
+        self,
+        name: str,
+        *,
+        timeout_ms: int,
+        max_snapshots: int,
+    ) -> list[ChangeRow]:
+        self.calls.append(f"dml_changes_listen:{name}:{timeout_ms}:{max_snapshots}")
         return [
-            SnapshotEvent(
+            ChangeRow(
                 consumer_name=name,
                 start_snapshot=1,
                 end_snapshot=42,
                 snapshot_id=42,
-                snapshot_time=self.now,
-                schema_version=1,
-            )
-        ]
-
-    def window(self, name: str, *, max_snapshots: int) -> ConsumerWindow:
-        self.calls.append(f"window:{name}:{max_snapshots}")
-        return ConsumerWindow(
-            start_snapshot=1,
-            end_snapshot=42,
-            has_changes=True,
-            schema_version=1,
-            schema_changes_pending=False,
-        )
-
-    def dml_table_changes_read_rows(
-        self,
-        name: str,
-        *,
-        table_name: str,
-        max_snapshots: int,
-        start_snapshot: int | None = None,
-        end_snapshot: int | None = None,
-    ) -> list[ChangeRow]:
-        self.calls.append(f"dml_table_changes_read:{name}:{table_name}:{max_snapshots}")
-        if table_name != "main.orders":
-            return []
-        return [
-            ChangeRow(
-                snapshot_id=42,
+                schema_id=1,
+                schema_name="main",
+                table_id=10,
+                table_name="main.orders",
                 rowid=1,
                 change_type=ChangeType.INSERT,
                 snapshot_time=self.now,
@@ -141,15 +116,12 @@ class LoopStats:
 
 def test_iter_consumer_batches_yields_committed_batch() -> None:
     cdc = FakeCDC()
-    wait_cdc = FakeCDC()
     stats = LoopStats()
 
     batches = list(
         iter_consumer_batches(
             cast(CDCClient, cdc),
-            cast(CDCClient, wait_cdc),
             "orders_sink",
-            table_names=["main.orders", "main.users"],
             timeout_ms=25,
             max_snapshots=10,
             max_windows=1,
@@ -163,37 +135,28 @@ def test_iter_consumer_batches_yields_committed_batch() -> None:
     assert batches[0].ddl_events == []
     assert batches[0].snapshot_events == []
     assert batches[0].change_count == 1
-    assert [table.table_name for table in batches[0].table_changes] == [
-        "main.orders",
-        "main.users",
-    ]
-    assert wait_cdc.calls == [
-        "dml_ticks_listen:orders_sink:25",
-        "window:orders_sink:10",
-        "commit:orders_sink:42",
-    ]
+    assert [table.table_name for table in batches[0].table_changes] == ["main.orders"]
     assert cdc.calls == [
-        "dml_table_changes_read:orders_sink:main.orders:10",
-        "dml_table_changes_read:orders_sink:main.users:10",
+        "dml_changes_listen:orders_sink:25:10",
+        "commit:orders_sink:42",
     ]
     assert stats.waits == [True]
     assert stats.windows == [True]
     assert stats.ddl_counts == []
     assert stats.event_counts == []
-    assert stats.table_counts == [2]
-    assert stats.change_counts == [("main.orders", 1), ("main.users", 0)]
+    assert stats.table_counts == [1]
+    assert stats.change_counts == [("main.orders", 1)]
     assert stats.commits == 1
     assert stats.consumers == ["orders_sink"]
     assert stats.observations == [
         (ChangeType.INSERT, "main.orders", {"id": 1, "produced_ns": 1, "produced_epoch_ns": 1})
     ]
-    assert stats.latencies == [(1, 1, wait_cdc.now)]
+    assert stats.latencies == [(1, 1, cdc.now)]
     assert "cdc_window_processing" in stats.operations
 
 
 def test_iter_consumer_batches_applies_retry_policy() -> None:
     cdc = FakeCDC()
-    wait_cdc = FakeCDC()
     retry_calls = 0
 
     def retry(operation: Callable[[], Any]) -> Any:
@@ -204,14 +167,12 @@ def test_iter_consumer_batches_applies_retry_policy() -> None:
     list(
         iter_consumer_batches(
             cast(CDCClient, cdc),
-            cast(CDCClient, wait_cdc),
             "orders_sink",
-            table_names=[],
             max_windows=1,
             retry=retry,
         )
     )
 
-    assert retry_calls == 4
+    assert retry_calls == 2
 
 

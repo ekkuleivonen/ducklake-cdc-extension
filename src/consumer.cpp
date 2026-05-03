@@ -74,6 +74,22 @@ std::unordered_map<std::string, std::string> TOKEN_CACHE;
 std::mutex WAIT_WARNING_MUTEX;
 std::unordered_set<int64_t> WAIT_WARNED_CONNECTIONS;
 
+struct AdaptiveListenState {
+	bool has_last_success = false;
+	std::chrono::steady_clock::time_point last_success_at;
+	int64_t burst_streak = 0;
+};
+
+std::mutex ADAPTIVE_LISTEN_MUTEX;
+std::unordered_map<std::string, AdaptiveListenState> ADAPTIVE_LISTEN_STATES;
+
+const int64_t ADAPTIVE_LISTEN_BURST_THRESHOLD_MS = 250;
+const int64_t ADAPTIVE_LISTEN_TARGET_ROWS = 64;
+const int64_t ADAPTIVE_LISTEN_TARGET_SNAPSHOTS = 8;
+const int64_t ADAPTIVE_LISTEN_MIN_COALESCE_MS = 5;
+const int64_t ADAPTIVE_LISTEN_MAX_COALESCE_MS = 50;
+const int64_t ADAPTIVE_LISTEN_POLL_MS = 5;
+
 //===--------------------------------------------------------------------===//
 // Lease / cache helpers
 //===--------------------------------------------------------------------===//
@@ -87,6 +103,11 @@ std::string ConnectionCachePrefix(duckdb::ClientContext &context) {
 std::string TokenCacheKey(duckdb::ClientContext &context, const std::string &catalog_name,
                           const std::string &consumer_name) {
 	return ConnectionCachePrefix(context) + ":" + catalog_name + ":" + consumer_name;
+}
+
+std::string AdaptiveListenKey(const std::string &catalog_name, const std::string &consumer_name,
+                              const std::string &stream_key) {
+	return catalog_name + ":" + consumer_name + ":" + stream_key;
 }
 
 std::string CachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
@@ -191,6 +212,25 @@ bool SupportsUpdateReturning(StateBackendKind backend) {
 	// has a small probe for this so the gate can be widened when scanners learn
 	// to round-trip RETURNING correctly.
 	return backend == StateBackendKind::DuckDB;
+}
+
+std::string NativePostgresTable(const std::string &schema_name, const std::string &table_name) {
+	return QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name);
+}
+
+std::string NativePostgresStateTable(const std::string &table_name, bool use_state_schema) {
+	const auto schema_name = use_state_schema ? STATE_SCHEMA : "public";
+	return NativePostgresTable(schema_name, table_name);
+}
+
+std::string NativePostgresMetadataTable(const std::string &table_name) {
+	return NativePostgresTable("public", table_name);
+}
+
+void PostgresExecuteChecked(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
+	auto result = conn.Query("CALL postgres_execute(" + QuoteLiteral("__ducklake_metadata_" + catalog_name) + ", " +
+	                         QuoteLiteral(sql) + ")");
+	ThrowIfQueryFailed(result);
 }
 
 std::string BuildBusyMessage(const std::string &catalog_name, const std::string &consumer_name,
@@ -1335,15 +1375,54 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 	}
 }
 
+duckdb::unique_ptr<duckdb::MaterializedQueryResult>
+VerifyCommittedConsumer(duckdb::Connection &conn, const std::string &consumers, const std::string &consumer_name,
+                        const std::string &cached_token, int64_t snapshot_id) {
+	auto result = conn.Query("SELECT consumer_name, last_committed_snapshot, last_committed_schema_version FROM " +
+	                         consumers + " WHERE consumer_name = " + QuoteLiteral(consumer_name) +
+	                         " AND owner_token = " + TokenSqlOrNull(cached_token) +
+	                         " AND last_committed_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
+	ThrowIfQueryFailed(result);
+	return result;
+}
+
+bool TryCommitPostgresNative(duckdb::Connection &conn, const std::string &catalog_name,
+                             const std::string &consumer_name, const std::string &cached_token, int64_t snapshot_id,
+                             std::vector<duckdb::Value> &out) {
+	if (cached_token.empty()) {
+		return false;
+	}
+	const auto use_state_schema = StateSchemaExists(conn, catalog_name);
+	const auto consumers = NativePostgresStateTable(CONSUMERS_TABLE, use_state_schema);
+	const auto attached_consumers = StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema);
+	const auto snapshot_table = NativePostgresMetadataTable("ducklake_snapshot");
+	const auto snapshot_sql = std::to_string(snapshot_id);
+	const auto update_sql =
+	    "UPDATE " + consumers + " SET last_committed_snapshot = " + snapshot_sql +
+	    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
+	    " WHERE snapshot_id = " + snapshot_sql + " LIMIT 1), owner_heartbeat_at = now(), updated_at = now() " +
+	    "WHERE consumer_name = " + QuoteLiteral(consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token) +
+	    " AND last_committed_snapshot <= " + snapshot_sql + " AND EXISTS (SELECT 1 FROM " + snapshot_table +
+	    " WHERE snapshot_id = " + snapshot_sql + ")";
+	PostgresExecuteChecked(conn, catalog_name, update_sql);
+
+	auto verified = VerifyCommittedConsumer(conn, attached_consumers, consumer_name, cached_token, snapshot_id);
+	if (!verified || verified->RowCount() == 0) {
+		return false;
+	}
+	out = {verified->GetValue(0, 0), verified->GetValue(1, 0), verified->GetValue(2, 0)};
+	return true;
+}
+
 std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const CdcCommitData &data) {
 	CheckCatalogOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
-	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
-	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 	if (SupportsUpdateReturning(backend)) {
+		const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
+		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 		auto fast_commit = conn.Query(
 		    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
 		    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
@@ -1358,6 +1437,13 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 			return {fast_commit->GetValue(0, 0), fast_commit->GetValue(1, 0), fast_commit->GetValue(2, 0)};
 		}
 	}
+	if (backend == StateBackendKind::Postgres) {
+		std::vector<duckdb::Value> committed;
+		if (TryCommitPostgresNative(conn, data.catalog_name, data.consumer_name, cached_token, data.snapshot_id,
+		                            committed)) {
+			return committed;
+		}
+	}
 
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
@@ -1365,6 +1451,7 @@ std::vector<duckdb::Value> CommitWindow(duckdb::ClientContext &context, const Cd
 	}
 	ValidateCommitSnapshot(conn, data.catalog_name, data.consumer_name, row.last_committed_snapshot, data.snapshot_id);
 	const auto schema_version = ResolveSchemaVersion(conn, data.catalog_name, data.snapshot_id);
+	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	ExecuteChecked(conn, "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
 	                         ", last_committed_schema_version = " + std::to_string(schema_version) +
 	                         ", owner_heartbeat_at = now(), updated_at = now() WHERE consumer_name = " +
@@ -1715,40 +1802,47 @@ duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &c
 	return std::move(result);
 }
 
-std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	if (data.timeout_ms < 0) {
+std::vector<duckdb::Value>
+WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                     const std::string &catalog_name, const std::string &consumer_name,
+                                     int64_t timeout_ms, const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	CheckCatalogOrThrow(context, catalog_name);
+	if (timeout_ms < 0) {
 		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
 	}
-	const auto timeout_ms = std::min<int64_t>(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
-	if (data.timeout_ms > HARD_WAIT_TIMEOUT_MS) {
-		EmitWaitTimeoutClampedNotice(data.timeout_ms, HARD_WAIT_TIMEOUT_MS);
+	const auto clamped_timeout_ms = std::min<int64_t>(timeout_ms, HARD_WAIT_TIMEOUT_MS);
+	if (timeout_ms > HARD_WAIT_TIMEOUT_MS) {
+		EmitWaitTimeoutClampedNotice(timeout_ms, HARD_WAIT_TIMEOUT_MS);
 	}
-	if (timeout_ms > 0) {
-		MaybeEmitWaitSharedConnectionWarning(context, timeout_ms);
+	if (clamped_timeout_ms > 0) {
+		MaybeEmitWaitSharedConnectionWarning(context, clamped_timeout_ms);
 	}
 	auto interval_ms = WAIT_INITIAL_INTERVAL_MS;
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-	duckdb::Connection conn(*context.db);
-	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(clamped_timeout_ms);
 	while (true) {
 		if (context.interrupted) {
 			throw duckdb::InterruptException();
 		}
-		const auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-		const auto next_matching = NextMatchingSnapshot(conn, data.catalog_name, row, subscriptions);
+		const auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
+		const auto next_matching = NextMatchingSnapshot(conn, catalog_name, row, subscriptions);
 		if (!next_matching.empty() && !next_matching[0].IsNull()) {
 			return next_matching;
 		}
 		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline || timeout_ms == 0) {
+		if (now >= deadline || clamped_timeout_ms == 0) {
 			return {duckdb::Value()};
 		}
 		const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
 		std::this_thread::sleep_for(std::chrono::milliseconds(std::min(interval_ms, remaining_ms)));
 		interval_ms = std::min<int64_t>(interval_ms * 2, WAIT_MAX_INTERVAL_MS);
 	}
+}
+
+std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, const ListenWaitData &data) {
+	duckdb::Connection conn(*context.db);
+	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
+	return WaitForNextSnapshotWithSubscriptions(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
+	                                            subscriptions);
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListenWaitInit(duckdb::ClientContext &context,
@@ -2066,6 +2160,42 @@ LoadConsumerSubscriptions(duckdb::Connection &conn, const std::string &catalog_n
 	return out;
 }
 
+std::vector<ConsumerSubscriptionRow> LoadDmlConsumerSubscriptions(duckdb::Connection &conn,
+                                                                  const std::string &catalog_name,
+                                                                  const std::string &consumer_name) {
+	std::vector<ConsumerSubscriptionRow> out;
+	std::ostringstream query;
+	query << "SELECT c.consumer_name, c.consumer_id, s.subscription_id, s.scope_kind, s.schema_id, s.table_id, "
+	      << "s.event_category, s.change_type, s.original_qualified_name, c.consumer_kind FROM "
+	      << StateTable(conn, catalog_name, CONSUMERS_TABLE) << " c JOIN "
+	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE) << " s ON s.consumer_id = c.consumer_id "
+	      << "WHERE c.consumer_name = " << QuoteLiteral(consumer_name)
+	      << " AND s.event_category = 'dml' AND s.scope_kind = 'table' AND s.table_id IS NOT NULL "
+	      << "ORDER BY c.consumer_id ASC, s.subscription_id ASC";
+	auto result = conn.Query(query.str());
+	if (!result || result->HasError()) {
+		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
+		                        result ? result->GetError() : "DML consumer subscription lookup failed");
+	}
+	for (duckdb::idx_t i = 0; i < result->RowCount(); ++i) {
+		ConsumerSubscriptionRow row;
+		row.consumer_name = result->GetValue(0, i).ToString();
+		row.consumer_kind = result->GetValue(9, i).ToString();
+		row.consumer_id = result->GetValue(1, i).GetValue<int64_t>();
+		row.subscription_id = result->GetValue(2, i).GetValue<int64_t>();
+		row.scope_kind = result->GetValue(3, i).ToString();
+		row.schema_id = result->GetValue(4, i);
+		row.table_id = result->GetValue(5, i);
+		row.event_category = result->GetValue(6, i).ToString();
+		row.change_type = result->GetValue(7, i).ToString();
+		row.original_qualified_name = result->GetValue(8, i);
+		row.current_qualified_name = duckdb::Value();
+		row.status = "active";
+		out.push_back(std::move(row));
+	}
+	return out;
+}
+
 bool SubscriptionCoversTable(const ConsumerSubscriptionRow &subscription, int64_t schema_id, int64_t table_id,
                              const std::string &event_category) {
 	if (subscription.status == "dropped" || subscription.event_category != event_category) {
@@ -2208,6 +2338,85 @@ std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &contex
 	data.consumer_name = consumer_name;
 	data.timeout_ms = timeout_ms;
 	return WaitForNextSnapshot(context, data);
+}
+
+std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                                      const std::string &catalog_name, const std::string &consumer_name,
+                                                      int64_t timeout_ms,
+                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	return WaitForNextSnapshotWithSubscriptions(context, conn, catalog_name, consumer_name, timeout_ms, subscriptions);
+}
+
+int64_t AdaptiveListenDelayMs(const std::string &catalog_name, const std::string &consumer_name,
+                              const std::string &stream_key, int64_t timeout_ms) {
+	if (timeout_ms <= 0) {
+		return 0;
+	}
+	std::lock_guard<std::mutex> guard(ADAPTIVE_LISTEN_MUTEX);
+	const auto entry = ADAPTIVE_LISTEN_STATES.find(AdaptiveListenKey(catalog_name, consumer_name, stream_key));
+	if (entry == ADAPTIVE_LISTEN_STATES.end() || entry->second.burst_streak < 2) {
+		return 0;
+	}
+	const auto exponent = std::min<int64_t>(entry->second.burst_streak - 2, 4);
+	const auto delay_ms = ADAPTIVE_LISTEN_MIN_COALESCE_MS << exponent;
+	return std::min<int64_t>(std::min<int64_t>(delay_ms, ADAPTIVE_LISTEN_MAX_COALESCE_MS), timeout_ms);
+}
+
+void MaybeCoalesceConsumerListen(duckdb::ClientContext &context, const std::string &catalog_name,
+                                 const std::string &consumer_name, const std::string &stream_key, int64_t timeout_ms,
+                                 int64_t max_snapshots, int64_t first_matching_snapshot) {
+	const auto coalesce_ms = AdaptiveListenDelayMs(catalog_name, consumer_name, stream_key, timeout_ms);
+	if (coalesce_ms <= 0 || max_snapshots <= 1 || first_matching_snapshot < 0) {
+		return;
+	}
+
+	duckdb::Connection conn(*context.db);
+	auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(coalesce_ms);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (context.interrupted) {
+			throw duckdb::InterruptException();
+		}
+		if (current_snapshot - first_matching_snapshot + 1 >= max_snapshots) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(ADAPTIVE_LISTEN_POLL_MS));
+		const auto next_snapshot = CurrentSnapshot(conn, catalog_name);
+		if (next_snapshot > current_snapshot) {
+			current_snapshot = next_snapshot;
+		}
+	}
+}
+
+void RecordConsumerListenResult(const std::string &catalog_name, const std::string &consumer_name,
+                                const std::string &stream_key, bool has_rows, int64_t start_snapshot,
+                                int64_t end_snapshot, int64_t row_count, int64_t max_snapshots) {
+	const auto key = AdaptiveListenKey(catalog_name, consumer_name, stream_key);
+	const auto now = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> guard(ADAPTIVE_LISTEN_MUTEX);
+	auto &state = ADAPTIVE_LISTEN_STATES[key];
+	if (!has_rows) {
+		state.burst_streak = 0;
+		state.has_last_success = false;
+		return;
+	}
+
+	const auto window_span = end_snapshot >= start_snapshot ? end_snapshot - start_snapshot + 1 : 0;
+	const auto is_small_result = row_count < ADAPTIVE_LISTEN_TARGET_ROWS &&
+	                             window_span < ADAPTIVE_LISTEN_TARGET_SNAPSHOTS && window_span < max_snapshots;
+	const auto is_quick_success =
+	    state.has_last_success &&
+	    std::chrono::duration_cast<std::chrono::milliseconds>(now - state.last_success_at).count() <
+	        ADAPTIVE_LISTEN_BURST_THRESHOLD_MS;
+	if (is_quick_success && is_small_result) {
+		state.burst_streak += 1;
+	} else if (!is_small_result) {
+		state.burst_streak = 0;
+	} else {
+		state.burst_streak = std::max<int64_t>(0, state.burst_streak - 1);
+	}
+	state.has_last_success = true;
+	state.last_success_at = now;
 }
 
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
