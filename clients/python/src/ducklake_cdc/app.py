@@ -120,6 +120,7 @@ class CDCApp:
         self._max_snapshots = max_snapshots
         self._install_signals = install_signals
         self._lock = threading.RLock()
+        self._consumer_lifecycle_lock = threading.Lock()
         self._workers: dict[str, _Worker] = {}
         self._opened = False
         self._stopping = False
@@ -147,7 +148,8 @@ class CDCApp:
 
         try:
             if should_enter:
-                worker.enter()
+                with self._consumer_lifecycle_lock:
+                    worker.enter()
             if should_start:
                 worker.start(
                     timeout_ms=self._listen_timeout_ms,

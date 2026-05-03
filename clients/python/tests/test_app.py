@@ -32,10 +32,12 @@ class _FakeConsumer:
         self,
         name: str,
         *,
+        on_enter: Callable[[], None] | None = None,
         on_run: Callable[[threading.Event], int] | None = None,
         raise_on_run: BaseException | None = None,
     ) -> None:
         self._name = name
+        self._on_enter = on_enter
         self._on_run = on_run
         self._raise = raise_on_run
         self.entered = 0
@@ -48,6 +50,8 @@ class _FakeConsumer:
 
     def __enter__(self) -> _FakeConsumer:
         self.entered += 1
+        if self._on_enter is not None:
+            self._on_enter()
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -344,6 +348,41 @@ def test_app_add_consumer_with_existing_name_raises() -> None:
     app = CDCApp(consumers=[_consumer("dup")], install_signals=False)
     with pytest.raises(ValueError, match="already registered"):
         app.add_consumer(_consumer("dup"))
+
+
+def test_app_serializes_hot_add_consumer_enter() -> None:
+    inside_enter = 0
+    max_inside_enter = 0
+    guard = threading.Lock()
+
+    def enter_slowly() -> None:
+        nonlocal inside_enter, max_inside_enter
+        with guard:
+            inside_enter += 1
+            max_inside_enter = max(max_inside_enter, inside_enter)
+        time.sleep(0.02)
+        with guard:
+            inside_enter -= 1
+
+    app = CDCApp(install_signals=False)
+    fakes = [
+        _FakeConsumer(f"hot-{idx}", on_enter=enter_slowly)
+        for idx in range(8)
+    ]
+
+    with app:
+        threads = [
+            threading.Thread(target=app.add_consumer, args=(cast(DMLConsumer, fake),))
+            for fake in fakes
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(fake.entered == 1 for fake in fakes)
+    assert max_inside_enter == 1
 
 
 # ---------------------------------------------------------------------------

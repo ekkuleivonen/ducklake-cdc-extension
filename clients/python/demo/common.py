@@ -149,7 +149,7 @@ def retry_on_lock(operation: Callable[[], T]) -> T:
         try:
             return operation()
         except DuckLakeError as exc:
-            if not is_database_locked(exc):
+            if not (is_database_locked(exc) or is_thread_join_deadlock(exc)):
                 raise
             time.sleep(LOCK_RETRY_SECONDS)
 
@@ -158,6 +158,16 @@ def is_database_locked(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
         if "database is locked" in str(current).lower():
+            return True
+        current = current.__cause__
+    return False
+
+
+def is_thread_join_deadlock(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "thread::join failed" in message and "resource deadlock avoided" in message:
             return True
         current = current.__cause__
     return False

@@ -139,8 +139,7 @@ class _ConsumerBase:
         if self._client is None:
             self._client = CDCClient(self._lake)
         try:
-            self._setup_consumer()
-            self._apply_lease_policy()
+            self._retry(self._setup_and_apply_lease_policy)
             self._open_sinks()
             self._opened = True
         except BaseException:
@@ -230,6 +229,10 @@ class _ConsumerBase:
             return
 
         self._create_and_position(client)
+
+    def _setup_and_apply_lease_policy(self) -> None:
+        self._setup_consumer()
+        self._apply_lease_policy()
 
     def _create_and_position(self, client: CDCClient) -> None:
         self._create_consumer(client)

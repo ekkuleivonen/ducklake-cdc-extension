@@ -40,6 +40,21 @@ def _fake_lake() -> DuckLake:
     return cast(DuckLake, _FakeLake())
 
 
+class _FakeClient:
+    def __init__(self) -> None:
+        self.list_calls = 0
+        self.created = 0
+
+    def cdc_list_consumers(self) -> list[ConsumerListEntry]:
+        self.list_calls += 1
+        if self.list_calls == 1:
+            raise RuntimeError("transient setup failure")
+        return []
+
+    def cdc_dml_consumer_create(self, *_args: Any, **_kwargs: Any) -> None:
+        self.created += 1
+
+
 def test_dml_consumer_requires_at_least_one_sink() -> None:
     with pytest.raises(ValueError, match="at least one sink"):
         DMLConsumer(_fake_lake(), "name", table="t", sinks=[])
@@ -98,6 +113,37 @@ def test_dml_consumer_requires_exactly_one_table_input() -> None:
             table_id=42,
             sinks=[StdoutDMLSink()],
         )
+
+
+def test_consumer_enter_applies_retry_policy_to_setup() -> None:
+    client = _FakeClient()
+    attempts = 0
+
+    def retry(operation: Any) -> Any:
+        nonlocal attempts
+        while True:
+            attempts += 1
+            try:
+                return operation()
+            except RuntimeError:
+                if attempts >= 2:
+                    raise
+
+    consumer = DMLConsumer(
+        _fake_lake(),
+        "retry-setup",
+        table="demo_schema.events",
+        sinks=[StdoutDMLSink()],
+        client=cast(Any, client),
+        retry=retry,
+    )
+
+    with consumer:
+        pass
+
+    assert attempts == 2
+    assert client.list_calls == 3
+    assert client.created == 1
 
 
 def test_lease_is_alive_treats_missing_token_as_free() -> None:

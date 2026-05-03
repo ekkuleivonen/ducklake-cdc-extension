@@ -299,6 +299,12 @@ def test_parse_args_accepts_consumers_per_table() -> None:
     assert args.consumers_per_table == 4
 
 
+def test_spawn_worker_count_is_capped() -> None:
+    assert demo_consumer._spawn_worker_count(1) == 1
+    assert demo_consumer._spawn_worker_count(3) == 3
+    assert demo_consumer._spawn_worker_count(20) == 4
+
+
 def _wait_for(predicate: Any, *, timeout: float = 1.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
