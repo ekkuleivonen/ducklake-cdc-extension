@@ -278,7 +278,7 @@ def run_batches(lake: DuckLake, batches: list[list[Action]], args: Args) -> None
 def run_batches_concurrent(batches: list[list[Action]], args: Args) -> None:
     start = time.monotonic()
     phase_batches_by_kind = {
-        phase: batches_for_phase(batches, phase)
+        phase: batches_for_phase(batches, phase, args)
         for phase in ("insert", "update", "delete")
     }
     total_commits = sum(len(phase_batches) for phase_batches in phase_batches_by_kind.values())
@@ -341,20 +341,30 @@ def run_worker_batches(
         lake.close()
 
 
-def batches_for_phase(batches: list[list[Action]], phase: str) -> list[list[Action]]:
-    phase_batches: list[list[Action]] = []
+def batches_for_phase(
+    batches: list[list[Action]], phase: str, args: Args
+) -> list[list[Action]]:
+    table_groups: dict[TableRef, list[Action]] = {}
     for batch in batches:
-        current: list[Action] = []
         for action in batch:
-            if action.kind != phase:
-                if current:
-                    phase_batches.append(current)
-                    current = []
-                continue
-            current.append(action)
-        if current:
-            phase_batches.append(current)
+            if action.kind == phase:
+                table_groups.setdefault(action.table, []).append(action)
+
+    phase_batches: list[list[Action]] = []
+    for actions in table_groups.values():
+        phase_batches.extend(chunk_actions(actions, args))
     return phase_batches
+
+
+def chunk_actions(actions: list[Action], args: Args) -> list[list[Action]]:
+    batches: list[list[Action]] = []
+    offset = 0
+    rng = random.Random(RANDOM_SEED + len(actions))
+    while offset < len(actions):
+        size = rng.randint(args.batch_min, args.batch_max)
+        batches.append(actions[offset : offset + size])
+        offset += size
+    return batches
 
 
 def split_batches(batches: list[list[Action]], worker_count: int) -> list[list[list[Action]]]:
@@ -408,8 +418,7 @@ def apply_batch(lake: DuckLake, batch: list[Action], args: Args) -> None:
     while True:
         try:
             with lake.transaction() as tx:
-                for action in batch:
-                    apply_action(tx, action, args)
+                apply_action_group(tx, batch, args)
             return
         except DuckLakeError as exc:
             if not is_transient_ducklake_conflict(exc):
@@ -424,6 +433,202 @@ def apply_batch(lake: DuckLake, batch: list[Action], args: Args) -> None:
                 )
             jitter = random.uniform(0.0, 0.2)
             time.sleep(min(0.2 * retry_count, 2.0) + jitter)
+
+
+def apply_action_group(lake: SqlRunner, actions: list[Action], args: Args) -> None:
+    if not actions:
+        return
+    first = actions[0]
+    if any(action.kind != first.kind or action.table != first.table for action in actions):
+        for action in actions:
+            apply_action(lake, action, args)
+        return
+    if first.kind == "insert":
+        apply_insert_batch(lake, actions, args)
+    elif first.kind == "update":
+        apply_update_batch(lake, actions, args)
+    elif first.kind == "delete":
+        apply_delete_batch(lake, actions)
+    else:
+        raise ValueError(f"unknown action kind: {first.kind}")
+
+
+def apply_insert_batch(lake: SqlRunner, actions: list[Action], args: Args) -> None:
+    if _is_contiguous_insert_batch(actions):
+        apply_contiguous_insert_batch(lake, actions, args)
+        return
+
+    produced_ns = time.monotonic_ns()
+    produced_epoch_ns = time.time_ns()
+    params: dict[str, object] = {}
+    rows: list[str] = []
+    for idx, action in enumerate(actions):
+        params.update(_action_params(action, args, idx, produced_ns, produced_epoch_ns))
+        rows.append(
+            "("
+            f"$id_{idx}, $payload_{idx}, 0, false, "
+            f"$produced_ns_{idx}, $produced_epoch_ns_{idx}, $action_seq_{idx}, "
+            f"$benchmark_profile_{idx}, $benchmark_duration_s_{idx}, "
+            f"$benchmark_schemas_{idx}, $benchmark_tables_{idx}, "
+            f"$benchmark_workers_{idx}, $benchmark_update_percent_{idx}, "
+            f"$benchmark_delete_percent_{idx}"
+            ")"
+        )
+    lake.sql(
+        f"""
+        INSERT INTO {actions[0].table.qualified}
+        VALUES {", ".join(rows)}
+        """,
+        **params,
+    ).list()
+
+
+def apply_contiguous_insert_batch(
+    lake: SqlRunner,
+    actions: list[Action],
+    args: Args,
+) -> None:
+    first = actions[0]
+    last = actions[-1]
+    produced_ns = time.monotonic_ns()
+    produced_epoch_ns = time.time_ns()
+    payload_prefix = f"{first.table.schema}.{first.table.table}."
+    lake.sql(
+        f"""
+        INSERT INTO {first.table.qualified}
+        SELECT
+            row_id,
+            $payload_prefix || row_id::VARCHAR,
+            0,
+            false,
+            $produced_ns,
+            $produced_epoch_ns,
+            $action_seq_base + (row_id - $first_row_id),
+            $benchmark_profile,
+            $benchmark_duration_s,
+            $benchmark_schemas,
+            $benchmark_tables,
+            $benchmark_workers,
+            $benchmark_update_percent,
+            $benchmark_delete_percent
+        FROM range($first_row_id, $end_row_id) AS generated(row_id)
+        """,
+        payload_prefix=payload_prefix,
+        produced_ns=produced_ns,
+        produced_epoch_ns=produced_epoch_ns,
+        action_seq_base=first.action_seq,
+        first_row_id=first.row_id,
+        end_row_id=last.row_id + 1,
+        benchmark_profile=args.profile,
+        benchmark_duration_s=args.duration,
+        benchmark_schemas=args.schemas,
+        benchmark_tables=args.tables,
+        benchmark_workers=args.workers,
+        benchmark_update_percent=args.update,
+        benchmark_delete_percent=args.delete,
+    ).list()
+
+
+def _is_contiguous_insert_batch(actions: list[Action]) -> bool:
+    if not actions or actions[0].kind != "insert":
+        return False
+    first = actions[0]
+    return all(
+        action.kind == "insert"
+        and action.table == first.table
+        and action.row_id == first.row_id + idx
+        and action.action_seq == first.action_seq + idx
+        for idx, action in enumerate(actions)
+    )
+
+
+def apply_update_batch(lake: SqlRunner, actions: list[Action], args: Args) -> None:
+    produced_ns = time.monotonic_ns()
+    produced_epoch_ns = time.time_ns()
+    params: dict[str, object] = {}
+    rows: list[str] = []
+    for idx, action in enumerate(actions):
+        params.update(_action_params(action, args, idx, produced_ns, produced_epoch_ns))
+        rows.append(
+            "("
+            f"$id_{idx}, $payload_{idx}, $produced_ns_{idx}, "
+            f"$produced_epoch_ns_{idx}, $action_seq_{idx}, "
+            f"$benchmark_profile_{idx}, $benchmark_duration_s_{idx}, "
+            f"$benchmark_schemas_{idx}, $benchmark_tables_{idx}, "
+            f"$benchmark_workers_{idx}, $benchmark_update_percent_{idx}, "
+            f"$benchmark_delete_percent_{idx}"
+            ")"
+        )
+    lake.sql(
+        f"""
+        UPDATE {actions[0].table.qualified} AS target
+        SET
+            payload = source.payload,
+            updated_count = target.updated_count + 1,
+            produced_ns = source.produced_ns,
+            produced_epoch_ns = source.produced_epoch_ns,
+            action_seq = source.action_seq,
+            benchmark_profile = source.benchmark_profile,
+            benchmark_duration_s = source.benchmark_duration_s,
+            benchmark_schemas = source.benchmark_schemas,
+            benchmark_tables = source.benchmark_tables,
+            benchmark_workers = source.benchmark_workers,
+            benchmark_update_percent = source.benchmark_update_percent,
+            benchmark_delete_percent = source.benchmark_delete_percent
+        FROM (
+            VALUES {", ".join(rows)}
+        ) AS source(
+            id,
+            payload,
+            produced_ns,
+            produced_epoch_ns,
+            action_seq,
+            benchmark_profile,
+            benchmark_duration_s,
+            benchmark_schemas,
+            benchmark_tables,
+            benchmark_workers,
+            benchmark_update_percent,
+            benchmark_delete_percent
+        )
+        WHERE target.id = source.id
+        """,
+        **params,
+    ).list()
+
+
+def apply_delete_batch(lake: SqlRunner, actions: list[Action]) -> None:
+    params = {f"id_{idx}": action.row_id for idx, action in enumerate(actions)}
+    lake.sql(
+        f"""
+        DELETE FROM {actions[0].table.qualified}
+        WHERE id IN ({", ".join(f"$id_{idx}" for idx in range(len(actions)))})
+        """,
+        **params,
+    ).list()
+
+
+def _action_params(
+    action: Action,
+    args: Args,
+    idx: int,
+    produced_ns: int,
+    produced_epoch_ns: int,
+) -> dict[str, object]:
+    return {
+        f"id_{idx}": action.row_id,
+        f"payload_{idx}": action.payload,
+        f"produced_ns_{idx}": produced_ns,
+        f"produced_epoch_ns_{idx}": produced_epoch_ns,
+        f"action_seq_{idx}": action.action_seq,
+        f"benchmark_profile_{idx}": args.profile,
+        f"benchmark_duration_s_{idx}": args.duration,
+        f"benchmark_schemas_{idx}": args.schemas,
+        f"benchmark_tables_{idx}": args.tables,
+        f"benchmark_workers_{idx}": args.workers,
+        f"benchmark_update_percent_{idx}": args.update,
+        f"benchmark_delete_percent_{idx}": args.delete,
+    }
 
 
 def is_transient_ducklake_conflict(exc: BaseException) -> bool:
