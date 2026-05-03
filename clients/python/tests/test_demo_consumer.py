@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ducklake import DuckLakeQueryError
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demo"))
 
 import consumer as demo_consumer  # noqa: E402
@@ -128,6 +130,55 @@ def test_table_spawn_sink_can_attach_existing_tables_by_name(monkeypatch: Any) -
     assert consumer.name == "demo__demo_schema_01_events_01"
     assert consumer._table == "demo_schema_01.events_01"
     assert consumer._start_at == "now"
+
+
+def test_table_spawn_sink_retries_transient_add_failures(monkeypatch: Any) -> None:
+    opened_lakes: list[_FakeLake] = []
+    extension_path = Path("/tmp/ducklake_cdc.duckdb_extension")
+
+    def open_lake(_args: Namespace) -> _FakeLake:
+        lake = _FakeLake()
+        opened_lakes.append(lake)
+        return lake
+
+    monkeypatch.setattr(demo_consumer, "_open_lake", open_lake)
+    monkeypatch.setattr(demo_consumer, "_local_extension_path", lambda: extension_path)
+    monkeypatch.setattr(demo_consumer, "TABLE_SPAWN_RETRY_INTERVAL_S", 0.0)
+
+    app = CDCApp(install_signals=False)
+    original_add = app.add_consumer
+    attempts = {"count": 0}
+
+    def flaky_add(consumer: Any) -> None:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise DuckLakeQueryError("temporary catalog conflict")
+        original_add(consumer)
+
+    app.add_consumer = flaky_add  # type: ignore[method-assign]
+    sink = demo_consumer._TableSpawnSink(
+        app=app,
+        args=Namespace(catalog=None, catalog_backend=None, storage=None),
+        stats=DemoStats(started_ns=0),
+        consumer_lakes=[],
+    )
+    request = demo_consumer._SpawnRequest(
+        table_id=42,
+        table_name="demo_schema_01.events_01",
+        start_at=7,
+    )
+
+    sink.enqueue_table(request)
+    sink.open()
+    try:
+        _wait_for(lambda: len(app.consumers) == 1)
+    finally:
+        sink.close()
+
+    assert attempts["count"] == 2
+    assert len(opened_lakes) == 2
+    assert opened_lakes[0].closed is True
+    assert app.consumers[0].name == "demo__table_id_42"
 
 
 def _wait_for(predicate: Any, *, timeout: float = 1.0) -> None:

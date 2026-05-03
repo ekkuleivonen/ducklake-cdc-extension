@@ -39,7 +39,7 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +54,7 @@ from common import (
     retry_on_lock,
 )
 
+from ducklake import DuckLakeError
 from ducklake_cdc import (
     BaseDDLSink,
     BaseDMLSink,
@@ -69,6 +70,8 @@ from ducklake_cdc import (
 
 CONSUMER_NAME_PREFIX = "demo"
 DDL_CONSUMER_NAME = f"{CONSUMER_NAME_PREFIX}__ddl"
+TABLE_SPAWN_RETRY_INTERVAL_S = 0.5
+TABLE_SPAWN_MAX_ATTEMPTS = 60
 DEFAULT_CDC_EXTENSION = (
     Path(__file__).resolve().parents[3]
     / "build"
@@ -131,6 +134,55 @@ class _StatsSink(BaseDMLSink):
         self._stats.record_commit()
 
 
+class _TimedDMLConsumer(DMLConsumer):
+    """Demo-only DML consumer that records pipeline timing by stage."""
+
+    def __init__(self, *args: Any, stats: DemoStats, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._demo_stats = stats
+
+    def _listen_op(self, timeout_ms: int, max_snapshots: int) -> Callable[[], list[Any]]:
+        operation = super()._listen_op(timeout_ms, max_snapshots)
+
+        def timed_operation() -> list[Any]:
+            start_ns = time.monotonic_ns()
+            rows = operation()
+            self._demo_stats.record_dml_listen(
+                elapsed_ms=_elapsed_ms_since(start_ns),
+                row_count=len(rows),
+            )
+            return rows
+
+        return timed_operation
+
+    def _build_batch(self, rows: list[Any]) -> DMLBatch:
+        start_ns = time.monotonic_ns()
+        batch = super()._build_batch(rows)
+        self._demo_stats.record_dml_build_batch(elapsed_ms=_elapsed_ms_since(start_ns))
+        return batch
+
+    def _deliver(self, batch: Any) -> None:
+        start_ns = time.monotonic_ns()
+        try:
+            super()._deliver(batch)
+        finally:
+            self._demo_stats.record_dml_sink(elapsed_ms=_elapsed_ms_since(start_ns))
+
+    def _commit_op(self, snapshot: int) -> Callable[[], object]:
+        operation = super()._commit_op(snapshot)
+
+        def timed_operation() -> object:
+            start_ns = time.monotonic_ns()
+            try:
+                return operation()
+            finally:
+                self._demo_stats.record_dml_commit_duration(
+                    elapsed_ms=_elapsed_ms_since(start_ns)
+                )
+
+        return timed_operation
+
+
 class _TableSpawnSink(BaseDDLSink):
     """DDL sink that hot-adds DML consumers for newly-created tables."""
 
@@ -148,8 +200,10 @@ class _TableSpawnSink(BaseDDLSink):
         self._args = args
         self._stats = stats
         self._consumer_lakes = consumer_lakes
-        self._seen_table_ids: set[int] = set()
-        self._seen_table_names: set[str] = set()
+        self._active_table_ids: set[int] = set()
+        self._active_table_names: set[str] = set()
+        self._pending_table_ids: set[int] = set()
+        self._pending_table_names: set[str] = set()
         self._seen_lock = threading.Lock()
         self._queue: queue.Queue[_SpawnRequest | None] = queue.Queue()
         self._stop_event = threading.Event()
@@ -190,7 +244,7 @@ class _TableSpawnSink(BaseDDLSink):
             )
 
     def enqueue_table(self, request: _SpawnRequest) -> bool:
-        if not self._try_mark_seen(
+        if not self._try_reserve(
             table_id=request.table_id,
             table_name=request.table_name,
         ):
@@ -205,14 +259,19 @@ class _TableSpawnSink(BaseDDLSink):
         table_name: str | None,
         start_at: str | int,
     ) -> bool:
-        if not self._try_mark_seen(table_id=table_id, table_name=table_name):
+        if not self._try_reserve(table_id=table_id, table_name=table_name):
             return False
 
-        self._add_table_consumer(
-            table_id=table_id,
-            table_name=table_name,
-            start_at=start_at,
-        )
+        try:
+            self._add_table_consumer(
+                table_id=table_id,
+                table_name=table_name,
+                start_at=start_at,
+            )
+        except Exception:
+            self._release_reservation(table_id=table_id, table_name=table_name)
+            raise
+        self._mark_active(table_id=table_id, table_name=table_name)
         return True
 
     def _run_spawn_loop(self) -> None:
@@ -222,19 +281,63 @@ class _TableSpawnSink(BaseDDLSink):
                 return
             if self._stop_event.is_set():
                 return
+            self._spawn_with_retries(request)
+
+    def _spawn_with_retries(self, request: _SpawnRequest) -> None:
+        for attempt in range(1, TABLE_SPAWN_MAX_ATTEMPTS + 1):
+            if self._stop_event.is_set():
+                self._release_reservation(
+                    table_id=request.table_id,
+                    table_name=request.table_name,
+                )
+                return
             try:
                 self._add_table_consumer(
                     table_id=request.table_id,
                     table_name=request.table_name,
                     start_at=request.start_at,
                 )
+            except DuckLakeError as exc:
+                if attempt == 1 or attempt % 10 == 0:
+                    print(
+                        "demo consumer: waiting to start DML consumer for "
+                        f"{request.table_name or f'table_id={request.table_id}'} "
+                        f"(attempt {attempt}): {_exception_summary(exc)}",
+                        flush=True,
+                    )
+                time.sleep(TABLE_SPAWN_RETRY_INTERVAL_S)
+                continue
             except Exception as exc:
+                self._release_reservation(
+                    table_id=request.table_id,
+                    table_name=request.table_name,
+                )
                 self._stats.record_error(exc)
                 print(
                     "demo consumer: failed to start DML consumer for "
-                    f"{request.table_name or f'table_id={request.table_id}'}: {exc}",
+                    f"{request.table_name or f'table_id={request.table_id}'}: "
+                    f"{_exception_summary(exc)}",
                     flush=True,
                 )
+                return
+
+            self._mark_active(
+                table_id=request.table_id,
+                table_name=request.table_name,
+            )
+            return
+
+        self._release_reservation(
+            table_id=request.table_id,
+            table_name=request.table_name,
+        )
+        self._stats.record_error("TableSpawnTimeout")
+        print(
+            "demo consumer: timed out starting DML consumer for "
+            f"{request.table_name or f'table_id={request.table_id}'} after "
+            f"{TABLE_SPAWN_MAX_ATTEMPTS} attempts",
+            flush=True,
+        )
 
     def _add_table_consumer(
         self,
@@ -251,13 +354,14 @@ class _TableSpawnSink(BaseDDLSink):
                 if table_id is not None
                 else {"table": _require_table_name(table_name)}
             )
-            consumer = DMLConsumer(
+            consumer = _TimedDMLConsumer(
                 lake,
                 _consumer_name_for_table(table_id=table_id, table_name=table_name),
                 start_at=start_at,
                 on_exists="replace",
                 sinks=[_StatsSink(self._stats)],
                 retry=retry_on_lock,
+                stats=self._stats,
                 **table_filter,
             )
             self._app.add_consumer(consumer)
@@ -272,17 +376,41 @@ class _TableSpawnSink(BaseDDLSink):
             flush=True,
         )
 
-    def _try_mark_seen(self, *, table_id: int | None, table_name: str | None) -> bool:
+    def _try_reserve(self, *, table_id: int | None, table_name: str | None) -> bool:
         with self._seen_lock:
-            if table_id is not None and table_id in self._seen_table_ids:
+            if table_id is not None and (
+                table_id in self._active_table_ids
+                or table_id in self._pending_table_ids
+            ):
                 return False
-            if table_name is not None and table_name in self._seen_table_names:
+            if table_name is not None and (
+                table_name in self._active_table_names
+                or table_name in self._pending_table_names
+            ):
                 return False
             if table_id is not None:
-                self._seen_table_ids.add(table_id)
+                self._pending_table_ids.add(table_id)
             if table_name is not None:
-                self._seen_table_names.add(table_name)
+                self._pending_table_names.add(table_name)
             return True
+
+    def _mark_active(self, *, table_id: int | None, table_name: str | None) -> None:
+        with self._seen_lock:
+            if table_id is not None:
+                self._pending_table_ids.discard(table_id)
+                self._active_table_ids.add(table_id)
+            if table_name is not None:
+                self._pending_table_names.discard(table_name)
+                self._active_table_names.add(table_name)
+
+    def _release_reservation(
+        self, *, table_id: int | None, table_name: str | None
+    ) -> None:
+        with self._seen_lock:
+            if table_id is not None:
+                self._pending_table_ids.discard(table_id)
+            if table_name is not None:
+                self._pending_table_names.discard(table_name)
 
 def main() -> None:
     args = parse_args()
@@ -411,6 +539,19 @@ def _require_table_name(table_name: str | None) -> str:
     if table_name is None:
         raise ValueError("cannot create a demo DML consumer without table_id or name")
     return table_name
+
+
+def _elapsed_ms_since(start_ns: int) -> float:
+    return (time.monotonic_ns() - start_ns) / 1_000_000.0
+
+
+def _exception_summary(exc: BaseException) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+    current = exc.__cause__
+    while current is not None:
+        parts.append(f"caused by {type(current).__name__}: {current}")
+        current = current.__cause__
+    return " | ".join(parts)
 
 
 def _consumer_name_for_table(*, table_id: int | None, table_name: str | None) -> str:

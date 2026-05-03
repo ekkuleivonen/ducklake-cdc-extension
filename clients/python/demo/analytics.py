@@ -59,6 +59,11 @@ class DemoStats:
     stale_row_latencies_ms: list[float] = field(default_factory=list)
     producer_to_snapshot_ms: list[float] = field(default_factory=list)
     snapshot_to_consumer_ms: list[float] = field(default_factory=list)
+    dml_listen_empty_ms: list[float] = field(default_factory=list)
+    dml_listen_nonempty_ms: list[float] = field(default_factory=list)
+    dml_build_batch_ms: list[float] = field(default_factory=list)
+    dml_sink_ms: list[float] = field(default_factory=list)
+    dml_commit_ms: list[float] = field(default_factory=list)
     delivered_batches: int = 0
     consumed_changes: int = 0
     rows_per_batch: list[int] = field(default_factory=list)
@@ -124,6 +129,21 @@ class DemoStats:
         # future stats sink can record commit timing without changing the
         # call sites.
         return None
+
+    def record_dml_listen(self, *, elapsed_ms: float, row_count: int) -> None:
+        if row_count > 0:
+            self.dml_listen_nonempty_ms.append(elapsed_ms)
+        else:
+            self.dml_listen_empty_ms.append(elapsed_ms)
+
+    def record_dml_build_batch(self, *, elapsed_ms: float) -> None:
+        self.dml_build_batch_ms.append(elapsed_ms)
+
+    def record_dml_sink(self, *, elapsed_ms: float) -> None:
+        self.dml_sink_ms.append(elapsed_ms)
+
+    def record_dml_commit_duration(self, *, elapsed_ms: float) -> None:
+        self.dml_commit_ms.append(elapsed_ms)
 
     def record_change_observation(
         self,
@@ -212,6 +232,13 @@ class DemoStats:
             "snapshot_to_consumer_ms": metric_summary(
                 self.snapshot_to_consumer_ms
             ).to_json(),
+            "dml_listen_empty_ms": metric_summary(self.dml_listen_empty_ms).to_json(),
+            "dml_listen_nonempty_ms": metric_summary(
+                self.dml_listen_nonempty_ms
+            ).to_json(),
+            "dml_build_batch_ms": metric_summary(self.dml_build_batch_ms).to_json(),
+            "dml_sink_ms": metric_summary(self.dml_sink_ms).to_json(),
+            "dml_commit_ms": metric_summary(self.dml_commit_ms).to_json(),
             "rows_per_batch": metric_summary(
                 [float(count) for count in self.rows_per_batch]
             ).to_json(),
@@ -432,6 +459,46 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
         )
     if breakdown:
         sections.append(breakdown)
+
+    pipeline: list[tuple[str, str, str]] = []
+    listen_nonempty = summary.get("dml_listen_nonempty_ms")
+    if _has_observations(listen_nonempty):
+        pipeline.append(
+            (
+                "consumer_listen_ms_p95",
+                format_float(listen_nonempty["p95"]),
+                "extension listen/read + Python row fetch for non-empty windows",
+            )
+        )
+    build_batch = summary.get("dml_build_batch_ms")
+    if _has_observations(build_batch):
+        pipeline.append(
+            (
+                "consumer_build_ms_p95",
+                format_float(build_batch["p95"]),
+                "Python Change/DMLBatch materialization",
+            )
+        )
+    sink = summary.get("dml_sink_ms")
+    if _has_observations(sink):
+        pipeline.append(
+            (
+                "consumer_sink_ms_p95",
+                format_float(sink["p95"]),
+                "Python demo sink aggregation + latency accounting",
+            )
+        )
+    commit = summary.get("dml_commit_ms")
+    if _has_observations(commit):
+        pipeline.append(
+            (
+                "consumer_commit_ms_p95",
+                format_float(commit["p95"]),
+                "extension cdc_commit after sink success",
+            )
+        )
+    if pipeline:
+        sections.append(pipeline)
 
     sections.append(
         [
