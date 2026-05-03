@@ -4,25 +4,31 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/bump-duckdb-version.sh [--no-submodules] vX.Y.Z
+Usage: scripts/bump-duckdb-version.sh [--no-lock] [--no-submodules] vX.Y.Z
 
 Updates the DuckDB version tuple used by this repository:
   - .github/duckdb-version
   - duckdb Python package pins
+  - root and Python client uv.lock files
   - extension-ci-tools workflow refs and ci_tools_version inputs
   - .gitmodules extension-ci-tools branch
   - active-target notes in docs/development.md
 
-By default, the script also fetches and checks out matching tags in the
-duckdb/ and extension-ci-tools/ submodules. Use --no-submodules to only edit
-text files.
+By default, the script also runs uv lock and fetches/checks out matching tags
+in the duckdb/ and extension-ci-tools/ submodules. Use --no-lock to skip
+lockfile updates, and --no-submodules to skip submodule checkouts.
 EOF
 }
 
+update_lockfiles=true
 update_submodules=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-lock)
+      update_lockfiles=false
+      shift
+      ;;
     --no-submodules)
       update_submodules=false
       shift
@@ -132,6 +138,15 @@ update(
 )
 PY
 
+if [[ "$update_lockfiles" == true ]]; then
+  if command -v uv >/dev/null 2>&1; then
+    uv lock
+    uv --directory clients/python lock
+  else
+    echo "warning: uv not found; skipped lockfile updates" >&2
+  fi
+fi
+
 if [[ "$update_submodules" == true ]]; then
   if git -C duckdb rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git -C duckdb fetch --tags origin "$duckdb_tag"
@@ -149,4 +164,4 @@ if [[ "$update_submodules" == true ]]; then
 fi
 
 echo "Updated DuckDB tuple to $duckdb_tag."
-echo "Review with: git diff -- .github/duckdb-version pyproject.toml clients/python/pyproject.toml .github/workflows .gitmodules docs/development.md duckdb extension-ci-tools"
+echo "Review with: git diff -- .github/duckdb-version pyproject.toml uv.lock clients/python/pyproject.toml clients/python/uv.lock .github/workflows .gitmodules docs/development.md duckdb extension-ci-tools"
