@@ -1,9 +1,7 @@
 """Stream demo DuckLake CDC changes to a sink and print a summary on exit.
 
-The demo consumer is intentionally knob-free. The library's job is to
-absorb whatever the producer throws at it efficiently with sensible
-defaults; if a knob would be needed in production to make this work,
-that's a library bug, not a demo flag.
+The demo consumer keeps production-shaped defaults while exposing a few
+benchmark controls for attaching to running workloads and stressing fan-out.
 
 Usage::
 
@@ -26,8 +24,10 @@ table rather than a one-time startup table listing.
 
 DML consumers are pinned to a single table by contract — see
 ``cdc_dml_consumer_create`` in the SQL extension. The demo therefore runs
-one catalog-level :class:`DDLConsumer` plus one :class:`DMLConsumer` per
-created table in a single :class:`CDCApp`.
+one catalog-level :class:`DDLConsumer` plus, by default, one
+:class:`DMLConsumer` per created table in a single :class:`CDCApp`. Use
+``--consumers-per-table`` to spawn multiple independent consumers for each
+table when testing duplicate fan-out load.
 """
 
 from __future__ import annotations
@@ -72,6 +72,7 @@ CONSUMER_NAME_PREFIX = "demo"
 DDL_CONSUMER_NAME = f"{CONSUMER_NAME_PREFIX}__ddl"
 TABLE_SPAWN_RETRY_INTERVAL_S = 0.5
 TABLE_SPAWN_MAX_ATTEMPTS = 60
+TABLE_SPAWN_MAX_WORKERS = 32
 PROGRESS_INTERVAL_S = 5.0
 DEFAULT_CDC_EXTENSION = (
     Path(__file__).resolve().parents[3]
@@ -88,6 +89,8 @@ class _SpawnRequest:
     table_id: int | None
     table_name: str | None
     start_at: str | int
+    consumer_index: int
+    consumers_per_table: int
 
 
 class _StatsSink(BaseDMLSink):
@@ -201,29 +204,33 @@ class _TableSpawnSink(BaseDDLSink):
         self._args = args
         self._stats = stats
         self._consumer_lakes = consumer_lakes
-        self._active_table_ids: set[int] = set()
-        self._active_table_names: set[str] = set()
-        self._pending_table_ids: set[int] = set()
-        self._pending_table_names: set[str] = set()
+        self._active_consumers: set[str] = set()
+        self._pending_consumers: set[str] = set()
         self._seen_lock = threading.Lock()
         self._queue: queue.Queue[_SpawnRequest | None] = queue.Queue()
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._threads: list[threading.Thread] = []
 
     def open(self) -> None:
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_spawn_loop,
-            name="demo-table-spawner",
-            daemon=True,
-        )
-        self._thread.start()
+        worker_count = _spawn_worker_count(self._args.consumers_per_table)
+        self._threads = [
+            threading.Thread(
+                target=self._run_spawn_loop,
+                name=f"demo-table-spawner-{index + 1}",
+                daemon=True,
+            )
+            for index in range(worker_count)
+        ]
+        for thread in self._threads:
+            thread.start()
 
     def close(self) -> None:
         self._stop_event.set()
-        self._queue.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
+        for _ in self._threads:
+            self._queue.put(None)
+        for thread in self._threads:
+            thread.join(timeout=1.0)
 
     def write(self, batch: DDLBatch, ctx: SinkContext) -> None:
         del ctx
@@ -237,21 +244,33 @@ class _TableSpawnSink(BaseDDLSink):
             table_id = change.object_id
             table_name = _qualified_table_name(change.schema_name, change.object_name)
             self.enqueue_table(
-                _SpawnRequest(
-                    table_id=table_id,
-                    table_name=table_name,
-                    start_at=change.snapshot_id,
-                )
+                table_id=table_id,
+                table_name=table_name,
+                start_at=change.snapshot_id,
             )
 
-    def enqueue_table(self, request: _SpawnRequest) -> bool:
-        if not self._try_reserve(
-            table_id=request.table_id,
-            table_name=request.table_name,
-        ):
-            return False
-        self._queue.put(request)
-        return True
+    def enqueue_table(
+        self,
+        *,
+        table_id: int | None,
+        table_name: str | None,
+        start_at: str | int,
+    ) -> int:
+        enqueued = 0
+        for consumer_index in range(self._args.consumers_per_table):
+            request = _SpawnRequest(
+                table_id=table_id,
+                table_name=table_name,
+                start_at=start_at,
+                consumer_index=consumer_index,
+                consumers_per_table=self._args.consumers_per_table,
+            )
+            consumer_name = _consumer_name_for_request(request)
+            if not self._try_reserve(consumer_name):
+                continue
+            self._queue.put(request)
+            enqueued += 1
+        return enqueued
 
     def add_table(
         self,
@@ -260,20 +279,26 @@ class _TableSpawnSink(BaseDDLSink):
         table_name: str | None,
         start_at: str | int,
     ) -> bool:
-        if not self._try_reserve(table_id=table_id, table_name=table_name):
-            return False
-
-        try:
-            self._add_table_consumer(
+        added = False
+        for consumer_index in range(self._args.consumers_per_table):
+            request = _SpawnRequest(
                 table_id=table_id,
                 table_name=table_name,
                 start_at=start_at,
+                consumer_index=consumer_index,
+                consumers_per_table=self._args.consumers_per_table,
             )
-        except Exception:
-            self._release_reservation(table_id=table_id, table_name=table_name)
-            raise
-        self._mark_active(table_id=table_id, table_name=table_name)
-        return True
+            consumer_name = _consumer_name_for_request(request)
+            if not self._try_reserve(consumer_name):
+                continue
+            try:
+                self._add_table_consumer(request)
+            except Exception:
+                self._release_reservation(consumer_name)
+                raise
+            self._mark_active(consumer_name)
+            added = True
+        return added
 
     def _run_spawn_loop(self) -> None:
         while True:
@@ -281,84 +306,62 @@ class _TableSpawnSink(BaseDDLSink):
             if request is None:
                 return
             if self._stop_event.is_set():
+                self._release_reservation(_consumer_name_for_request(request))
                 return
             self._spawn_with_retries(request)
 
     def _spawn_with_retries(self, request: _SpawnRequest) -> None:
+        consumer_name = _consumer_name_for_request(request)
+        label = _spawn_label(request)
         for attempt in range(1, TABLE_SPAWN_MAX_ATTEMPTS + 1):
             if self._stop_event.is_set():
-                self._release_reservation(
-                    table_id=request.table_id,
-                    table_name=request.table_name,
-                )
+                self._release_reservation(consumer_name)
                 return
             try:
-                self._add_table_consumer(
-                    table_id=request.table_id,
-                    table_name=request.table_name,
-                    start_at=request.start_at,
-                )
+                self._add_table_consumer(request)
             except DuckLakeError as exc:
                 if attempt == 1 or attempt % 10 == 0:
                     print(
                         "demo consumer: waiting to start DML consumer for "
-                        f"{request.table_name or f'table_id={request.table_id}'} "
-                        f"(attempt {attempt}): {_exception_summary(exc)}",
+                        f"{label} (attempt {attempt}): {_exception_summary(exc)}",
                         flush=True,
                     )
                 time.sleep(TABLE_SPAWN_RETRY_INTERVAL_S)
                 continue
             except Exception as exc:
-                self._release_reservation(
-                    table_id=request.table_id,
-                    table_name=request.table_name,
-                )
+                self._release_reservation(consumer_name)
                 self._stats.record_error(exc)
                 print(
                     "demo consumer: failed to start DML consumer for "
-                    f"{request.table_name or f'table_id={request.table_id}'}: "
-                    f"{_exception_summary(exc)}",
+                    f"{label}: {_exception_summary(exc)}",
                     flush=True,
                 )
                 return
 
-            self._mark_active(
-                table_id=request.table_id,
-                table_name=request.table_name,
-            )
+            self._mark_active(consumer_name)
             return
 
-        self._release_reservation(
-            table_id=request.table_id,
-            table_name=request.table_name,
-        )
+        self._release_reservation(consumer_name)
         self._stats.record_error("TableSpawnTimeout")
         print(
             "demo consumer: timed out starting DML consumer for "
-            f"{request.table_name or f'table_id={request.table_id}'} after "
-            f"{TABLE_SPAWN_MAX_ATTEMPTS} attempts",
+            f"{label} after {TABLE_SPAWN_MAX_ATTEMPTS} attempts",
             flush=True,
         )
 
-    def _add_table_consumer(
-        self,
-        *,
-        table_id: int | None,
-        table_name: str | None,
-        start_at: str | int,
-    ) -> None:
+    def _add_table_consumer(self, request: _SpawnRequest) -> None:
         lake = _open_lake(self._args)
         try:
             lake.load_extension(path=_local_extension_path())
             table_filter = (
-                {"table_id": table_id}
-                if table_id is not None
-                else {"table": _require_table_name(table_name)}
+                {"table_id": request.table_id}
+                if request.table_id is not None
+                else {"table": _require_table_name(request.table_name)}
             )
             consumer = _TimedDMLConsumer(
                 lake,
-                _consumer_name_for_table(table_id=table_id, table_name=table_name),
-                start_at=start_at,
+                _consumer_name_for_request(request),
+                start_at=request.start_at,
                 on_exists="replace",
                 sinks=[_StatsSink(self._stats)],
                 retry=retry_on_lock,
@@ -373,45 +376,29 @@ class _TableSpawnSink(BaseDDLSink):
         self._consumer_lakes.append(lake)
         print(
             "demo consumer: streaming "
-            f"{table_name or f'table_id={table_id}'} from snapshot {start_at}",
+            f"{_spawn_label(request)} from snapshot {request.start_at}",
             flush=True,
         )
 
-    def _try_reserve(self, *, table_id: int | None, table_name: str | None) -> bool:
+    def _try_reserve(self, consumer_name: str) -> bool:
         with self._seen_lock:
-            if table_id is not None and (
-                table_id in self._active_table_ids
-                or table_id in self._pending_table_ids
+            if (
+                consumer_name in self._active_consumers
+                or consumer_name in self._pending_consumers
             ):
                 return False
-            if table_name is not None and (
-                table_name in self._active_table_names
-                or table_name in self._pending_table_names
-            ):
-                return False
-            if table_id is not None:
-                self._pending_table_ids.add(table_id)
-            if table_name is not None:
-                self._pending_table_names.add(table_name)
+            self._pending_consumers.add(consumer_name)
             return True
 
-    def _mark_active(self, *, table_id: int | None, table_name: str | None) -> None:
+    def _mark_active(self, consumer_name: str) -> None:
         with self._seen_lock:
-            if table_id is not None:
-                self._pending_table_ids.discard(table_id)
-                self._active_table_ids.add(table_id)
-            if table_name is not None:
-                self._pending_table_names.discard(table_name)
-                self._active_table_names.add(table_name)
+            self._pending_consumers.discard(consumer_name)
+            self._active_consumers.add(consumer_name)
 
-    def _release_reservation(
-        self, *, table_id: int | None, table_name: str | None
-    ) -> None:
+    def _release_reservation(self, consumer_name: str) -> None:
         with self._seen_lock:
-            if table_id is not None:
-                self._pending_table_ids.discard(table_id)
-            if table_name is not None:
-                self._pending_table_names.discard(table_name)
+            self._pending_consumers.discard(consumer_name)
+
 
 def main() -> None:
     args = parse_args()
@@ -573,6 +560,10 @@ def _elapsed_ms_since(start_ns: int) -> float:
     return (time.monotonic_ns() - start_ns) / 1_000_000.0
 
 
+def _spawn_worker_count(consumers_per_table: int) -> int:
+    return max(1, min(consumers_per_table, TABLE_SPAWN_MAX_WORKERS))
+
+
 def _exception_summary(exc: BaseException) -> str:
     parts = [f"{type(exc).__name__}: {exc}"]
     current = exc.__cause__
@@ -582,7 +573,29 @@ def _exception_summary(exc: BaseException) -> str:
     return " | ".join(parts)
 
 
-def _consumer_name_for_table(*, table_id: int | None, table_name: str | None) -> str:
+def _spawn_label(request: _SpawnRequest) -> str:
+    label = request.table_name or f"table_id={request.table_id}"
+    if request.consumers_per_table > 1:
+        label = f"{label} consumer {request.consumer_index + 1}/{request.consumers_per_table}"
+    return label
+
+
+def _consumer_name_for_request(request: _SpawnRequest) -> str:
+    return _consumer_name_for_table(
+        table_id=request.table_id,
+        table_name=request.table_name,
+        consumer_index=request.consumer_index,
+        consumers_per_table=request.consumers_per_table,
+    )
+
+
+def _consumer_name_for_table(
+    *,
+    table_id: int | None,
+    table_name: str | None,
+    consumer_index: int = 0,
+    consumers_per_table: int = 1,
+) -> str:
     """Map a table identity to a deterministic, catalog-safe consumer name.
 
     The SQL extension stores consumer names as VARCHAR; dots in the
@@ -595,7 +608,10 @@ def _consumer_name_for_table(*, table_id: int | None, table_name: str | None) ->
     if identity is None:
         raise ValueError("cannot create a demo DML consumer without table_id or name")
     safe = _CONSUMER_NAME_SAFE.sub("_", identity)
-    return f"{CONSUMER_NAME_PREFIX}__{safe}"
+    suffix = (
+        f"__consumer_{consumer_index + 1:02d}" if consumers_per_table > 1 else ""
+    )
+    return f"{CONSUMER_NAME_PREFIX}__{safe}{suffix}"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -629,7 +645,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "to a producer that is already running"
         ),
     )
+    parser.add_argument(
+        "--consumers-per-table",
+        type=positive_int,
+        default=1,
+        help=(
+            "number of independent DML consumers to spawn for each table. "
+            "Values >1 duplicate delivery for fan-out stress testing."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
 
 
 def emit_summary(stats: DemoStats, *, output: Path | None) -> None:

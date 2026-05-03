@@ -145,14 +145,20 @@ class CDCApp:
             should_enter = self._opened
             should_start = self._opened and not self._stopping
 
-        if should_enter:
-            worker.enter()
-        if should_start:
-            worker.start(
-                timeout_ms=self._listen_timeout_ms,
-                max_snapshots=self._max_snapshots,
-                infinite=True,
-            )
+        try:
+            if should_enter:
+                worker.enter()
+            if should_start:
+                worker.start(
+                    timeout_ms=self._listen_timeout_ms,
+                    max_snapshots=self._max_snapshots,
+                    infinite=True,
+                )
+        except Exception:
+            with self._lock:
+                self._workers.pop(consumer.name, None)
+            worker.exit()
+            raise
 
     def add_consumers(self, consumers: Iterable[Consumer]) -> None:
         for consumer in consumers:

@@ -52,7 +52,12 @@ def test_table_spawn_sink_hot_adds_dml_consumers_for_new_tables(monkeypatch: Any
     consumer_lakes: list[Any] = []
     sink = demo_consumer._TableSpawnSink(
         app=app,
-        args=Namespace(catalog=None, catalog_backend=None, storage=None),
+        args=Namespace(
+            catalog=None,
+            catalog_backend=None,
+            storage=None,
+            consumers_per_table=1,
+        ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=consumer_lakes,
     )
@@ -113,7 +118,12 @@ def test_table_spawn_sink_can_attach_existing_tables_by_name(monkeypatch: Any) -
     app = CDCApp(install_signals=False)
     sink = demo_consumer._TableSpawnSink(
         app=app,
-        args=Namespace(catalog=None, catalog_backend=None, storage=None),
+        args=Namespace(
+            catalog=None,
+            catalog_backend=None,
+            storage=None,
+            consumers_per_table=1,
+        ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
     )
@@ -130,6 +140,103 @@ def test_table_spawn_sink_can_attach_existing_tables_by_name(monkeypatch: Any) -
     assert consumer.name == "demo__demo_schema_01_events_01"
     assert consumer._table == "demo_schema_01.events_01"
     assert consumer._start_at == "now"
+
+
+def test_table_spawn_sink_adds_multiple_consumers_per_table(monkeypatch: Any) -> None:
+    opened_lakes: list[_FakeLake] = []
+    extension_path = Path("/tmp/ducklake_cdc.duckdb_extension")
+
+    def open_lake(_args: Namespace) -> _FakeLake:
+        lake = _FakeLake()
+        opened_lakes.append(lake)
+        return lake
+
+    monkeypatch.setattr(demo_consumer, "_open_lake", open_lake)
+    monkeypatch.setattr(demo_consumer, "_local_extension_path", lambda: extension_path)
+
+    app = CDCApp(install_signals=False)
+    sink = demo_consumer._TableSpawnSink(
+        app=app,
+        args=Namespace(
+            catalog=None,
+            catalog_backend=None,
+            storage=None,
+            consumers_per_table=3,
+        ),
+        stats=DemoStats(started_ns=0),
+        consumer_lakes=[],
+    )
+
+    assert sink.add_table(table_id=42, table_name="demo_schema_01.events_01", start_at=7)
+    assert not sink.add_table(
+        table_id=42,
+        table_name="demo_schema_01.events_01",
+        start_at=7,
+    )
+
+    assert len(opened_lakes) == 3
+    assert [consumer.name for consumer in app.consumers] == [
+        "demo__table_id_42__consumer_01",
+        "demo__table_id_42__consumer_02",
+        "demo__table_id_42__consumer_03",
+    ]
+    assert [consumer._table_id for consumer in app.consumers] == [42, 42, 42]
+
+
+def test_table_spawn_sink_hot_adds_multiple_consumers_from_ddl(
+    monkeypatch: Any,
+) -> None:
+    opened_lakes: list[_FakeLake] = []
+    extension_path = Path("/tmp/ducklake_cdc.duckdb_extension")
+
+    def open_lake(_args: Namespace) -> _FakeLake:
+        lake = _FakeLake()
+        opened_lakes.append(lake)
+        return lake
+
+    monkeypatch.setattr(demo_consumer, "_open_lake", open_lake)
+    monkeypatch.setattr(demo_consumer, "_local_extension_path", lambda: extension_path)
+
+    app = CDCApp(install_signals=False)
+    sink = demo_consumer._TableSpawnSink(
+        app=app,
+        args=Namespace(
+            catalog=None,
+            catalog_backend=None,
+            storage=None,
+            consumers_per_table=4,
+        ),
+        stats=DemoStats(started_ns=0),
+        consumer_lakes=[],
+    )
+    batch = _ddl_batch(
+        SchemaChange(
+            event_kind=DdlEventKind.CREATED,
+            object_kind=DdlObjectKind.TABLE,
+            snapshot_id=7,
+            snapshot_time=datetime(2026, 1, 1, tzinfo=UTC),
+            schema_id=1,
+            schema_name="demo_schema_01",
+            object_id=42,
+            object_name="events_01",
+            details=None,
+        )
+    )
+
+    sink.open()
+    try:
+        sink.write(batch, _ctx(batch))
+        _wait_for(lambda: len(app.consumers) == 4)
+    finally:
+        sink.close()
+
+    assert len(opened_lakes) == 4
+    assert [consumer.name for consumer in app.consumers] == [
+        "demo__table_id_42__consumer_01",
+        "demo__table_id_42__consumer_02",
+        "demo__table_id_42__consumer_03",
+        "demo__table_id_42__consumer_04",
+    ]
 
 
 def test_table_spawn_sink_retries_transient_add_failures(monkeypatch: Any) -> None:
@@ -158,17 +265,16 @@ def test_table_spawn_sink_retries_transient_add_failures(monkeypatch: Any) -> No
     app.add_consumer = flaky_add  # type: ignore[method-assign]
     sink = demo_consumer._TableSpawnSink(
         app=app,
-        args=Namespace(catalog=None, catalog_backend=None, storage=None),
+        args=Namespace(
+            catalog=None,
+            catalog_backend=None,
+            storage=None,
+            consumers_per_table=1,
+        ),
         stats=DemoStats(started_ns=0),
         consumer_lakes=[],
     )
-    request = demo_consumer._SpawnRequest(
-        table_id=42,
-        table_name="demo_schema_01.events_01",
-        start_at=7,
-    )
-
-    sink.enqueue_table(request)
+    sink.enqueue_table(table_id=42, table_name="demo_schema_01.events_01", start_at=7)
     sink.open()
     try:
         _wait_for(lambda: len(app.consumers) == 1)
@@ -179,6 +285,18 @@ def test_table_spawn_sink_retries_transient_add_failures(monkeypatch: Any) -> No
     assert len(opened_lakes) == 2
     assert opened_lakes[0].closed is True
     assert app.consumers[0].name == "demo__table_id_42"
+
+
+def test_parse_args_defaults_to_one_consumer_per_table() -> None:
+    args = demo_consumer.parse_args([])
+
+    assert args.consumers_per_table == 1
+
+
+def test_parse_args_accepts_consumers_per_table() -> None:
+    args = demo_consumer.parse_args(["--consumers-per-table", "4"])
+
+    assert args.consumers_per_table == 4
 
 
 def _wait_for(predicate: Any, *, timeout: float = 1.0) -> None:
