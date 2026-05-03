@@ -72,6 +72,7 @@ CONSUMER_NAME_PREFIX = "demo"
 DDL_CONSUMER_NAME = f"{CONSUMER_NAME_PREFIX}__ddl"
 TABLE_SPAWN_RETRY_INTERVAL_S = 0.5
 TABLE_SPAWN_MAX_ATTEMPTS = 60
+PROGRESS_INTERVAL_S = 5.0
 DEFAULT_CDC_EXTENSION = (
     Path(__file__).resolve().parents[3]
     / "build"
@@ -424,6 +425,8 @@ def main() -> None:
     stats = DemoStats()
     consumer_lakes: list[Any] = []
     app: CDCApp | None = None
+    progress_stop = threading.Event()
+    progress_thread: threading.Thread | None = None
 
     try:
         try:
@@ -444,6 +447,13 @@ def main() -> None:
                 listen_timeout_ms=200,
                 shutdown_timeout=2.0,
             )
+            progress_thread = threading.Thread(
+                target=_report_progress,
+                args=(stats, progress_stop),
+                name="demo-consumer-progress",
+                daemon=True,
+            )
+            progress_thread.start()
             spawner = _TableSpawnSink(
                 app=app,
                 args=args,
@@ -494,6 +504,9 @@ def main() -> None:
             stats.record_error(exc)
             raise
     finally:
+        progress_stop.set()
+        if progress_thread is not None:
+            progress_thread.join(timeout=1.0)
         has_running_workers = (
             app is not None and any(health.running for health in app.stats())
         )
@@ -515,6 +528,21 @@ def main() -> None:
                 pass
         stats.finish()
         emit_summary(stats, output=args.summary_output)
+
+
+def _report_progress(stats: DemoStats, stop_event: threading.Event) -> None:
+    while not stop_event.wait(PROGRESS_INTERVAL_S):
+        snapshot = stats.progress_snapshot()
+        print(
+            "demo consumer: progress "
+            f"{snapshot['consumed_changes']} changes, "
+            f"{snapshot['delivered_batches']} batches, "
+            f"{snapshot['table_count_seen']} table(s), "
+            f"{snapshot['consumer_count_seen']} active consumer(s), "
+            f"{snapshot['consumed_changes_per_second']:.0f} changes/s, "
+            f"{snapshot['error_count']} error(s)",
+            flush=True,
+        )
 
 
 def _open_lake(args: argparse.Namespace) -> Any:

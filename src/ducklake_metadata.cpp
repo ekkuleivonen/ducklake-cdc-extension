@@ -572,13 +572,14 @@ void InstallPostgresSnapshotNotifyBestEffort(duckdb::Connection &conn, const std
 	    "CREATE OR REPLACE FUNCTION " + QuoteIdentifier(STATE_SCHEMA) +
 	        ".ducklake_cdc_notify_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_notify(" +
 	        QuoteLiteral(channel) + ", NEW.snapshot_id::text); RETURN NEW; END; $$");
-	PostgresExecuteBestEffort(conn, catalog_name,
-	                          "DROP TRIGGER IF EXISTS ducklake_cdc_snapshot_notify ON public.ducklake_snapshot");
 	PostgresExecuteBestEffort(
 	    conn, catalog_name,
-	    "CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot FOR EACH ROW "
-	    "EXECUTE FUNCTION " +
-	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()");
+	    "DO $$ BEGIN IF NOT EXISTS ("
+	    "SELECT 1 FROM pg_trigger WHERE tgname = 'ducklake_cdc_snapshot_notify' "
+	    "AND tgrelid = 'public.ducklake_snapshot'::regclass"
+	    ") THEN EXECUTE 'CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot "
+	    "FOR EACH ROW EXECUTE FUNCTION " +
+	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()'; END IF; END $$");
 }
 
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {

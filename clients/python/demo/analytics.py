@@ -260,6 +260,25 @@ class DemoStats:
             "stale_latency_row_count": len(self.stale_row_latencies_ms),
         }
 
+    def progress_snapshot(self) -> dict[str, int | float]:
+        end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
+        active_duration_seconds = (
+            max((end_ns - self.first_delivered_ns) / 1_000_000_000.0, 0.0)
+            if self.first_delivered_ns is not None
+            else 0.0
+        )
+        return {
+            "active_duration_seconds": active_duration_seconds,
+            "consumed_changes": self.consumed_changes,
+            "consumed_changes_per_second": divide(
+                self.consumed_changes, active_duration_seconds
+            ),
+            "delivered_batches": self.delivered_batches,
+            "consumer_count_seen": len(self.consumer_names),
+            "table_count_seen": len(self.table_names),
+            "error_count": self.error_count,
+        }
+
     def _dml_action_count_seen(self) -> int:
         return (
             self.change_type_counts.get("insert", 0)

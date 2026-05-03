@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import random
+import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from common import (
@@ -23,6 +24,7 @@ from common import (
 from ducklake import DuckLake, DuckLakeError
 
 RANDOM_SEED = 42
+PROGRESS_INTERVAL_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,41 @@ class Action:
     action_seq: int
 
 
+@dataclass
+class ProgressCounter:
+    label: str
+    total_commits: int
+    total_actions: int
+    interval_s: float = PROGRESS_INTERVAL_S
+    completed_commits: int = 0
+    completed_actions: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    last_report_at: float = field(default_factory=time.monotonic)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self, *, commits: int, actions: int, force: bool = False) -> None:
+        with self._lock:
+            self.completed_commits += commits
+            self.completed_actions += actions
+            now = time.monotonic()
+            if (
+                not force
+                and self.completed_commits < self.total_commits
+                and (now - self.last_report_at) < self.interval_s
+            ):
+                return
+            self.last_report_at = now
+            elapsed = max(now - self.started_at, 0.001)
+            print(
+                "producer demo: "
+                f"{self.label} progress "
+                f"{self.completed_commits}/{self.total_commits} commits, "
+                f"{self.completed_actions}/{self.total_actions} actions, "
+                f"{self.completed_actions / elapsed:.0f} actions/s",
+                flush=True,
+            )
+
+
 class ResultLike(Protocol):
     def list(self) -> list[dict[str, Any]]: ...
 
@@ -57,6 +94,7 @@ class Args:
     schemas: int
     tables: int
     inserts: int
+    insert_rate: float | None
     update: float
     delete: float
     duration: float
@@ -95,6 +133,13 @@ def main() -> None:
             f"{len(tables)} tables, {len(actions)} actions, {len(batches)} commits, "
             f"{args.duration:g}s {args.profile}, {args.workers} worker(s)"
         )
+        if args.insert_rate is not None:
+            print(
+                "producer demo: "
+                f"{args.insert_rate:g} inserts/s target for {args.duration:g}s "
+                f"({args.inserts} inserts/table)",
+                flush=True,
+            )
         run_batches(lake, batches, args)
     finally:
         lake.close()
@@ -105,6 +150,14 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
     parser.add_argument("--schemas", type=positive_int, default=1)
     parser.add_argument("--tables", type=positive_int, default=1)
     parser.add_argument("--inserts", type=non_negative_int, default=10)
+    parser.add_argument(
+        "--insert-rate",
+        type=non_negative_float,
+        help=(
+            "target inserted rows per second. Requires --duration > 0 and "
+            "produces an insert-only workload; total inserts are rate * duration"
+        ),
+    )
     parser.add_argument("--update", type=percentage, default=25.0)
     parser.add_argument("--delete", type=percentage, default=10.0)
     parser.add_argument("--duration", type=non_negative_float, default=0.0)
@@ -148,10 +201,21 @@ def parse_args(argv: Sequence[str] | None = None) -> Args:
     namespace = parser.parse_args(argv)
     if namespace.batch_min > namespace.batch_max:
         parser.error("--batch_min must be <= --batch_max")
+    if namespace.insert_rate is not None:
+        if namespace.duration <= 0:
+            parser.error("--insert-rate requires --duration > 0")
+        if namespace.update != 0.0 or namespace.delete != 0.0:
+            parser.error("--insert-rate produces insert-only workloads; pass --update 0 --delete 0")
+        namespace.inserts = inserts_per_table_for_rate(
+            insert_rate=namespace.insert_rate,
+            duration=namespace.duration,
+            table_count=namespace.schemas * namespace.tables,
+        )
     return Args(
         schemas=namespace.schemas,
         tables=namespace.tables,
         inserts=namespace.inserts,
+        insert_rate=namespace.insert_rate,
         update=namespace.update,
         delete=namespace.delete,
         duration=namespace.duration,
@@ -301,6 +365,11 @@ def run_phase_concurrent(
 ) -> None:
     worker_batches = split_batches_for_phase(batches, phase, args.workers)
     worker_count = len(worker_batches)
+    progress = ProgressCounter(
+        label=phase,
+        total_commits=len(batches),
+        total_actions=sum(len(batch) for batch in batches),
+    )
     print(
         f"producer demo: {phase} phase, {len(batches)} commits, "
         f"{worker_count} worker(s), {duration:.2f}s target"
@@ -312,18 +381,22 @@ def run_phase_concurrent(
                 assigned_batches,
                 args,
                 duration=duration,
+                progress=progress,
             )
             for assigned_batches in worker_batches
             if assigned_batches
         ]
-        completed = 0
         for future in as_completed(futures):
-            completed += future.result()
-            print(f"producer demo: {phase} phase progress {completed}/{len(batches)} commits")
+            future.result()
+    progress.record(commits=0, actions=0, force=True)
 
 
 def run_worker_batches(
-    batches: list[list[Action]], args: Args, *, duration: float
+    batches: list[list[Action]],
+    args: Args,
+    *,
+    duration: float,
+    progress: ProgressCounter | None = None,
 ) -> int:
     lake = open_demo_lake(
         catalog=args.catalog,
@@ -334,6 +407,8 @@ def run_worker_batches(
         gaps = schedule_gaps_for_count(len(batches), duration, args.profile)
         for idx, batch in enumerate(batches):
             apply_batch(lake, batch, args)
+            if progress is not None:
+                progress.record(commits=1, actions=len(batch))
             if idx < len(gaps):
                 time.sleep(gaps[idx])
         return len(batches)
@@ -722,6 +797,16 @@ def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
 
 def percent_count(total: int, percent: float) -> int:
     return round(total * percent / 100.0)
+
+
+def inserts_per_table_for_rate(
+    *,
+    insert_rate: float,
+    duration: float,
+    table_count: int,
+) -> int:
+    total_inserts = round(insert_rate * duration)
+    return max(1, (total_inserts + table_count - 1) // table_count)
 
 
 def quote_identifier(value: str) -> str:

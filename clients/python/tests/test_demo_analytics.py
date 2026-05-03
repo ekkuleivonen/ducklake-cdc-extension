@@ -111,6 +111,8 @@ def test_demo_stats_summary_is_json_ready() -> None:
     assert summary["dml_commit_ms"]["p95"] == 4.0
     assert summary["fresh_latency_excluded_row_count"] == 0
     assert summary["stale_latency_row_count"] == 0
+    assert stats.progress_snapshot()["consumed_changes"] == 2
+    assert stats.progress_snapshot()["consumer_count_seen"] == 1
 
 
 def test_demo_stats_change_latency_records_fresh_and_breakdown() -> None:
