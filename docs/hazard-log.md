@@ -292,40 +292,81 @@ go; this file says what can hurt users or maintainers on the way there.
   level API; possible mitigations include forbidding `auto_commit=True` with
   required sinks or renaming it to make the unsafe ordering obvious.
 
-### H-022: SQLite-Backed Metadata Lock Handoff on Windows MinGW
+### H-022: Cross-Connection Metadata Lock Handoff on First Bootstrap Write
 
-- Risk: When the metadata catalog is SQLite-backed and a single
-  `cdc_*_consumer_create` (or any cdc_* call that bootstraps
-  `__ducklake_cdc.*`) opens more than one DuckDB connection against the
-  same SQLite file, the Windows MinGW build can fail with `Invalid Error:
-  Resource deadlock avoided`. The MinGW C runtime maps the underlying
-  `LockFileEx` / `ERROR_POSSIBLE_DEADLOCK` result to `EDEADLK`; MSVC,
-  Linux, and macOS do not surface the same conflict. Each cdc_* function
-  used to open three connections in sequence (compat probe → bootstrap
-  CREATEs → main work), and the read↔write handoff between them was
-  enough to trip the detector even when no user statement read the
-  metadata directly. An earlier mitigation that pushed callers to
-  `start_at := 'now'` instead of `SET VARIABLE x = (SELECT
-  max(snapshot_id) FROM …ducklake_snapshot)` only removed the visible
-  user-side read; the handoff inside the cdc_* function remained.
-- Status: handled.
-- Handling: `CheckCatalogOrThrow` and `BootstrapConsumerStateOrThrow`
-  now have `Connection&` overloads, and every cdc_* function opens one
-  internal connection up front (`duckdb::Connection conn(*context.db);
-  ConfigureCdcInternalConnection(conn);`) and threads it through the
-  compat probe, the bootstrap CREATEs, and all follow-up reads/writes.
-  Going through a single DuckDB connection means a single SQLite file
-  handle when the metadata is SQLite-backed, so there is no
-  cross-connection lock to mis-classify as a deadlock.
-  `test/sql/dml_schema_shape_pinning.test` exercises the
-  bootstrap-triggering path and is part of the standard release matrix
-  on every supported platform, including Windows MinGW.
+- Risk: The first cdc_* call against a catalog in a DuckDB process is
+  the one that bootstraps `__ducklake_cdc.*` (`CREATE SCHEMA IF NOT
+  EXISTS` + `CREATE TABLE IF NOT EXISTS` × 3) against the attached
+  metadata database (`__ducklake_metadata_<catalog>`). When the
+  immediately-preceding user statement is a read on that same attached
+  metadata database — the canonical shape being `SET VARIABLE x =
+  (SELECT max(snapshot_id) FROM __ducklake_metadata_<catalog>
+  .ducklake_snapshot)` followed by `cdc_*_consumer_create(..., start_at
+  := getvariable('x'))` — the same caller thread ends up running the
+  extension's bootstrap writes on a newly-opened internal
+  `duckdb::Connection` against the same attached database whose catalog
+  machinery the outer `ClientContext` still holds state on. The two
+  platforms surface this differently:
+  - Windows MSVC's error-checking `std::mutex::lock()` detects the
+    resulting same-thread re-entry of a shared catalog/attachment
+    mutex and throws `std::system_error(errc::
+    resource_deadlock_would_occur, "resource deadlock would occur")`,
+    which the test harness prints as
+    `Invalid Error: resource deadlock would occur: resource deadlock
+    would occur` (doubled-message shape is the MSVC STL fingerprint of
+    `std::system_error`).
+  - Windows MinGW's C runtime historically surfaced a related file-
+    locking variant — `LockFileEx` / `ERROR_POSSIBLE_DEADLOCK` mapped
+    to `EDEADLK`, printed as `Resource deadlock avoided` — on
+    SQLite-backed metadata. Linux, macOS, and Wasm don't error-check
+    `std::mutex` re-entry on the same thread, so the same code path
+    slides past silently on those platforms.
+  The most plausible shared mutex is inside the auto-loaded DuckLake
+  extension's catalog (it owns the attached metadata database and
+  sees both the outer read and the inner bootstrap write against it);
+  secondary candidates are `DatabaseManager::databases_lock` and the
+  dependency-manager write lock on the same `AttachedDatabase`. A
+  debug-build MSVC stack trace at the `std::system_error` throw site
+  would pin which one exactly; we haven't invested in that yet because
+  no real user has hit this outside the regression-test pattern
+  described below.
+- Status: partially handled.
+- Handling (source side, kept): `CheckCatalogOrThrow` and
+  `BootstrapConsumerStateOrThrow` have `Connection&` overloads, and
+  every cdc_* function opens one internal connection up front
+  (`duckdb::Connection conn(*context.db); ConfigureCdcInternalConnection
+  (conn);`) and threads it through the compat probe, the bootstrap
+  CREATEs, and all follow-up reads/writes. That closes the separate
+  3-internal-connection MinGW variant (the original shape of this
+  hazard). It does not close the outer-conn ↔ inner-conn handoff, which
+  requires upstream (DuckDB + DuckLake) lock-ordering work to fix
+  in-source.
+- Handling (test side): `test/sql/dml_schema_shape_pinning.test` uses
+  `start_at := 'now'` for the two bootstrap-triggering
+  `cdc_*_consumer_create` calls against a freshly attached catalog.
+  `'now'` resolves the head inside the extension's own internal
+  connection (no user-conn read of the metadata database preceding
+  the first bootstrap write), which sidesteps the residual hazard.
+  Subsequent `cdc_*_consumer_create` calls on the same catalog are
+  post-bootstrap and stay safe even in the `getvariable(...)` form,
+  so the shape-pinning semantics the test exists to guard are still
+  exercised end-to-end.
 - Notes: DuckLake's documented `META_JOURNAL_MODE 'WAL'` and
-  `META_BUSY_TIMEOUT` ATTACH options improve concurrency on SQLite-backed
-  catalogs in general (see duckdb/ducklake#128) and should be used by
-  operators who need many concurrent writers; they're orthogonal to this
-  fix.
-- Next action: If a future cdc_* function adds a code path that opens a
-  second internal connection against the metadata catalog, route it
-  through the existing `conn` instead — the `Connection&` overloads are
-  there for exactly that reason.
+  `META_BUSY_TIMEOUT` ATTACH options improve concurrency on
+  SQLite-backed catalogs in general (see duckdb/ducklake#128) and are
+  orthogonal to this hazard.
+- User-facing guidance: If an orchestrator runs a SELECT against
+  `__ducklake_metadata_<catalog>` and then immediately makes its first
+  `cdc_*_consumer_create` call against that catalog in the same DuckDB
+  process on Windows MSVC, either (a) pin via `start_at := 'now'` /
+  `'beginning'` instead of resolving the snapshot on the user
+  connection, (b) drive a read-only cdc_* call first (e.g.
+  `cdc_list_consumers`, `cdc_window` on a pre-existing consumer, or
+  `cdc_dml_ticks_query`) so the bootstrap is not the first write, or
+  (c) run the preceding metadata read on a separate DuckDB process.
+- Next action: If we see this hit by a real user outside the
+  regression-test pattern, capture an MSVC debug-build stack trace at
+  the `std::system_error(resource_deadlock_would_occur)` throw site to
+  identify the specific shared mutex, then either serialize the
+  outer-to-inner transition in our code or file an upstream issue on
+  the offending lock's ordering contract.
