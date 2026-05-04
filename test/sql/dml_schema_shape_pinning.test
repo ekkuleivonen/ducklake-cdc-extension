@@ -1,0 +1,286 @@
+# name: test/sql/dml_schema_shape_pinning.test
+# description: DML consumers are pinned to their schema shape: empty windows
+# group: [sql]
+
+#              auto-advance, schema changes for subscribed tables terminate the
+#              consumer, schema changes for unsubscribed tables don't, and
+#              commits past the boundary raise CDC_SCHEMA_TERMINATED.
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/dml_schema_shape_pinning.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/dml_schema_shape_pinning_data');
+
+# ---------------------------------------------------------------------------
+# Setup: two tables in the default schema; one consumer subscribed to t1.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE lake.t1(id INTEGER, payload VARCHAR);
+
+statement ok
+CREATE TABLE lake.t2(id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO lake.t1 VALUES (1, 'a');
+
+statement ok
+SET VARIABLE pinned_snapshot = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'shape_pin',
+  table_name := 't1',
+  start_at := getvariable('pinned_snapshot')::VARCHAR
+);
+
+# ---------------------------------------------------------------------------
+# Rule 1 — Schema/DML changes on UNSUBSCRIBED objects don't stop the consumer
+# and don't leave an empty backlog stuck on the cursor.
+#
+# We commit a t2 change (snap N+1) and a t1 change (snap N+2) and a t2
+# ALTER (snap N+3). A single nonblocking listen for t1 must:
+#   - advance past N+1 (no t1 row there);
+#   - return the t1 row at N+2;
+#   - advance past N+3 (DDL on t2, irrelevant to a DML consumer pinned to t1).
+# ---------------------------------------------------------------------------
+
+statement ok
+INSERT INTO lake.t2 VALUES (10, 'unsubscribed');
+
+statement ok
+INSERT INTO lake.t1 VALUES (2, 'b');
+
+statement ok
+ALTER TABLE lake.t2 ADD COLUMN tag VARCHAR;
+
+# Drain everything currently visible. The listen returns the t1 INSERT.
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_changes_listen('lake', 'shape_pin', timeout_ms := 0, max_snapshots := 1000)
+WHERE table_name = 'main.t1' AND change_type = 'insert';
+----
+true
+
+# Commit forward through everything we've drained so far (including the
+# unsubscribed t2 ALTER) and verify the cursor advanced past N+1, N+2, N+3.
+statement ok
+SET VARIABLE pre_alter = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+SELECT * FROM cdc_commit('lake', 'shape_pin', getvariable('pre_alter'));
+
+# Sanity: now there's nothing else to do; window is "caught up", not terminal.
+# Catalog-wide DDL (the t2 ALTER) does NOT show up in schema_changes_pending
+# for a DML consumer pinned to t1 — that flag is strictly subscribed-table
+# scoped now.
+query IIII
+SELECT has_changes, schema_changes_pending, terminal, terminal_at_snapshot
+FROM cdc_window('lake', 'shape_pin', max_snapshots := 1000);
+----
+false	false	false	NULL
+
+# ---------------------------------------------------------------------------
+# Rule 2 — Schema changes on SUBSCRIBED tables terminate the consumer.
+#
+# After ALTER t1, the consumer's cdc_window must report has_changes=false
+# and schema_changes_pending=true. Listen returns zero rows. Cursor parked
+# strictly before the ALTER snapshot.
+# ---------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE lake.t1 ADD COLUMN extra VARCHAR;
+
+statement ok
+SET VARIABLE alter_snapshot = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+# Insert post-ALTER DML so the new shape has visible rows; the terminated
+# consumer must NOT see them.
+statement ok
+INSERT INTO lake.t1 VALUES (4, 'd', 'tagged');
+
+# Terminal: has_changes=false AND schema_changes_pending=true AND
+# terminal=true. terminal_at_snapshot points at the ALTER snapshot.
+query IIII
+SELECT has_changes, schema_changes_pending, terminal,
+       terminal_at_snapshot = getvariable('alter_snapshot')
+FROM cdc_window('lake', 'shape_pin', max_snapshots := 1000);
+----
+false	true	true	true
+
+# Listen returns zero rows.
+query I
+SELECT count(*)
+FROM cdc_dml_changes_listen('lake', 'shape_pin', timeout_ms := 0, max_snapshots := 1000);
+----
+0
+
+# Cursor parked strictly before the ALTER snapshot (idempotent commits OK).
+# cdc_list_consumers also exposes terminal_at_snapshot so an orchestrator
+# can plan the successor without driving cdc_window first.
+query II
+SELECT last_committed_snapshot < getvariable('alter_snapshot'),
+       terminal_at_snapshot = getvariable('alter_snapshot')
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'shape_pin';
+----
+true	true
+
+# ---------------------------------------------------------------------------
+# Rule 3 — cdc_commit past the boundary raises CDC_SCHEMA_TERMINATED.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM cdc_commit('lake', 'shape_pin', getvariable('alter_snapshot'));
+----
+CDC_SCHEMA_TERMINATED
+
+# ---------------------------------------------------------------------------
+# Rule 4 — cdc_consumer_reset cannot cross the boundary either.
+#
+# Forward across the boundary is rejected (target = alter_snapshot).
+# Backward across an earlier boundary is rejected too. Same-shape rewinds
+# are still allowed.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM cdc_consumer_reset('lake', 'shape_pin', to_snapshot := getvariable('alter_snapshot')::VARCHAR);
+----
+CDC_SCHEMA_TERMINATED
+
+# Same-shape rewind: reset to 'beginning' from a cursor still in the
+# pre-ALTER epoch is a no-op for cross-shape detection (no boundary
+# strictly between 0 and the current cursor).
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'shape_pin', to_snapshot := 'beginning');
+
+# Cursor moved to the beginning; the consumer is no longer terminal yet —
+# but the same ALTER on t1 still terminates a future window scan. The
+# window is non-empty (has_changes=true) and `terminal_at_snapshot` still
+# points at the boundary so an orchestrator can see the upcoming
+# termination ahead of time. `terminal` itself only flips once the cursor
+# reaches `boundary - 1`.
+query IIII
+SELECT has_changes, schema_changes_pending, terminal,
+       terminal_at_snapshot = getvariable('alter_snapshot')
+FROM cdc_window('lake', 'shape_pin', max_snapshots := 1000);
+----
+true	true	false	true
+
+# ---------------------------------------------------------------------------
+# Rule 5 — A successor consumer started past the boundary reads new DML.
+#
+# The orchestration story: a DDL consumer surfaces the boundary, the user
+# spawns a fresh DML consumer with start_at = alter_snapshot, and that
+# consumer reads the post-ALTER row.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'shape_pin_v2',
+  table_name := 't1',
+  start_at := getvariable('alter_snapshot')::VARCHAR
+);
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_changes_listen('lake', 'shape_pin_v2', timeout_ms := 0, max_snapshots := 1000)
+WHERE table_name = 'main.t1' AND change_type = 'insert';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Rule 6 — DROP SCHEMA … CASCADE for the subscribed table's containing
+# schema also terminates the consumer.
+#
+# The detector matches `dropped_schema:<schema_id>` against the
+# subscription's schema_id. Even if DuckLake also emits per-table
+# `dropped_table:<id>` tokens, this gives belt-and-suspenders coverage
+# against future changes to that decomposition.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA lake.events;
+
+statement ok
+CREATE TABLE lake.events.audit(id INTEGER, msg VARCHAR);
+
+statement ok
+INSERT INTO lake.events.audit VALUES (1, 'hello');
+
+statement ok
+SET VARIABLE pre_drop = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'audit_sink',
+  table_name := 'events.audit',
+  start_at := getvariable('pre_drop')::VARCHAR
+);
+
+statement ok
+INSERT INTO lake.events.audit VALUES (2, 'world');
+
+statement ok
+DROP SCHEMA lake.events CASCADE;
+
+statement ok
+SET VARIABLE drop_schema_snapshot = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+# Drain the one pre-drop INSERT (the second INSERT lives in a snapshot
+# before the DROP), then commit and confirm termination at the DROP
+# SCHEMA snapshot.
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_changes_listen('lake', 'audit_sink', timeout_ms := 0, max_snapshots := 1000)
+WHERE change_type = 'insert';
+----
+true
+
+# Park the cursor right before the DROP SCHEMA boundary by committing the
+# pre-drop end_snapshot the listen call read.
+statement ok
+SET VARIABLE pre_drop_end = (
+  SELECT end_snapshot FROM cdc_window('lake', 'audit_sink', max_snapshots := 1000)
+);
+
+statement ok
+SELECT * FROM cdc_commit('lake', 'audit_sink', getvariable('pre_drop_end'));
+
+# Now terminal at the DROP SCHEMA boundary: terminal=true and
+# terminal_at_snapshot points at the DROP SCHEMA snapshot.
+query II
+SELECT terminal,
+       terminal_at_snapshot = getvariable('drop_schema_snapshot')
+FROM cdc_window('lake', 'audit_sink', max_snapshots := 1000);
+----
+true	true
+
+statement error
+SELECT * FROM cdc_commit('lake', 'audit_sink', getvariable('drop_schema_snapshot'));
+----
+CDC_SCHEMA_TERMINATED

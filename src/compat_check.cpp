@@ -16,6 +16,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -64,6 +65,11 @@ bool IsSupported(const std::string &version) {
 		}
 	}
 	return false;
+}
+
+std::mutex &CompatProbeMutex() {
+	static std::mutex mutex;
+	return mutex;
 }
 
 // Builds the docs/errors.md `CDC_INCOMPATIBLE_CATALOG` reference message.
@@ -198,9 +204,10 @@ void EmitCompatNoticesIfAny(duckdb::DatabaseInstance &db) {
 }
 
 void CheckCatalogOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
-	duckdb::Connection conn(*context.db);
 	std::string observed_version;
 	try {
+		std::lock_guard<std::mutex> lock(CompatProbeMutex());
+		duckdb::Connection conn(*context.db);
 		observed_version = ReadCatalogVersion(conn, catalog_name);
 	} catch (...) {
 		// A missing metadata schema means this is not a DuckLake catalog. Let

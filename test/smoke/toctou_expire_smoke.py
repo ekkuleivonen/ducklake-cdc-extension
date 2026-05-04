@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
 	// produce a clean window.
 	const auto pin_snapshot = std::to_string(snapshot_ids[1]);
 	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'toctou', start_at := '" + pin_snapshot +
-	                 "', table_names := ['toctou'])");
+	                 "', table_name := 'toctou')");
 
 	auto window_a = RequireOk(a, "SELECT * FROM cdc_window('lake', 'toctou')");
 	if (!window_a->Cast<MaterializedQueryResult>().GetValue(2, 0).GetValue<bool>()) {

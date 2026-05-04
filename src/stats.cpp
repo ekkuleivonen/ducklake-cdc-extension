@@ -84,6 +84,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
 	                                MetadataTable(data.catalog_name, "ducklake_snapshot"));
@@ -239,6 +240,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditEventsInit(duckdb::
 	BootstrapConsumerStateOrThrow(context, data.catalog_name);
 
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 	const auto audit = StateTable(conn, data.catalog_name, AUDIT_TABLE);
 	std::ostringstream where;
 	where << " WHERE epoch(ts::TIMESTAMP WITH TIME ZONE) >= epoch(now()) - " << data.since_seconds;
@@ -308,13 +310,19 @@ bool LeaseIsAlive(duckdb::Connection &conn, const duckdb::Value &heartbeat, int6
 
 bool HasPendingSchemaBoundary(duckdb::Connection &conn, const std::string &catalog_name, const ConsumerRow &consumer,
                               int64_t current_snapshot) {
-	if (!consumer.stop_at_schema_change) {
-		return false;
-	}
 	const auto first_snapshot =
 	    FirstSnapshotAfter(conn, catalog_name, consumer.last_committed_snapshot, current_snapshot);
 	if (first_snapshot == -1) {
 		return false;
+	}
+	if (consumer.consumer_kind == "dml") {
+		// For DML consumers the boundary is scoped strictly to the
+		// consumer's subscribed tables. A catalog-wide schema change on
+		// some other table is not a doctor-level concern for this
+		// consumer (the listen path auto-advances past it).
+		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, catalog_name, consumer.consumer_name);
+		return NextDmlSubscribedSchemaChangeSnapshot(conn, catalog_name, consumer.last_committed_snapshot,
+		                                             current_snapshot, subscriptions) != -1;
 	}
 	if (SnapshotIsExternalSchemaChange(conn, catalog_name, first_snapshot)) {
 		return true;
@@ -353,6 +361,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDoctorInit(duckdb::Clien
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcDoctorData>();
 	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
 
 	if (!MetadataSchemaExists(conn, data.catalog_name)) {
 		AddDoctorRow(*result, "error", "CDC_INCOMPATIBLE_CATALOG", duckdb::Value(),

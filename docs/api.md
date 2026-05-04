@@ -47,20 +47,17 @@ release.
   [`cdc_ddl_changes_read`](#cdc_ddl_changes_read),
   [`cdc_ddl_ticks_listen`](#cdc_ddl_ticks_listen),
   [`cdc_ddl_ticks_read`](#cdc_ddl_ticks_read)
-- Stateful DML:
+- Stateful DML (one consumer = one table; row shape projects the
+  pinned table's native columns at the top level):
   [`cdc_dml_changes_listen`](#cdc_dml_changes_listen),
   [`cdc_dml_changes_read`](#cdc_dml_changes_read),
   [`cdc_dml_ticks_listen`](#cdc_dml_ticks_listen),
   [`cdc_dml_ticks_read`](#cdc_dml_ticks_read)
-- Typed table DML:
-  [`cdc_dml_table_changes_listen`](#cdc_dml_table_changes_listen),
-  [`cdc_dml_table_changes_read`](#cdc_dml_table_changes_read)
 - Stateless:
   [`cdc_ddl_changes_query`](#cdc_ddl_changes_query),
   [`cdc_dml_changes_query`](#cdc_dml_changes_query),
   [`cdc_ddl_ticks_query`](#cdc_ddl_ticks_query),
   [`cdc_dml_ticks_query`](#cdc_dml_ticks_query),
-  [`cdc_dml_table_changes_query`](#cdc_dml_table_changes_query),
   [`cdc_schema_diff`](#cdc_schema_diff)
 
 ---
@@ -116,13 +113,21 @@ Returns:
 consumer_name VARCHAR
 consumer_kind VARCHAR        -- ddl | dml
 consumer_id BIGINT
+table_id BIGINT              -- DML only: the consumer's pinned table_id;
+                             --   NULL for DDL consumers
+table_name VARCHAR           -- DML only: the *current* qualified name of
+                             --   the pinned table (the extension chases
+                             --   renames so orchestrators don't have to);
+                             --   NULL for DDL consumers
 subscription_count BIGINT
 subscriptions_active BIGINT
 subscriptions_renamed BIGINT
 subscriptions_dropped BIGINT
-stop_at_schema_change BOOLEAN
 last_committed_snapshot BIGINT
 last_committed_schema_version BIGINT
+terminal_at_snapshot BIGINT  -- NULL for DDL; for DML: snapshot id of the next
+                             --   subscribed-table shape change, NULL when
+                             --   none is pending
 owner_token UUID
 owner_acquired_at TIMESTAMPTZ
 owner_heartbeat_at TIMESTAMPTZ
@@ -132,6 +137,14 @@ created_by VARCHAR
 updated_at TIMESTAMPTZ
 metadata VARCHAR
 ```
+
+`terminal_at_snapshot` is a forward-looking signal for orchestrators (typically
+a DDL consumer driving DML consumer lifecycles): it is non-NULL while a DML
+consumer still has snapshots to drain but a shape change for its pinned table
+is queued in the catalog. Once the consumer's cursor reaches the snapshot just
+before that boundary, `cdc_window` will report `terminal = true` (see below)
+and the orchestrator should spawn a successor consumer at
+`terminal_at_snapshot`.
 
 ### `cdc_list_subscriptions`
 
@@ -260,22 +273,68 @@ FROM cdc_dml_consumer_create(
   catalog,
   name,
   start_at      := 'now',       -- 'now' | 'beginning' | 'oldest' | snapshot id
-  table_names   := NULL,        -- LIST<VARCHAR>; name sugar resolved at start_at
-  table_ids     := NULL,        -- LIST<BIGINT>; preferred stable identity input
+  table_name    := NULL,        -- VARCHAR; name sugar resolved at start_at
+  table_id      := NULL,        -- BIGINT; preferred stable identity input
   change_types  := ['*'],       -- * | insert | update_preimage | update_postimage | delete
   metadata      := NULL
 );
 ```
 
-Creates a durable DML consumer for one or more concrete table identities.
+Creates a durable DML consumer pinned to **exactly one** concrete table
+identity. Pass exactly one of `table_name` or `table_id`; the bind
+rejects "both set" and "neither set".
+
+Multi-table fan-out is **not** part of the DML consumer contract. It
+belongs to the orchestrator: spawn one DML consumer per table and join
+downstream of the sinks. This keeps the schema-shape termination
+contract crisp — when the pinned table's shape changes, that one
+consumer hard-stops and the orchestrator spawns a successor at the
+boundary snapshot.
 
 DML consumers do not dynamically subscribe to future tables through schema or
 catalog filters. That policy belongs in application code, usually driven by a
 separate DDL consumer.
 
-Name inputs are resolved at `start_at` and persisted as `table_id`. A table
-subscription follows the same `table_id` across renames. Drop + recreate with
-the same name is a new identity and requires a new subscription/consumer.
+Name input is resolved at `start_at` and persisted as `table_id`. The
+table subscription follows the same `table_id` across renames. Drop +
+recreate with the same name is a new identity and requires a new
+subscription/consumer.
+
+DML consumers are pinned to the schema shape of their subscribed table at
+creation time. The shape is implicit: it is whatever shape applies at
+`last_committed_snapshot`. The first snapshot strictly after the cursor that
+touches the subscribed identity with a shape-affecting DuckLake token is the
+consumer's terminal boundary. The detector matches the DuckLake 1.0
+`changes_made` vocabulary:
+
+- `altered_table:<id>` for the subscribed table_id (covers `ALTER TABLE …
+  ADD/DROP COLUMN` and `ALTER TABLE … RENAME` — DuckLake encodes renames
+  as ALTER, not as a separate token);
+- `dropped_table:<id>` for the subscribed table_id;
+- `dropped_schema:<id>` for the subscription's schema_id (covers
+  `DROP SCHEMA … CASCADE` of the subscribed table's containing schema).
+
+At the boundary:
+
+- `cdc_window` returns `has_changes = false`, `schema_changes_pending =
+  true`, and `terminal = true`. `terminal_at_snapshot` exposes the
+  boundary snapshot id. The cursor is parked at `boundary - 1`.
+- The DML listen and read paths return zero rows.
+- `cdc_commit` to a snapshot at or past the boundary raises
+  `CDC_SCHEMA_TERMINATED`.
+- `cdc_consumer_reset` to a target on the other side of any boundary in the
+  cursor-to-target range raises `CDC_SCHEMA_TERMINATED`. Same-shape rewinds
+  are still allowed.
+
+To consume the post-change shape, create a new DML consumer with `start_at`
+at or after the boundary snapshot. DDL consumers are the discovery primitive
+that surfaces the boundary; orchestration sits in application code.
+
+Schema changes that do NOT touch any subscribed identity (e.g. `ALTER TABLE`
+on some other table, or `CREATE TABLE` for a table the consumer does not
+subscribe to) are NOT terminal. The DML listen path auto-advances past them
+without delivering an empty batch and without setting
+`schema_changes_pending`.
 
 Returns the same row shape as `cdc_list_subscriptions`, limited to the created
 consumer.
@@ -292,6 +351,12 @@ Repositions the cursor and clears the lease.
 `to_snapshot` accepts `'now'`, `'beginning'`, `'oldest'`, or an explicit snapshot
 id. Resetting can replay older data, fast-forward a broken consumer, or recover
 from a retention gap.
+
+DML consumers refuse resets that would cross a schema-shape boundary for the
+subscribed table. The reset target must be in the same shape epoch as the
+current cursor. Crossing a boundary in either direction raises
+`CDC_SCHEMA_TERMINATED`; create a new consumer with `start_at` in the
+desired shape epoch instead.
 
 Returns:
 
@@ -377,7 +442,43 @@ end_snapshot BIGINT
 has_changes BOOLEAN
 schema_version BIGINT
 schema_changes_pending BOOLEAN
+terminal BOOLEAN
+terminal_at_snapshot BIGINT
 ```
+
+`schema_changes_pending` is consumer-kind-aware:
+
+- **DDL consumers**: `true` when a catalog-wide schema-version transition
+  (any `altered_*`, `dropped_*`, `renamed_*`, or shape-affecting
+  `created_*` token) lands inside the visible range. The schema-change
+  snapshot itself is included in the window so the DDL events can be
+  drained in the same call.
+- **DML consumers**: `true` only when a shape-affecting token for the
+  consumer's *pinned table* is queued in the visible range
+  (`altered_table:<id>` / `dropped_table:<id>` / `dropped_schema:<id>`
+  where `<id>` matches the subscription). Catalog-wide DDL on
+  unsubscribed objects is invisible: the listen path auto-advances the
+  cursor past those snapshots (see [Stateful DML](#stateful-dml)).
+
+For DML consumers, the window is bounded above by that schema-shape
+boundary. When the cursor is parked at `boundary - 1`, the next window is
+`[boundary, boundary - 1]` with `has_changes = false`,
+`schema_changes_pending = true`, and `terminal = true`. That triple is
+the terminal signal: read paths return zero rows, `cdc_commit` past the
+boundary raises `CDC_SCHEMA_TERMINATED`, and the consumer must be
+replaced (see `cdc_dml_consumer_create`).
+
+`terminal` is `true` only for DML consumers that have reached their
+shape boundary. DDL consumers always report `terminal = false`.
+
+`terminal_at_snapshot` is the snapshot id of the offending shape change.
+It is non-NULL whenever a DML consumer has a pending boundary in the
+catalog — i.e. whenever a subscribed-table shape change exists in
+`(last_committed_snapshot, current_snapshot]` — even when the cursor has
+not yet reached `boundary - 1`. This lets orchestrators (typically a DDL
+consumer) plan the successor before the current consumer drains. The
+field is NULL for DDL consumers and for DML consumers with no pending
+boundary.
 
 ### `cdc_commit`
 
@@ -394,6 +495,11 @@ This is the safe at-least-once contract:
 ```text
 listen/read -> write sink durably -> cdc_commit
 ```
+
+For DML consumers, `cdc_commit` validates `snapshot_id` against the
+consumer's pinned schema-shape boundary. A commit that would land at or past
+the boundary raises `CDC_SCHEMA_TERMINATED` and the cursor stays parked.
+Idempotent commits to the current cursor are always allowed.
 
 Returns:
 
@@ -520,9 +626,21 @@ change_count BIGINT
 
 ## Stateful DML
 
-Consumer-level DML functions are generic and multi-table. They return a stable
-schema regardless of the subscribed tables. Use typed table DML functions when
-the caller wants DuckDB-typed user columns for one table.
+DML consumers are pinned to exactly one table by contract (see
+`cdc_dml_consumer_create`). The DML payload API is therefore unified:
+there is one read/listen pair, and rows project the pinned table's
+**native columns** at the top level — no separate "table changes"
+function and no JSON `values` blob.
+
+All DML listen functions auto-advance through *non-terminal* empty windows.
+A window is non-terminal when `cdc_window` reports `has_changes = true` but
+the listen scan returns zero rows (the in-window snapshots only carry
+changes for tables this consumer is not subscribed to). The extension
+commits the cursor to `end_snapshot` so the consumer does not get pinned on
+irrelevant catalog activity. Auto-advance does NOT fire on terminal windows
+(`has_changes = false` from `cdc_window`); those leave the cursor parked at
+the schema-shape boundary, and `cdc_commit` past the boundary raises
+`CDC_SCHEMA_TERMINATED`.
 
 ### `cdc_dml_changes_listen`
 
@@ -537,10 +655,10 @@ FROM cdc_dml_changes_listen(
 );
 ```
 
-Waits until DML rows matching the consumer are available or the deadline is
-reached, then returns generic DML changes for all subscribed tables.
+Waits until DML rows for the consumer's pinned table are available or the
+deadline is reached, then returns typed DML rows.
 
-Returns the same row shape as `cdc_dml_changes_read`.
+Returns the same variable row shape as `cdc_dml_changes_read`.
 
 ### `cdc_dml_changes_read`
 
@@ -556,32 +674,37 @@ FROM cdc_dml_changes_read(
 );
 ```
 
-Reads generic DML changes for all tables subscribed by the consumer. If an
-explicit range is supplied, the function uses it directly. Otherwise it resolves
+Reads typed DML rows for the consumer's pinned table. If an explicit
+range is supplied, the function uses it directly. Otherwise it resolves
 the current consumer window.
 
-Returns:
+The pinned table identity is implicit (set at
+`cdc_dml_consumer_create` time and tracked across renames via
+subscription rows); there is no per-call `table_name` / `table_id`
+override.
+
+Returns a variable schema:
 
 ```text
 consumer_name VARCHAR
 start_snapshot BIGINT
 end_snapshot BIGINT
 snapshot_id BIGINT
-snapshot_time TIMESTAMPTZ
-schema_id BIGINT
-schema_name VARCHAR
-table_id BIGINT
-table_name VARCHAR
 rowid BIGINT
-change_type VARCHAR       -- insert | update_preimage | update_postimage | delete
-values JSON               -- stable generic payload for the table row
+change_type VARCHAR        -- insert | update_preimage | update_postimage | delete
+table_id BIGINT            -- the pinned table's stable id (redundant on every
+                           --   row, but cheap and lets fan-out sinks route
+                           --   without external bookkeeping)
+table_name VARCHAR         -- the pinned table's *current* qualified name
+<user columns from the table...>
+snapshot_time TIMESTAMPTZ
 author VARCHAR
 commit_message VARCHAR
 commit_extra_info VARCHAR
 ```
 
-For `insert` and `update_postimage`, `values` is the emitted row. For
-`update_preimage` and `delete`, `values` is the previous row version.
+For `insert` and `update_postimage`, the user columns hold the emitted row.
+For `update_preimage` and `delete`, they hold the previous row version.
 
 ### `cdc_dml_ticks_listen`
 
@@ -634,68 +757,6 @@ change_count BIGINT
 
 ---
 
-## Typed Table DML
-
-Typed table DML functions return one table's user columns with their DuckDB
-types. They are best for application code that joins, validates, or transforms a
-small set of known tables.
-
-### `cdc_dml_table_changes_listen`
-
-```sql
-SELECT *
-FROM cdc_dml_table_changes_listen(
-  catalog,
-  name,
-  table_id      := NULL,
-  table_name    := NULL,
-  timeout_ms    := 30000,
-  max_snapshots := 100,
-  auto_commit   := FALSE
-);
-```
-
-Waits for DML changes for one subscribed table and returns typed rows.
-
-Returns the same variable row shape as `cdc_dml_table_changes_read`.
-
-### `cdc_dml_table_changes_read`
-
-```sql
-SELECT *
-FROM cdc_dml_table_changes_read(
-  catalog,
-  name,
-  table_id       := NULL,
-  table_name     := NULL,
-  start_snapshot := NULL,
-  end_snapshot   := NULL,
-  max_snapshots  := 100,
-  auto_commit    := FALSE
-);
-```
-
-Reads typed DML rows for one subscribed table. `table_id` is preferred.
-`table_name` is name sugar resolved inside the requested range.
-
-Returns a variable schema:
-
-```text
-consumer_name VARCHAR
-start_snapshot BIGINT
-end_snapshot BIGINT
-snapshot_id BIGINT
-rowid BIGINT
-change_type VARCHAR
-<user columns from the table...>
-snapshot_time TIMESTAMPTZ
-author VARCHAR
-commit_message VARCHAR
-commit_extra_info VARCHAR
-```
-
----
-
 ## Stateless Queries
 
 Stateless functions do not create a consumer, acquire a lease, or advance a
@@ -730,17 +791,19 @@ FROM cdc_dml_changes_query(
   catalog,
   from_snapshot,
   to_snapshot := NULL,
-  table_names := NULL,
-  table_ids   := NULL,
-  change_types := ['*']
+  table_id    := NULL,        -- BIGINT; preferred stable identity input
+  table_name  := NULL         -- VARCHAR; name sugar resolved at to_snapshot
 );
 ```
 
-Returns generic multi-table DML changes over an explicit range. Use
-`cdc_dml_table_changes_query` for typed rows from one table.
+Stateless single-table typed DML lookback. Pass exactly one of
+`table_id` or `table_name`.
 
-Returns the same payload columns as `cdc_dml_changes_read`, without
-`consumer_name`, `start_snapshot`, or `end_snapshot`.
+Returns the same variable row shape as `cdc_dml_changes_read`, without
+`consumer_name`, `start_snapshot`, or `end_snapshot`. The pinned-table
+columns appear at the top level alongside `snapshot_id`, `rowid`,
+`change_type`, and the snapshot's `author` / `commit_message` /
+`commit_extra_info`.
 
 ### `cdc_ddl_ticks_query`
 
@@ -778,25 +841,6 @@ FROM cdc_dml_ticks_query(
 Returns DML-relevant snapshot/table ticks over an explicit range.
 
 Returns the same payload columns as `cdc_dml_ticks_read`, without
-`consumer_name`, `start_snapshot`, or `end_snapshot`.
-
-### `cdc_dml_table_changes_query`
-
-```sql
-SELECT *
-FROM cdc_dml_table_changes_query(
-  catalog,
-  from_snapshot,
-  to_snapshot := NULL,
-  table_id    := NULL,
-  table_name  := NULL
-);
-```
-
-Returns typed DML rows for one table over an explicit range. This is the
-stateless sibling of `cdc_dml_table_changes_read`.
-
-Returns the same variable row shape as `cdc_dml_table_changes_read`, without
 `consumer_name`, `start_snapshot`, or `end_snapshot`.
 
 ### `cdc_schema_diff`

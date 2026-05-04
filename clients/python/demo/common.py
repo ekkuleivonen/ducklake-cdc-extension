@@ -17,8 +17,11 @@ CATALOG_PATH = WORK_DIR / "demo.sqlite"
 DATA_PATH = WORK_DIR / "demo_data"
 LOCK_RETRY_SECONDS = 0.2
 CATALOG_ENV = "DUCKLAKE_DEMO_CATALOG"
+CATALOG_ADMIN_ENV = "DUCKLAKE_DEMO_CATALOG_ADMIN"
 STORAGE_ENV = "DUCKLAKE_DEMO_STORAGE"
 DEFAULT_POSTGRES_CATALOG = "postgresql://ducklake:ducklake@localhost:5435/ducklake"
+DEFAULT_POSTGRES_ADMIN_CATALOG = "postgresql://ducklake:ducklake@localhost:5436/ducklake"
+DEMO_PG_POOL_MAX_CONNECTIONS = 64
 T = TypeVar("T")
 
 
@@ -29,11 +32,15 @@ def open_demo_lake(
     catalog_backend: str | None = None,
     storage: str | None = None,
 ) -> DuckLake:
-    duckdb = (
-        DuckDBConfig(config={"allow_unsigned_extensions": True})
-        if allow_unsigned_extensions
-        else None
-    )
+    duckdb_config: dict[str, int | bool] = {
+        # The postgres-scanner pool defaults to 8 connections. The demo can
+        # legitimately run one DuckLake connection per producer/consumer worker,
+        # so lift the pool ceiling instead of making --workers 10 look hung.
+        "pg_pool_max_connections": DEMO_PG_POOL_MAX_CONNECTIONS,
+    }
+    if allow_unsigned_extensions:
+        duckdb_config["allow_unsigned_extensions"] = True
+    duckdb = DuckDBConfig(config=duckdb_config)
     catalog_input = resolve_catalog(catalog=catalog, catalog_backend=catalog_backend)
     storage_input = resolve_storage(storage=storage)
     return DuckLake(
@@ -76,7 +83,7 @@ def reset_demo_catalog(*, catalog: str | SqliteCatalog) -> None:
         Path(catalog.path).unlink(missing_ok=True)
         return
     if _is_postgres_catalog(catalog):
-        reset_postgres_database(_strip_ducklake_postgres_prefix(catalog))
+        reset_postgres_database(_postgres_reset_dsn(catalog))
         return
     if catalog.startswith("sqlite://"):
         Path(urlsplit(catalog).path).unlink(missing_ok=True)
@@ -139,12 +146,23 @@ def _strip_ducklake_postgres_prefix(catalog: str) -> str:
     return catalog.removeprefix("ducklake:postgres:")
 
 
+def _postgres_reset_dsn(catalog: str) -> str:
+    configured = environ.get(CATALOG_ADMIN_ENV)
+    if configured:
+        return _strip_ducklake_postgres_prefix(configured)
+
+    dsn = _strip_ducklake_postgres_prefix(catalog)
+    if dsn == DEFAULT_POSTGRES_CATALOG:
+        return DEFAULT_POSTGRES_ADMIN_CATALOG
+    return dsn
+
+
 def retry_on_lock(operation: Callable[[], T]) -> T:
     while True:
         try:
             return operation()
         except DuckLakeError as exc:
-            if not is_database_locked(exc):
+            if not (is_database_locked(exc) or is_thread_join_deadlock(exc)):
                 raise
             time.sleep(LOCK_RETRY_SECONDS)
 
@@ -153,6 +171,16 @@ def is_database_locked(exc: BaseException) -> bool:
     current: BaseException | None = exc
     while current is not None:
         if "database is locked" in str(current).lower():
+            return True
+        current = current.__cause__
+    return False
+
+
+def is_thread_join_deadlock(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "thread::join failed" in message and "resource deadlock avoided" in message:
             return True
         current = current.__cause__
     return False

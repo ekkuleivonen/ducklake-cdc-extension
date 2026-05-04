@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
 
 	RequireOk(a, "CREATE TABLE lake.iw(id INTEGER)");
 	RequireOk(a, "INSERT INTO lake.iw VALUES (1)");
-	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'iw_consumer', table_names := ['iw'])");
+	RequireOk(a, "SELECT * FROM cdc_dml_consumer_create('lake', 'iw_consumer', table_name := 'iw')");
 
 	std::atomic<bool> wait_started{false};
 	std::atomic<bool> wait_completed{false};

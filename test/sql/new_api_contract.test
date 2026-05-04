@@ -87,7 +87,7 @@ statement ok
 SELECT * FROM cdc_dml_consumer_create(
   'lake',
   'listen_backlog',
-  table_names := ['orders'],
+  table_name := 'orders',
   start_at := 'now'
 );
 
@@ -122,6 +122,16 @@ Catalog Error
 
 statement error
 SELECT * FROM cdc_dml_table_changes_read('lake', 'legacy', 'orders');
+----
+Catalog Error
+
+# Generic JSON DML reads were removed: there is one DML payload API
+# (`cdc_dml_changes_read` / `_listen` / `_query`) projecting the consumer's
+# pinned table's native columns. The OLD `cdc_dml_changes_read`/`_listen`
+# took LIST overrides and emitted a JSON `values` column; that surface is
+# gone.
+statement error
+SELECT * FROM cdc_dml_changes_read('lake', 'legacy', table_names := ['orders']);
 ----
 Binder Error
 

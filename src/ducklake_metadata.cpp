@@ -19,7 +19,9 @@
 #include "duckdb/parser/keyword_helper.hpp"
 
 #include <cctype>
+#include <mutex>
 #include <sstream>
+#include <unordered_set>
 
 namespace duckdb_cdc {
 
@@ -171,6 +173,15 @@ std::string GenerateUuid(duckdb::Connection &conn) {
 	return result->GetValue(0, 0).ToString();
 }
 
+void ConfigureCdcInternalConnection(duckdb::Connection &conn) {
+	// CDC internal connections execute short metadata lookups and materialize
+	// table-function results. Letting DuckDB parallelize those queries can make
+	// one logical consumer occupy most of the postgres-scanner connection pool.
+	// Keep the internal work serial; user analytical queries still use the
+	// caller's configured thread count.
+	ExecuteChecked(conn, "SET threads = 1");
+}
+
 //===--------------------------------------------------------------------===//
 // Catalog table-name builders + state-schema introspection
 //===--------------------------------------------------------------------===//
@@ -183,6 +194,19 @@ std::string MetadataTable(const std::string &catalog_name, const std::string &ta
 	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(table_name);
 }
 
+std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto metadata_database = "__ducklake_metadata_" + catalog_name;
+	auto result = conn.Query("SELECT database_oid, type, path FROM duckdb_databases() WHERE database_name = " +
+	                         QuoteLiteral(metadata_database) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	const auto oid = result->GetValue(0, 0).ToString();
+	const auto type = result->GetValue(1, 0).IsNull() ? "" : result->GetValue(1, 0).ToString();
+	const auto path = result->GetValue(2, 0).IsNull() ? "" : result->GetValue(2, 0).ToString();
+	return metadata_database + "|" + oid + "|" + type + "|" + path;
+}
+
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema) {
 	if (use_state_schema) {
 		return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(STATE_SCHEMA) + "." + QuoteIdentifier(table_name);
@@ -190,12 +214,70 @@ std::string StateTable(const std::string &catalog_name, const std::string &table
 	return MetadataDatabase(catalog_name) + ".main." + QuoteIdentifier(table_name);
 }
 
+namespace {
+
+// Cache attached metadata databases whose `__ducklake_cdc` state schema we've
+// observed to exist. Bootstrap creates the schema once and never drops it for a
+// given attachment, so this is monotonic per attached database. The key must not
+// be just `catalog_name`: CI exercises multiple backend attachments with the
+// same logical alias (`lake`) in one process.
+//
+// We rely on the cache because DuckDB's catalog enumeration over
+// postgres-attached databases (`duckdb_schemas()` and `duckdb_tables()`) is not
+// always self-consistent across consecutive calls on the same connection:
+// building one SQL string with two `StateTable(...)` calls has been observed to
+// yield `__ducklake_cdc` for the first lookup and `main` for the second,
+// producing
+//   Catalog Error: schema "main" does not exist
+// at the listen call site.
+std::mutex STATE_SCHEMA_CACHE_MUTEX;
+std::unordered_set<std::string> STATE_SCHEMA_CACHE;
+
+bool StateSchemaCacheLookup(const std::string &cache_key) {
+	if (cache_key.empty()) {
+		return false;
+	}
+	std::lock_guard<std::mutex> guard(STATE_SCHEMA_CACHE_MUTEX);
+	return STATE_SCHEMA_CACHE.count(cache_key) > 0;
+}
+
+void StateSchemaCacheRemember(const std::string &cache_key) {
+	if (cache_key.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(STATE_SCHEMA_CACHE_MUTEX);
+	STATE_SCHEMA_CACHE.insert(cache_key);
+}
+
+bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto md_db = QuoteLiteral("__ducklake_metadata_" + catalog_name);
+	auto schemas = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " + md_db +
+	                          " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
+	if (schemas && !schemas->HasError() && schemas->RowCount() > 0 && !schemas->GetValue(0, 0).IsNull() &&
+	    schemas->GetValue(0, 0).GetValue<int64_t>() > 0) {
+		return true;
+	}
+	// `duckdb_schemas()` did not see it. Try the table-level enumeration
+	// for the consumers table that bootstrap always creates.
+	auto tables = conn.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = " + md_db +
+	                         " AND schema_name = " + QuoteLiteral(STATE_SCHEMA) +
+	                         " AND table_name = " + QuoteLiteral(CONSUMERS_TABLE));
+	return tables && !tables->HasError() && tables->RowCount() > 0 && !tables->GetValue(0, 0).IsNull() &&
+	       tables->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+} // namespace
+
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
-	auto result = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
-	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) +
-	                         " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
-	return result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
-	       result->GetValue(0, 0).GetValue<int64_t>() > 0;
+	const auto cache_key = MetadataAttachmentCacheKey(conn, catalog_name);
+	if (StateSchemaCacheLookup(cache_key)) {
+		return true;
+	}
+	if (ProbeStateSchema(conn, catalog_name)) {
+		StateSchemaCacheRemember(cache_key);
+		return true;
+	}
+	return false;
 }
 
 std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name) {
@@ -422,12 +504,17 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 //===--------------------------------------------------------------------===//
 
 std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema) {
+	// `table_id` is the single subscribed table for DML consumers (one
+	// DML consumer = one table, by contract). It is NULL for DDL
+	// consumers — DDL consumers can subscribe to schemas, tables, or the
+	// whole catalog and route those facts through
+	// `__ducklake_cdc_consumer_subscriptions`.
 	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
 	       " ("
 	       "consumer_name VARCHAR, "
 	       "consumer_kind VARCHAR NOT NULL, "
 	       "consumer_id BIGINT NOT NULL, "
-	       "stop_at_schema_change BOOLEAN NOT NULL, "
+	       "table_id BIGINT, "
 	       "last_committed_snapshot BIGINT, "
 	       "last_committed_schema_version BIGINT, "
 	       "owner_token UUID, "
@@ -509,13 +596,14 @@ void InstallPostgresSnapshotNotifyBestEffort(duckdb::Connection &conn, const std
 	    "CREATE OR REPLACE FUNCTION " + QuoteIdentifier(STATE_SCHEMA) +
 	        ".ducklake_cdc_notify_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_notify(" +
 	        QuoteLiteral(channel) + ", NEW.snapshot_id::text); RETURN NEW; END; $$");
-	PostgresExecuteBestEffort(conn, catalog_name,
-	                          "DROP TRIGGER IF EXISTS ducklake_cdc_snapshot_notify ON public.ducklake_snapshot");
 	PostgresExecuteBestEffort(
 	    conn, catalog_name,
-	    "CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot FOR EACH ROW "
-	    "EXECUTE FUNCTION " +
-	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()");
+	    "DO $$ BEGIN IF NOT EXISTS ("
+	    "SELECT 1 FROM pg_trigger WHERE tgname = 'ducklake_cdc_snapshot_notify' "
+	    "AND tgrelid = 'public.ducklake_snapshot'::regclass"
+	    ") THEN EXECUTE 'CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot "
+	    "FOR EACH ROW EXECUTE FUNCTION " +
+	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()'; END IF; END $$");
 }
 
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
@@ -527,6 +615,11 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
 	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
+	if (use_state_schema) {
+		// Pre-warm the StateSchemaExists cache so subsequent listen calls
+		// in this process never have to re-probe the catalog enumerator.
+		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+	}
 	InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
 }
 

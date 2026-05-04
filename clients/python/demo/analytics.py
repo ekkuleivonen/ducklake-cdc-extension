@@ -1,14 +1,20 @@
-"""Lightweight analytics helpers for the DuckLake CDC demo."""
+"""Lightweight analytics helpers for the DuckLake CDC demo.
+
+Only the surface the knob-free demo actually drives lives here. Anything
+that used to count catalog calls, loop iterations, or DDL events from the
+old demo's hand-rolled fan-out is gone — :class:`ducklake_cdc.CDCApp`
+owns the loop now and the demo's job is to render observable throughput +
+latency on top of it.
+"""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, TypeVar
+from datetime import UTC, datetime
+from typing import Any
 
-T = TypeVar("T")
 NANOS_PER_MILLISECOND = 1_000_000.0
 CLOCK_SKEW_CLAMP_MS = 5.0
 
@@ -35,33 +41,34 @@ class MetricSummary:
 
 @dataclass
 class DemoStats:
+    """Aggregator the demo's optional stats sink writes into.
+
+    Field groups mirror the rendered :func:`summary_table`:
+
+    - throughput: ``consumed_changes`` / ``finished_ns`` - ``first_delivered_ns``;
+    - latency: ``fresh_action_latencies_ms``,
+      ``producer_to_snapshot_ms``, ``snapshot_to_consumer_ms``;
+    - shape: per-table counts, per-change-type counts, producer
+      benchmark payload echoed back from the row data.
+    """
+
     started_ns: int = field(default_factory=time.monotonic_ns)
+    first_delivered_ns: int | None = None
     finished_ns: int | None = None
-    end_to_end_latencies_ms: list[float] = field(default_factory=list)
     fresh_action_latencies_ms: list[float] = field(default_factory=list)
     stale_row_latencies_ms: list[float] = field(default_factory=list)
     producer_to_snapshot_ms: list[float] = field(default_factory=list)
     snapshot_to_consumer_ms: list[float] = field(default_factory=list)
-    latency_by_change_type_ms: dict[str, list[float]] = field(default_factory=dict)
-    operation_ms: dict[str, list[float]] = field(default_factory=dict)
-    cdc_dml_changes_listen_calls: int = 0
-    cdc_dml_changes_listen_timeouts: int = 0
-    cdc_window_calls: int = 0
-    cdc_window_non_empty_calls: int = 0
-    cdc_window_empty_calls: int = 0
-    cdc_ddl_changes_read_calls: int = 0
-    cdc_dml_ticks_read_calls: int = 0
-    lake_tables_calls: int = 0
-    cdc_dml_table_changes_read_calls: int = 0
-    cdc_commit_calls: int = 0
-    ddl_events: int = 0
-    snapshot_events: int = 0
+    dml_listen_empty_ms: list[float] = field(default_factory=list)
+    dml_listen_nonempty_ms: list[float] = field(default_factory=list)
+    dml_build_batch_ms: list[float] = field(default_factory=list)
+    dml_sink_ms: list[float] = field(default_factory=list)
+    dml_commit_ms: list[float] = field(default_factory=list)
+    dml_snapshot_spans: list[int] = field(default_factory=list)
+    dml_listen_max_snapshots: list[int] = field(default_factory=list)
+    delivered_batches: int = 0
     consumed_changes: int = 0
-    latency_observations: int = 0
-    latency_missing_produced_ns: int = 0
-    latency_clock_skew_clamped: int = 0
-    table_counts: list[int] = field(default_factory=list)
-    rows_per_table: list[int] = field(default_factory=list)
+    rows_per_batch: list[int] = field(default_factory=list)
     changes_by_table: dict[str, int] = field(default_factory=dict)
     consumer_names: set[str] = field(default_factory=set)
     schema_names: set[str] = field(default_factory=set)
@@ -76,14 +83,12 @@ class DemoStats:
     benchmark_delete_percents: set[float] = field(default_factory=set)
     error_count: int = 0
     error_type_counts: dict[str, int] = field(default_factory=dict)
-    dropped_row_count: int = 0
+    latency_missing_produced_ns: int = 0
+    latency_clock_skew_clamped: int = 0
 
     def finish(self) -> None:
         if self.finished_ns is None:
             self.finished_ns = time.monotonic_ns()
-
-    def record_operation(self, name: str, elapsed_ms: float) -> None:
-        self.operation_ms.setdefault(name, []).append(elapsed_ms)
 
     def record_consumer(self, consumer_name: str) -> None:
         self.consumer_names.add(consumer_name)
@@ -93,45 +98,58 @@ class DemoStats:
         error_type = error if isinstance(error, str) else type(error).__name__
         self.error_type_counts[error_type] = self.error_type_counts.get(error_type, 0) + 1
 
-    def record_dropped_rows(self, count: int) -> None:
-        self.dropped_row_count += count
+    def record_window(self, *, has_changes: bool, observed_ns: int | None = None) -> None:
+        if has_changes:
+            if self.first_delivered_ns is None:
+                self.first_delivered_ns = (
+                    time.monotonic_ns() if observed_ns is None else observed_ns
+                )
+            self.delivered_batches += 1
 
     def record_wait(self, *, has_snapshot: bool) -> None:
-        self.cdc_dml_changes_listen_calls += 1
-        if not has_snapshot:
-            self.cdc_dml_changes_listen_timeouts += 1
-
-    def record_window(self, *, has_changes: bool) -> None:
-        self.cdc_window_calls += 1
-        if has_changes:
-            self.cdc_window_non_empty_calls += 1
-        else:
-            self.cdc_window_empty_calls += 1
-
-    def record_ddl(self, count: int) -> None:
-        self.cdc_ddl_changes_read_calls += 1
-        self.ddl_events += count
-
-    def record_events(self, count: int) -> None:
-        self.cdc_dml_ticks_read_calls += 1
-        self.snapshot_events += count
+        # Kept as a no-op hook so the optional stats sink contract stays
+        # symmetric with future "saw a window but it was empty" plumbing.
+        del has_snapshot
 
     def record_tables(self, count: int) -> None:
-        self.lake_tables_calls += 1
-        self.table_counts.append(count)
+        del count  # tracked implicitly via record_changes(table_name=…)
 
     def record_changes(self, count: int, *, table_name: str | None = None) -> None:
         self.consumed_changes += count
-        self.rows_per_table.append(count)
+        self.rows_per_batch.append(count)
         if table_name is not None:
-            self.changes_by_table[table_name] = self.changes_by_table.get(table_name, 0) + count
+            self.changes_by_table[table_name] = (
+                self.changes_by_table.get(table_name, 0) + count
+            )
             self.table_names.add(table_name)
             schema_name = schema_from_table_name(table_name)
             if schema_name is not None:
                 self.schema_names.add(schema_name)
 
     def record_commit(self) -> None:
-        self.cdc_commit_calls += 1
+        # Mirrors the consumer's internal commit; the surface is kept so a
+        # future stats sink can record commit timing without changing the
+        # call sites.
+        return None
+
+    def record_dml_listen(
+        self, *, elapsed_ms: float, row_count: int, max_snapshots: int
+    ) -> None:
+        self.dml_listen_max_snapshots.append(max_snapshots)
+        if row_count > 0:
+            self.dml_listen_nonempty_ms.append(elapsed_ms)
+        else:
+            self.dml_listen_empty_ms.append(elapsed_ms)
+
+    def record_dml_build_batch(self, *, elapsed_ms: float, snapshot_span: int) -> None:
+        self.dml_build_batch_ms.append(elapsed_ms)
+        self.dml_snapshot_spans.append(snapshot_span)
+
+    def record_dml_sink(self, *, elapsed_ms: float) -> None:
+        self.dml_sink_ms.append(elapsed_ms)
+
+    def record_dml_commit_duration(self, *, elapsed_ms: float) -> None:
+        self.dml_commit_ms.append(elapsed_ms)
 
     def record_change_observation(
         self,
@@ -152,17 +170,6 @@ class DemoStats:
         if values is not None:
             self._record_benchmark_payload(values)
 
-    def record_latency(self, produced_ns: object, *, consumed_ns: int | None = None) -> None:
-        parsed_produced_ns = parse_int(produced_ns)
-        if parsed_produced_ns is None:
-            self.latency_missing_produced_ns += 1
-            return
-        observed_ns = time.monotonic_ns() if consumed_ns is None else consumed_ns
-        self.end_to_end_latencies_ms.append(
-            (observed_ns - parsed_produced_ns) / NANOS_PER_MILLISECOND
-        )
-        self.latency_observations += 1
-
     def record_change_latency(
         self,
         *,
@@ -180,11 +187,8 @@ class DemoStats:
 
         observed_ns = time.monotonic_ns() if consumed_ns is None else consumed_ns
         latency_ms = (observed_ns - parsed_produced_ns) / NANOS_PER_MILLISECOND
-        self.end_to_end_latencies_ms.append(latency_ms)
-        self.latency_observations += 1
 
         change_type_name = str(change_type)
-        self.latency_by_change_type_ms.setdefault(change_type_name, []).append(latency_ms)
         if change_type_name in {"insert", "update_postimage"}:
             self.fresh_action_latencies_ms.append(latency_ms)
             parsed_epoch_ns = parse_int(produced_epoch_ns)
@@ -198,95 +202,111 @@ class DemoStats:
                     self.latency_clock_skew_clamped += 1
                 if producer_to_snapshot_ms >= 0:
                     self.producer_to_snapshot_ms.append(producer_to_snapshot_ms)
-                observed_epoch_ns = time.time_ns() if consumed_epoch_ns is None else consumed_epoch_ns
+                observed_epoch_ns = (
+                    time.time_ns() if consumed_epoch_ns is None else consumed_epoch_ns
+                )
                 self.snapshot_to_consumer_ms.append(
                     (observed_epoch_ns - snapshot_epoch_ns) / NANOS_PER_MILLISECOND
                 )
         elif change_type_name in {"update_preimage", "delete"}:
-            # These rows intentionally carry the previous row version's
-            # produced timestamp, so they are not fresh action latency.
             self.stale_row_latencies_ms.append(latency_ms)
 
     def summary(self) -> dict[str, Any]:
         end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
-        actual_duration_seconds = max((end_ns - self.started_ns) / 1_000_000_000.0, 0.0)
-        catalog_queries_estimated = self.catalog_queries_estimated()
+        run_duration_seconds = max((end_ns - self.started_ns) / 1_000_000_000.0, 0.0)
+        active_duration_seconds = (
+            max((end_ns - self.first_delivered_ns) / 1_000_000_000.0, 0.0)
+            if self.first_delivered_ns is not None
+            else 0.0
+        )
         return {
-            "actual_duration_seconds": actual_duration_seconds,
+            "actual_duration_seconds": run_duration_seconds,
+            "active_duration_seconds": active_duration_seconds,
+            "run_duration_seconds": run_duration_seconds,
             "consumed_changes": self.consumed_changes,
-            "consumed_changes_per_second": divide(self.consumed_changes, actual_duration_seconds),
-            "end_to_end_latency_ms": metric_summary(self.end_to_end_latencies_ms).to_json(),
-            "fresh_action_latency_ms": metric_summary(self.fresh_action_latencies_ms).to_json(),
-            "stale_row_latency_ms": metric_summary(self.stale_row_latencies_ms).to_json(),
-            "producer_to_snapshot_ms": metric_summary(self.producer_to_snapshot_ms).to_json(),
-            "snapshot_to_consumer_ms": metric_summary(self.snapshot_to_consumer_ms).to_json(),
-            "latency_by_change_type_ms": {
-                name: metric_summary(values).to_json()
-                for name, values in sorted(self.latency_by_change_type_ms.items())
-            },
-            "operation_ms": {
-                name: metric_summary(values).to_json()
-                for name, values in sorted(self.operation_ms.items())
-            },
-            "catalog_queries_estimated": catalog_queries_estimated,
-            "catalog_qps_avg": divide(catalog_queries_estimated, actual_duration_seconds),
-            "cdc_dml_changes_listen_calls": self.cdc_dml_changes_listen_calls,
-            "cdc_dml_changes_listen_timeouts": self.cdc_dml_changes_listen_timeouts,
-            "cdc_window_calls": self.cdc_window_calls,
-            "cdc_window_non_empty_calls": self.cdc_window_non_empty_calls,
-            "cdc_window_empty_calls": self.cdc_window_empty_calls,
-            "empty_window_ratio": divide(self.cdc_window_empty_calls, self.cdc_window_calls),
-            "cdc_ddl_changes_read_calls": self.cdc_ddl_changes_read_calls,
-            "cdc_dml_ticks_read_calls": self.cdc_dml_ticks_read_calls,
-            "lake_tables_calls": self.lake_tables_calls,
-            "cdc_dml_table_changes_read_calls": self.cdc_dml_table_changes_read_calls,
-            "cdc_commit_calls": self.cdc_commit_calls,
-            "ddl_events": self.ddl_events,
-            "snapshot_events": self.snapshot_events,
-            "table_count_per_window": metric_summary(
-                [float(count) for count in self.table_counts]
+            "consumed_changes_per_second": divide(
+                self.consumed_changes, active_duration_seconds
+            ),
+            "delivered_batches": self.delivered_batches,
+            "fresh_action_latency_ms": metric_summary(
+                self.fresh_action_latencies_ms
             ).to_json(),
-            "rows_per_table_call": metric_summary(
-                [float(count) for count in self.rows_per_table]
+            "stale_row_latency_ms": metric_summary(self.stale_row_latencies_ms).to_json(),
+            "producer_to_snapshot_ms": metric_summary(
+                self.producer_to_snapshot_ms
+            ).to_json(),
+            "snapshot_to_consumer_ms": metric_summary(
+                self.snapshot_to_consumer_ms
+            ).to_json(),
+            "dml_listen_empty_ms": metric_summary(self.dml_listen_empty_ms).to_json(),
+            "dml_listen_nonempty_ms": metric_summary(
+                self.dml_listen_nonempty_ms
+            ).to_json(),
+            "dml_build_batch_ms": metric_summary(self.dml_build_batch_ms).to_json(),
+            "dml_sink_ms": metric_summary(self.dml_sink_ms).to_json(),
+            "dml_commit_ms": metric_summary(self.dml_commit_ms).to_json(),
+            "dml_snapshot_span": metric_summary(
+                [float(span) for span in self.dml_snapshot_spans]
+            ).to_json(),
+            "dml_listen_max_snapshots": metric_summary(
+                [float(value) for value in self.dml_listen_max_snapshots]
+            ).to_json(),
+            "rows_per_batch": metric_summary(
+                [float(count) for count in self.rows_per_batch]
             ).to_json(),
             "changes_by_table": dict(sorted(self.changes_by_table.items())),
-            "latency_observations": self.latency_observations,
             "latency_missing_produced_ns": self.latency_missing_produced_ns,
             "latency_clock_skew_clamped": self.latency_clock_skew_clamped,
             "consumer_count_seen": len(self.consumer_names),
             "schema_count_seen": len(self.schema_names),
             "table_count_seen": len(self.table_names),
-            "ddl_count_seen": self.ddl_events,
-            "dml_count_seen": self.dml_action_count_seen(),
-            "dml_row_count_seen": self.consumed_changes,
+            "dml_count_seen": self._dml_action_count_seen(),
             "dml_change_type_counts": dict(sorted(self.change_type_counts.items())),
-            "dml_action_shares": self.dml_action_shares(),
-            "producer_workload": self.producer_workload_summary(),
+            "dml_action_shares": self._dml_action_shares(),
+            "producer_workload": self._producer_workload_summary(),
             "error_count": self.error_count,
             "error_type_counts": dict(sorted(self.error_type_counts.items())),
-            "dropped_row_count": self.dropped_row_count,
             "fresh_latency_excluded_row_count": (
                 self.latency_missing_produced_ns + len(self.stale_row_latencies_ms)
             ),
             "stale_latency_row_count": len(self.stale_row_latencies_ms),
         }
 
-    def dml_action_count_seen(self) -> int:
+    def progress_snapshot(self) -> dict[str, int | float]:
+        end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
+        active_duration_seconds = (
+            max((end_ns - self.first_delivered_ns) / 1_000_000_000.0, 0.0)
+            if self.first_delivered_ns is not None
+            else 0.0
+        )
+        return {
+            "active_duration_seconds": active_duration_seconds,
+            "consumed_changes": self.consumed_changes,
+            "consumed_changes_per_second": divide(
+                self.consumed_changes, active_duration_seconds
+            ),
+            "delivered_batches": self.delivered_batches,
+            "consumer_count_seen": len(self.consumer_names),
+            "table_count_seen": len(self.table_names),
+            "error_count": self.error_count,
+        }
+
+    def _dml_action_count_seen(self) -> int:
         return (
             self.change_type_counts.get("insert", 0)
             + self.change_type_counts.get("update_postimage", 0)
             + self.change_type_counts.get("delete", 0)
         )
 
-    def dml_action_shares(self) -> dict[str, float]:
-        total = self.dml_action_count_seen()
+    def _dml_action_shares(self) -> dict[str, float]:
+        total = self._dml_action_count_seen()
         return {
             "insert": divide(self.change_type_counts.get("insert", 0), total),
             "update": divide(self.change_type_counts.get("update_postimage", 0), total),
             "delete": divide(self.change_type_counts.get("delete", 0), total),
         }
 
-    def producer_workload_summary(self) -> dict[str, object]:
+    def _producer_workload_summary(self) -> dict[str, object]:
         return {
             "profiles": sorted(self.benchmark_profiles),
             "duration_seconds": scalar_or_sorted(self.benchmark_duration_seconds),
@@ -320,15 +340,6 @@ class DemoStats:
         if delete_percent is not None:
             self.benchmark_delete_percents.add(delete_percent)
 
-    def catalog_queries_estimated(self) -> int:
-        return (
-            self.cdc_dml_changes_listen_calls
-            + self.cdc_ddl_changes_read_calls
-            + self.cdc_dml_ticks_read_calls
-            + self.cdc_dml_table_changes_read_calls
-            + self.cdc_commit_calls
-        )
-
 
 def metric_summary(values: list[float]) -> MetricSummary:
     if not values:
@@ -356,23 +367,15 @@ def percentile(values: list[float], percentile_value: float) -> float:
     return (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
 
 
-def timed_call(stats: DemoStats | None, operation_name: str, operation: Callable[[], T]) -> T:
-    started = time.perf_counter()
-    try:
-        return operation()
-    finally:
-        if stats is not None:
-            stats.record_operation(operation_name, (time.perf_counter() - started) * 1000.0)
-
-
 def summary_table(summary: Mapping[str, Any]) -> str:
     """Render a focused, sectioned summary of the metrics that actually matter.
 
-    The full numeric record stays in `stats.summary()` (and the JSON dump);
-    this table is the at-a-glance view: throughput, fresh CDC latency,
-    where that latency is spent, per-call extension cost, and a small
-    workload-shape footer.
+    The full numeric record stays in :meth:`DemoStats.summary` (and the
+    JSON dump). This rendering is the at-a-glance view: throughput, fresh
+    CDC latency, where that latency is spent, and a small workload-shape
+    footer.
     """
+
     sections = _summary_sections(summary)
     return _render_sections("DuckLake CDC demo summary", sections)
 
@@ -384,8 +387,13 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
         [
             (
                 "duration_s",
-                format_float(summary["actual_duration_seconds"]),
-                "wall time of the consumer run",
+                format_float(summary.get("active_duration_seconds", 0.0)),
+                "active time from first delivered batch to exit",
+            ),
+            (
+                "run_duration_s",
+                format_float(summary.get("run_duration_seconds", 0.0)),
+                "wall time of the consumer process",
             ),
             (
                 "changes",
@@ -395,7 +403,12 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
             (
                 "changes_per_s",
                 format_float(summary["consumed_changes_per_second"]),
-                "throughput across the run",
+                "throughput across the active delivery window",
+            ),
+            (
+                "batches",
+                str(summary.get("delivered_batches", 0)),
+                "non-empty windows committed across all consumers",
             ),
         ]
     )
@@ -478,30 +491,70 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
     if breakdown:
         sections.append(breakdown)
 
-    operation_ms = summary.get("operation_ms")
-    per_call: list[tuple[str, str, str]] = []
-    if isinstance(operation_ms, Mapping):
-        wait = operation_ms.get("cdc_dml_changes_listen")
-        if isinstance(wait, Mapping):
-            per_call.append(
-                (
-                    "cdc_dml_changes_listen_ms_p50",
-                    format_float(wait["p50"]),
-                    "listen + read cost (p95 inflated by idle timeouts)",
-                )
+    pipeline: list[tuple[str, str, str]] = []
+    listen_nonempty = summary.get("dml_listen_nonempty_ms")
+    if _has_observations(listen_nonempty):
+        pipeline.append(
+            (
+                "consumer_listen_ms_p95",
+                format_float(listen_nonempty["p95"]),
+                "extension listen/read + Python row fetch for non-empty windows",
             )
-        for name, description in (
-            ("cdc_window", "per-call cdc_window cost"),
-            ("cdc_dml_table_changes_read", "legacy per-table read cost"),
-            ("cdc_commit", "per-call cdc_commit cost"),
-        ):
-            metrics = operation_ms.get(name)
-            if isinstance(metrics, Mapping):
-                per_call.append(
-                    (f"{name}_ms_p95", format_float(metrics["p95"]), description)
-                )
-    if per_call:
-        sections.append(per_call)
+        )
+    snapshot_span = summary.get("dml_snapshot_span")
+    if _has_observations(snapshot_span):
+        pipeline.append(
+            (
+                "consumer_snapshot_span_p95",
+                format_float(snapshot_span["p95"]),
+                "snapshots coalesced per delivered DML batch",
+            )
+        )
+        pipeline.append(
+            (
+                "consumer_snapshot_span_max",
+                format_float(snapshot_span["max"]),
+                "largest DML snapshot window delivered",
+            )
+        )
+    listen_max_snapshots = summary.get("dml_listen_max_snapshots")
+    if _has_observations(listen_max_snapshots):
+        pipeline.append(
+            (
+                "consumer_listen_max_snapshots_p50",
+                format_float(listen_max_snapshots["p50"]),
+                "requested DML listen coalescing window",
+            )
+        )
+    build_batch = summary.get("dml_build_batch_ms")
+    if _has_observations(build_batch):
+        pipeline.append(
+            (
+                "consumer_build_ms_p95",
+                format_float(build_batch["p95"]),
+                "Python Change/DMLBatch materialization",
+            )
+        )
+    sink = summary.get("dml_sink_ms")
+    if _has_observations(sink):
+        pipeline.append(
+            (
+                "consumer_sink_ms_p95",
+                format_float(sink["p95"]),
+                "Python demo sink aggregation + latency accounting",
+            )
+        )
+    commit = summary.get("dml_commit_ms")
+    if _has_observations(commit):
+        pipeline.append(
+            (
+                "consumer_commit_ms_p95",
+                format_float(commit["p95"]),
+                "extension cdc_commit after sink success",
+            )
+        )
+    if pipeline:
+        sections.append(pipeline)
 
     sections.append(
         [
@@ -509,11 +562,6 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
                 "count_errors",
                 str(summary.get("error_count", 0)),
                 "uncaught consumer/runtime errors observed before exit",
-            ),
-            (
-                "count_dropped_rows",
-                str(summary.get("dropped_row_count", 0)),
-                "rows intentionally discarded by the sink or benchmark harness",
             ),
             (
                 "count_missing_produced_ns",
@@ -556,11 +604,6 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
             "distinct tables observed in consumed rows",
         ),
         (
-            "count_ddl",
-            str(summary.get("ddl_count_seen", 0)),
-            "DDL events observed",
-        ),
-        (
             "count_dml",
             str(summary.get("dml_count_seen", 0)),
             "logical DML actions: insert + update_postimage + delete",
@@ -588,28 +631,17 @@ def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, s
         )
     sections.append(workload_shape)
 
-    loop_shape: list[tuple[str, str, str]] = [
-        (
-            "iterations",
-            str(summary["cdc_window_calls"]),
-            "total consumer loop iterations",
-        ),
-        (
-            "empty_window_ratio",
-            format_float(summary["empty_window_ratio"]),
-            "fraction of windows with no changes (>0 = wakeup spam)",
-        ),
-    ]
-    rows_per_table = summary.get("rows_per_table_call")
-    if isinstance(rows_per_table, Mapping):
-        loop_shape.append(
-            (
-                "rows_per_changes_call_p95",
-                format_float(rows_per_table["p95"]),
-                "typical batch size; large -> consider cdc_dml_changes_read",
-            )
+    rows_per_batch = summary.get("rows_per_batch")
+    if isinstance(rows_per_batch, Mapping) and int(rows_per_batch.get("count", 0)) > 0:
+        sections.append(
+            [
+                (
+                    "rows_per_batch_p95",
+                    format_float(rows_per_batch["p95"]),
+                    "typical batch size; large -> consider cdc_dml_changes_read",
+                ),
+            ]
         )
-    sections.append(loop_shape)
 
     return sections
 
@@ -649,30 +681,6 @@ def _render_sections(
                 f"{value.rjust(value_width)} | "
                 f"{description.ljust(desc_width)} |"
             )
-    lines.append(border)
-    return "\n".join(lines)
-
-
-def render_table(title: str, rows: list[tuple[str, str]]) -> str:
-    """Render a simple two-column metric/value table.
-
-    Kept as a small public utility for callers that want to format their
-    own ad-hoc metric tables. The richer demo summary uses
-    `_render_sections` directly.
-    """
-    metric_width = max(len("metric"), *(len(metric) for metric, _ in rows))
-    value_width = max(len("value"), *(len(value) for _, value in rows))
-    border = f"+-{'-' * metric_width}-+-{'-' * value_width}-+"
-    lines = [
-        title,
-        border,
-        f"| {'metric'.ljust(metric_width)} | {'value'.rjust(value_width)} |",
-        border,
-    ]
-    lines.extend(
-        f"| {metric.ljust(metric_width)} | {value.rjust(value_width)} |"
-        for metric, value in rows
-    )
     lines.append(border)
     return "\n".join(lines)
 
@@ -749,7 +757,7 @@ def datetime_to_epoch_ns(value: datetime | None) -> int | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=UTC)
     return int(value.timestamp() * 1_000_000_000)
 
 

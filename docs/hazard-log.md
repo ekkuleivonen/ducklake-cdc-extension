@@ -277,3 +277,17 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Keep doctor checks tied to concrete hazards: gap risk, stale
   leases, dropped or renamed subscriptions, metadata presence, catalog
   compatibility, suspicious lag, and recent reset or force-release audit events.
+
+### H-021: High-Level Auto Commit Bypasses Sink Gating
+
+- Risk: Python high-level consumers may expose `auto_commit=True` while also
+  delivering to sinks. In that mode the SQL listen/read function can commit
+  before required sinks acknowledge the batch, so the sink layer no longer
+  controls at-least-once delivery.
+- Status: accepted.
+- Handling: This is a known limitation for the first Python client shape. The
+  draft documents that `auto_commit=True` passes through to SQL commit behavior
+  and bypasses sink-gated commit safety.
+- Next action: Revisit only if users are likely to trip over this in the high
+  level API; possible mitigations include forbidding `auto_commit=True` with
+  required sinks or renaming it to make the unsafe ordering obvious.

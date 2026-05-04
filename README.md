@@ -15,11 +15,11 @@ A DuckDB extension that adds change-data-capture cursors on top of
   `cdc_consumer_force_release`.
 - Cursor primitives: `cdc_window` and `cdc_commit`.
 - Stateful streams: `cdc_ddl_changes_*`, `cdc_ddl_ticks_*`,
-  `cdc_dml_changes_*`, `cdc_dml_ticks_*`, and typed
-  `cdc_dml_table_changes_*`.
+  `cdc_dml_changes_*` (single typed payload API; one consumer = one
+  table), and `cdc_dml_ticks_*`.
 - Stateless queries: `cdc_ddl_changes_query`, `cdc_ddl_ticks_query`,
-  `cdc_dml_changes_query`, `cdc_dml_ticks_query`, and
-  `cdc_dml_table_changes_query`.
+  `cdc_dml_changes_query` (single-table typed lookback), and
+  `cdc_dml_ticks_query`.
 - Schema inspection: `cdc_schema_diff`.
 - Observability: `cdc_version`, `cdc_doctor`, `cdc_list_consumers`,
   `cdc_list_subscriptions`, `cdc_consumer_stats`, and `cdc_audit_events`.
@@ -56,19 +56,19 @@ SELECT *
 FROM cdc_dml_consumer_create(
   'lake',
   'orders_sink',
-  table_names := ['main.orders'],
+  table_name := 'main.orders',
   change_types := ['insert', 'update_postimage', 'delete'],
   start_at := 'now'
 );
 
 INSERT INTO lake.orders VALUES (2, 'paid');
 
+-- The pinned table identity is implicit: `cdc_dml_changes_read`
+-- projects the row's native columns at the top level alongside
+-- `snapshot_id`, `rowid`, `change_type`, `table_id`, `table_name`,
+-- and the snapshot's `author` / `commit_message` / `commit_extra_info`.
 SELECT *
-FROM cdc_dml_table_changes_read(
-  'lake',
-  'orders_sink',
-  table_name := 'main.orders'
-);
+FROM cdc_dml_changes_read('lake', 'orders_sink');
 
 SET VARIABLE end_snapshot = (
   SELECT end_snapshot FROM cdc_window('lake', 'orders_sink')
@@ -109,21 +109,47 @@ FROM cdc_ddl_changes_listen('lake', 'schema_watch', timeout_ms := 30000);
 
 ## Python
 
+Single consumer (DML consumers are pinned to a single table by contract):
+
 ```python
 from ducklake import DuckLake
-from ducklake_cdc import CDCClient
+from ducklake_cdc import DMLConsumer, StdoutDMLSink
 
 lake = DuckLake("ducklake:my.ducklake", alias="lake")
-cdc = CDCClient(lake)
 
-cdc.dml_consumer_create(
+with DMLConsumer(
+    lake,
     "orders_sink",
-    table_names=["main.orders"],
+    table="main.orders",
     change_types=["insert", "update_postimage", "delete"],
-)
-
-rows = cdc.dml_table_changes_read_rows("orders_sink", table_name="main.orders")
+    sinks=[StdoutDMLSink()],
+) as consumer:
+    consumer.run(infinite=True)
 ```
+
+Multiple consumers in one process — `CDCApp` runs them concurrently with
+shared lifecycle and `SIGINT` / `SIGTERM` handling:
+
+```python
+from ducklake import DuckLake
+from ducklake_cdc import CDCApp, DMLConsumer, StdoutDMLSink
+
+lake = DuckLake("ducklake:my.ducklake", alias="lake")
+
+consumers = [
+    DMLConsumer(lake, f"sink_{table.name}", table=f"{table.schema_name}.{table.name}",
+                sinks=[StdoutDMLSink()])
+    for table in lake.tables()
+]
+
+with CDCApp(consumers=consumers) as app:
+    app.run(infinite=True)  # blocks until Ctrl+C; drains in-flight batches on exit
+```
+
+For raw extension access, the low-level mirror lives at
+`ducklake_cdc.lowlevel.CDCClient` and exposes `cdc_dml_consumer_create`,
+`cdc_dml_changes_read` / `_listen` / `_query`, `cdc_window`, `cdc_commit`,
+and friends as direct methods.
 
 ## Tests
 

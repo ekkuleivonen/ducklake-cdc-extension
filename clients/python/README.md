@@ -43,37 +43,48 @@ applied as `SET name = value` before DuckLake is attached.
 
 ## Demo
 
-Run the demo scripts from this directory:
+The demo has two scripts: a long-running `consumer.py` that observes
+everything the lake produces and a short-lived `producer.py` that
+generates a workload. The consumer is intentionally knob-free — the
+library's job is to absorb whatever the producer throws at it efficiently
+with sensible defaults — so all the workload knobs live on the producer.
 
 ```bash
+# one terminal: start the consumer (Ctrl+C when you want the summary)
 uv run python demo/consumer.py
-uv run python demo/producer.py
+
+# another terminal: run a workload
+uv run python demo/producer.py --schemas 1 --tables 2 --inserts 1000
 ```
 
-`consumer.py` loads `ducklake_cdc` against the local catalog, creates a
-catalog-wide CDC subscription, and streams DDL, snapshot events, row-level DML,
-and commits as JSON lines on stdout. Run it first, then run `producer.py` in
-another terminal.
-
-By default the demo uses the included Postgres-backed DuckLake metadata catalog
-on `localhost:5435` plus local data files under `demo/.work/`. Start the demo
-catalog first:
+By default the demo uses the included Postgres-backed DuckLake metadata
+catalog through PgBouncer on `localhost:5435` plus local data files under
+`demo/.work/`. Start the demo catalog first:
 
 ```bash
 docker compose up -d --wait
 ```
 
-Use `--catalog-backend sqlite` to opt into the local SQLite catalog. You can
-still override either process with `--catalog`/`--storage` or the
-`DUCKLAKE_DEMO_CATALOG` and `DUCKLAKE_DEMO_STORAGE` environment variables.
+PgBouncer listens on `5435` for normal DuckLake traffic. Direct Postgres is
+also exposed on `5436` for local admin/reset operations; `consumer.py` uses
+that direct port when resetting the default catalog. If you override the
+catalog with `DUCKLAKE_DEMO_CATALOG`, set `DUCKLAKE_DEMO_CATALOG_ADMIN` when
+the reset path should use a different direct Postgres DSN.
 
-`consumer.py` resets the demo catalog and removes local demo data files before
-it opens the CDC connections, so each demo run starts from a clean catalog and
-Parquet directory. `producer.py` generates schemas, tables, inserts, updates,
-and deletes over a requested duration. `--batch_min` and `--batch_max` control
-how many actions are grouped into each DuckLake transaction. `producer.py --reset`
-is still available for one-off producer-only runs, but do not use it while
-`consumer.py` is attached.
+Use `--catalog-backend sqlite` (on either script) to opt into the local
+SQLite catalog. You can still override either process with
+`--catalog`/`--storage` or the `DUCKLAKE_DEMO_CATALOG` and
+`DUCKLAKE_DEMO_STORAGE` environment variables.
+
+`consumer.py` resets the demo catalog and removes local demo data files
+before it starts, then waits for producer-created tables. This keeps
+results comparable across runs while preserving the intended flow:
+start the consumer first, run the producer second, then stop the
+consumer to print the summary.
+
+`producer.py` generates schemas, tables, inserts, updates, and deletes
+over a requested duration. `--batch_min` and `--batch_max` control how
+many actions are grouped into each DuckLake transaction.
 
 ```bash
 uv run python demo/producer.py \
@@ -88,33 +99,27 @@ uv run python demo/producer.py \
   --batch_max 50
 ```
 
+`consumer.py` discovers the lake's tables, builds one `DMLConsumer` per
+table, and runs them concurrently under a single `CDCApp`. Each DML
+consumer holds a dedicated DuckLake/DuckDB connection, so
+`--consumers-per-table 2` across 30 tables means roughly 61 long-lived
+connections including the DDL watcher. Use `--table-spawn-workers` to
+lower the startup burst when many tables appear at once. On `Ctrl+C`
+(or `SIGTERM`) the consumer drains the in-flight batch, prints a summary
+of throughput and end-to-end latency, and optionally writes the same
+summary as JSON via `--summary-output`.
+
 ```bash
 docker compose up -d --wait
 export DUCKLAKE_DEMO_STORAGE='s3://my-demo-bucket/ducklake-demo'
-uv run python demo/consumer.py --analytics
+uv run python demo/consumer.py --summary-output demo/.work/summary.json
+# in another terminal
 uv run python demo/producer.py --schemas 2 --tables 3 --inserts 100
+# back in the consumer terminal: Ctrl+C
 ```
 
-To fully reset the local demo Postgres container and volume outside the normal
-consumer startup reset, run `docker compose down -v`.
-
-For a benchmark-like exploratory run, collect aggregate analytics from the
-consumer while keeping the live event stream on stdout:
-
-```bash
-uv run python demo/consumer.py \
-  --analytics \
-  --summary-output demo/.work/summary.json \
-  --max-windows 100
-```
-
-Then run the producer in another terminal with the workload you want to observe.
-The consumer exits after 5 seconds without a new snapshot by default and prints
-a summary table with throughput, CDC call counts, operation timing percentiles,
-and end-to-end latency for changes that carry the demo `produced_ns` column.
-Use `--idle-timeout 0` to keep it running indefinitely. `--summary-output`
-writes the same summary as JSON for scripts. This is useful for client/demo
-iteration; `bench/runner.py` remains the stricter benchmark harness.
+To fully reset the local demo Postgres container and volume outside the
+normal consumer-time reset, run `docker compose down -v`.
 
 Until the latest extension build is available from DuckDB community extensions,
 load a local build by path. By default the demo looks for:

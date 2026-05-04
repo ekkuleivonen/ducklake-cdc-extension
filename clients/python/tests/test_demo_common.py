@@ -46,7 +46,7 @@ def test_demo_lake_sets_unsigned_extensions_at_connect_time(tmp_path: Path) -> N
 
     duckdb = lake._manager.duckdb
 
-    assert duckdb.config == {"allow_unsigned_extensions": True}
+    assert duckdb.config["allow_unsigned_extensions"] is True
     assert "allow_unsigned_extensions" not in duckdb.runtime_settings()
 
 

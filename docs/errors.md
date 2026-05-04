@@ -41,13 +41,43 @@ you are deliberately doing a large catch-up read.
 The attached DuckLake catalog is outside the catalog format range this
 extension knows how to read safely.
 
+### `CDC_SCHEMA_TERMINATED`
+
+A DML consumer is pinned to the schema shape of its subscribed table at
+creation time (one DML consumer = one table by contract). The shape is
+the column set the table has at the consumer's
+`last_committed_snapshot`. Once the subscribed table is altered,
+dropped, or has its containing schema dropped, the consumer terminates:
+it stops returning DML and its cursor is parked at the snapshot before
+the shape change. `cdc_window` reports the boundary on
+`terminal_at_snapshot` and flips `terminal = true` once the cursor is
+parked at `boundary - 1`.
+
+This error fires when a caller tries to drive the cursor past the boundary:
+
+- `cdc_commit(catalog, name, snapshot_id)` with `snapshot_id >= boundary`.
+- `cdc_consumer_reset(catalog, name, to_snapshot)` to a target on the other
+  side of any boundary in the cursor-to-target range. Same-shape rewinds
+  are still allowed.
+
+Recovery: create a fresh DML consumer with `start_at` at or after the
+boundary snapshot and let it consume the post-change shape. Drive the
+orchestration from a DDL consumer that surfaces the boundary event. See
+[`cdc_dml_consumer_create`](./api.md#cdc_dml_consumer_create).
+
 ## Notices and Warnings
 
 ### `CDC_SCHEMA_BOUNDARY`
 
-`cdc_window` returned a window with `schema_changes_pending = true`. Consumers
-that process both stream types should read/apply DDL with
+`cdc_window` returned a window that straddles a schema-version transition.
+For DDL consumers this means `schema_changes_pending = true` because a
+catalog-wide schema change exists in the visible range; consumers that
+process both stream types should read/apply DDL with
 `cdc_ddl_changes_read` before applying DML from the same snapshot range.
+For DML consumers it means a shape change for the *pinned* table is
+pending — the next `cdc_window` call past the boundary will return
+`terminal = true` and the consumer must be replaced (see
+`CDC_SCHEMA_TERMINATED`).
 
 ### `CDC_WAIT_TIMEOUT_CLAMPED`
 

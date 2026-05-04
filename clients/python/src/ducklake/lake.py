@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from ducklake._connection import ConnectionManager
@@ -13,10 +15,13 @@ from ducklake.config import (
     parse_catalog,
     parse_storage,
     quote_identifier,
+    quote_literal,
 )
 from ducklake.result import QueryParameters, Result
 from ducklake.session import Session, Transaction
 from ducklake.table import Table
+
+_EXTENSION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class DuckLake:
@@ -65,6 +70,36 @@ class DuckLake:
 
     def close(self) -> None:
         self._manager.close()
+
+    def load_extension(
+        self,
+        name: str | None = None,
+        *,
+        path: str | Path | None = None,
+        install: bool = True,
+    ) -> None:
+        """Install and/or load a DuckDB extension into this lake's connection.
+
+        Pass ``name`` for an extension known to the DuckDB extension repo
+        (auto-installed by default; pass ``install=False`` to skip the
+        install step). Pass ``path`` to load a local
+        ``.duckdb_extension`` file directly — typically a development
+        override pointing at a freshly built extension.
+
+        ``name`` and ``path`` are mutually exclusive.
+        """
+        if (name is None) == (path is None):
+            raise ValueError("provide exactly one of `name` or `path`")
+        connection = self.raw_connection()
+        if path is not None:
+            connection.execute(f"LOAD {quote_literal(str(Path(path)))}")
+            return
+        assert name is not None
+        if not _EXTENSION_NAME.fullmatch(name):
+            raise ValueError(f"invalid DuckDB extension name: {name!r}")
+        if install:
+            connection.execute(f"INSTALL {name}")
+        connection.execute(f"LOAD {name}")
 
     def tables(self, *, schema_name: str | None = None) -> list[Table]:
         query = """

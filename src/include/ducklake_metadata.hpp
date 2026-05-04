@@ -79,6 +79,7 @@ int64_t SingleInt64(duckdb::MaterializedQueryResult &result, const std::string &
 void ThrowIfQueryFailed(const duckdb::unique_ptr<duckdb::MaterializedQueryResult> &result);
 void ExecuteChecked(duckdb::Connection &conn, const std::string &sql);
 std::string GenerateUuid(duckdb::Connection &conn);
+void ConfigureCdcInternalConnection(duckdb::Connection &conn);
 
 //===--------------------------------------------------------------------===//
 // Catalog table-name builders + state-schema introspection
@@ -86,6 +87,7 @@ std::string GenerateUuid(duckdb::Connection &conn);
 
 std::string MetadataDatabase(const std::string &catalog_name);
 std::string MetadataTable(const std::string &catalog_name, const std::string &table_name);
+std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::string &catalog_name);
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema);
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name);
 std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name);

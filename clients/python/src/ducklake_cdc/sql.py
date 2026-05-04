@@ -7,6 +7,7 @@ from enum import Enum
 from typing import TypeAlias
 
 from ducklake.config import quote_literal
+
 SqlValue: TypeAlias = str | int | float | bool | None
 
 

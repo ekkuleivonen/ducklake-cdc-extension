@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
@@ -96,6 +97,7 @@ def reset_postgres_catalog(dsn: str) -> None:
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS __ducklake_cdc CASCADE")
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
         conn.commit()
@@ -168,9 +170,7 @@ def require_error(con: duckdb.DuckDBPyConnection, sql: str, needle: str) -> None
 def run_consumer_flow(a: duckdb.DuckDBPyConnection, b: duckdb.DuckDBPyConnection) -> None:
     a.execute("CREATE TABLE lake.orders(id INTEGER, status VARCHAR)")
     a.execute(
-        "SELECT * FROM cdc_dml_consumer_create("
-        "'lake', 'orders_sink', table_names := ['orders'], start_at := 'now'"
-        ")"
+        "SELECT * FROM cdc_dml_consumer_create(" "'lake', 'orders_sink', table_name := 'orders', start_at := 'now'" ")"
     )
 
     a.execute("INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid')")
@@ -186,9 +186,12 @@ def run_consumer_flow(a: duckdb.DuckDBPyConnection, b: duckdb.DuckDBPyConnection
 
     require_error(b, "SELECT * FROM cdc_window('lake', 'orders_sink')", "CDC_BUSY")
 
+    # The single typed DML payload API: rows project the pinned table's
+    # native columns (`id`, `status`) at the top level — there's no JSON
+    # `values` payload anymore.
     dml_rows = all_rows(
         a,
-        "SELECT change_type, values "
+        "SELECT change_type, id, status "
         "FROM cdc_dml_changes_read("
         "'lake', 'orders_sink', "
         f"start_snapshot := {start_snapshot}, end_snapshot := {end_snapshot}"
@@ -197,13 +200,17 @@ def run_consumer_flow(a: duckdb.DuckDBPyConnection, b: duckdb.DuckDBPyConnection
     )
     if len(dml_rows) != 2 or {row[0] for row in dml_rows} != {"insert"}:
         raise AssertionError(f"expected two insert rows from initial DML window, got {dml_rows!r}")
-    if not all('"status"' in row[1] for row in dml_rows):
-        raise AssertionError(f"expected generic DML JSON payloads to contain status, got {dml_rows!r}")
+    if {(row[1], row[2]) for row in dml_rows} != {(1, "new"), (2, "paid")}:
+        raise AssertionError(f"expected typed DML payloads with id/status, got {dml_rows!r}")
 
     a.execute(f"SELECT * FROM cdc_commit('lake', 'orders_sink', {end_snapshot})")
 
 
 def run_schema_boundary_flow(a: duckdb.DuckDBPyConnection) -> None:
+    """DDL surfaces the schema change; the original DML consumer terminates at
+    its shape boundary; a fresh DML consumer started at the boundary can read
+    DML against the new shape.
+    """
     a.execute(
         "SELECT * FROM cdc_ddl_consumer_create(" "'lake', 'schema_watch', schemas := ['main'], start_at := 'now'" ")"
     )
@@ -218,31 +225,62 @@ def run_schema_boundary_flow(a: duckdb.DuckDBPyConnection) -> None:
     if ("altered", "table", "orders") not in ddl_rows:
         raise AssertionError(f"expected ALTER TABLE event for orders, got {ddl_rows!r}")
 
-    start_snapshot, end_snapshot, has_changes, _, schema_pending = one(
+    # The original DML consumer 'orders_sink' is pinned to the pre-ALTER
+    # shape: it must report a terminal window with no rows visible to it
+    # and `terminal_at_snapshot` set to the ALTER's snapshot id.
+    has_changes, schema_pending, terminal, terminal_at = one(
         a,
-        "SELECT start_snapshot, end_snapshot, has_changes, schema_version, schema_changes_pending "
+        "SELECT has_changes, schema_changes_pending, terminal, terminal_at_snapshot "
         "FROM cdc_window('lake', 'orders_sink')",
     )
-    if not has_changes:
-        raise AssertionError("expected post-DDL DML window to have changes")
+    if has_changes:
+        raise AssertionError("orders_sink window should be empty at the shape boundary")
     if not schema_pending:
-        raise AssertionError("expected post-DDL DML window to report schema_changes_pending")
+        raise AssertionError("orders_sink should report schema_changes_pending at its boundary")
+    if not terminal:
+        raise AssertionError("orders_sink should report terminal=true at its boundary")
+    if terminal_at is None:
+        raise AssertionError("orders_sink should expose terminal_at_snapshot at its boundary")
 
+    require_error(
+        a,
+        f"SELECT * FROM cdc_commit('lake', 'orders_sink', {terminal_at})",
+        "CDC_SCHEMA_TERMINATED",
+    )
+
+    # The orchestration story: the DDL consumer spotted the ALTER, the
+    # operator (us) spawns a successor DML consumer at the boundary, and
+    # that consumer reads the post-ALTER row under the new shape.
+    a.execute(
+        "SELECT * FROM cdc_dml_consumer_create("
+        "'lake', 'orders_sink_v2', table_name := 'orders', "
+        f"start_at := '{terminal_at}'"
+        ")"
+    )
+    start_snapshot_v2, end_snapshot_v2, has_changes_v2, _, _, _, _ = one(
+        a,
+        "SELECT * FROM cdc_window('lake', 'orders_sink_v2')",
+    )
+    if not has_changes_v2:
+        raise AssertionError("expected the successor DML window to see the post-ALTER INSERT")
+
+    # `cdc_dml_changes_read` is THE typed DML payload API. Its rows now
+    # project the pinned table's native columns at the top level (here:
+    # the post-ALTER `id`, `status`, and the new `note`).
     typed_rows = all_rows(
         a,
         "SELECT change_type, id, status, note "
-        "FROM cdc_dml_table_changes_read("
-        "'lake', 'orders_sink', "
-        "table_name := 'orders', "
-        f"start_snapshot := {start_snapshot}, end_snapshot := {end_snapshot}"
+        "FROM cdc_dml_changes_read("
+        "'lake', 'orders_sink_v2', "
+        f"start_snapshot := {start_snapshot_v2}, end_snapshot := {end_snapshot_v2}"
         ") "
         "WHERE change_type = 'insert' "
         "ORDER BY snapshot_id, rowid",
     )
     if ("insert", 3, "shipped", "schema-boundary") not in typed_rows:
-        raise AssertionError(f"expected typed post-DDL insert row with the new note column, got {typed_rows!r}")
+        raise AssertionError(f"expected typed post-ALTER insert row with the new note column, got {typed_rows!r}")
 
-    a.execute(f"SELECT * FROM cdc_commit('lake', 'orders_sink', {end_snapshot})")
+    a.execute(f"SELECT * FROM cdc_commit('lake', 'orders_sink_v2', {end_snapshot_v2})")
 
 
 def run_backend(name: str, postgres_dsn: str) -> None:
@@ -279,6 +317,23 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if len(args.backends) > 1:
+        for backend in args.backends:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    __file__,
+                    "--backends",
+                    backend,
+                    "--postgres-dsn",
+                    args.postgres_dsn,
+                ],
+                check=False,
+            )
+            if completed.returncode != 0:
+                return completed.returncode
+        return 0
 
     for backend in args.backends:
         run_backend(backend, args.postgres_dsn)
