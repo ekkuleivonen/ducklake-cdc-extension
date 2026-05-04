@@ -748,8 +748,6 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 		result->end_snapshot = end_snapshot_entry->second.GetValue<int64_t>();
 	}
 
-	CheckCatalogOrThrow(context, result->catalog_name);
-
 	// Probe the underlying `<lake>.table_changes(...)` schema with a `LIMIT 0`
 	// query so the planner sees the table's actual columns. `table_changes`
 	// projects the schema as of the END snapshot of the range, so the probe
@@ -776,6 +774,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 	// fixing it would require rebinding on every Init.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, result->catalog_name);
 	const auto subscriptions = LoadConsumerSubscriptions(conn, result->catalog_name, result->consumer_name);
 	ResolveSubscribedTable(subscriptions, result->consumer_name, result->schema_id, result->table_id,
 	                       result->table_name);
@@ -1085,9 +1084,9 @@ duckdb::unique_ptr<duckdb::FunctionData> DmlTicksQueryBind(duckdb::ClientContext
 	result->stateless = true;
 	result->table_ids = Int64ListNamedParameter(input, "table_ids");
 	result->table_names = StringListNamedParameter(input, "table_names");
-	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, result->catalog_name);
 	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
 	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot, "cdc_dml_ticks_query");
 	DmlTicksReturnTypes(return_types, names, false);
@@ -1156,9 +1155,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeChangesBind(duckdb::ClientConte
 	auto result = duckdb::make_uniq<CdcRangeChangesData>();
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->from_snapshot = input.inputs[1].GetValue<int64_t>();
-	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, result->catalog_name);
 	result->to_snapshot = RangeToSnapshotParameter(conn, input, result->catalog_name, 2);
 	ValidateRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot,
 	                    "cdc_dml_changes_query");

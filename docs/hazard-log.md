@@ -294,35 +294,38 @@ go; this file says what can hurt users or maintainers on the way there.
 
 ### H-022: SQLite-Backed Metadata Lock Handoff on Windows MinGW
 
-- Risk: When the metadata catalog is SQLite-backed and the caller runs a
-  sqlite_scanner read against `__ducklake_metadata_<catalog>.<…>` (typically
-  `SET VARIABLE x = (SELECT max(snapshot_id) FROM …ducklake_snapshot)`)
-  immediately followed by the first `cdc_*_consumer_create` call, the
-  Windows MinGW build can fail with `Invalid Error: Resource deadlock
-  avoided`. The MinGW C runtime maps the underlying `LockFileEx` /
-  `ERROR_POSSIBLE_DEADLOCK` result to `EDEADLK`; MSVC, Linux, and macOS do
-  not surface the same conflict on this code path. The first
-  `cdc_*_consumer_create` is the only call that bootstraps
-  `__ducklake_cdc.__ducklake_cdc_consumers` etc. (a `CREATE SCHEMA IF NOT
-  EXISTS` plus `CREATE TABLE IF NOT EXISTS`), so the cross-connection
-  lock-handoff window is uniquely tight there.
-- Status: accepted.
-- Handling: `test/sql/dml_schema_shape_pinning.test` documents the pattern
-  and uses `start_at := 'now'` (resolved on the extension's own connection)
-  for the bootstrap-triggering call. Any subsequent
-  `cdc_*_consumer_create` that runs after the bootstrap is no longer
-  exposed to the same handoff (the schema/tables already exist), so the
-  `SET VARIABLE`-then-create pattern is safe once at least one cdc_*
-  function has executed against the catalog in this DuckDB process.
+- Risk: When the metadata catalog is SQLite-backed and a single
+  `cdc_*_consumer_create` (or any cdc_* call that bootstraps
+  `__ducklake_cdc.*`) opens more than one DuckDB connection against the
+  same SQLite file, the Windows MinGW build can fail with `Invalid Error:
+  Resource deadlock avoided`. The MinGW C runtime maps the underlying
+  `LockFileEx` / `ERROR_POSSIBLE_DEADLOCK` result to `EDEADLK`; MSVC,
+  Linux, and macOS do not surface the same conflict. Each cdc_* function
+  used to open three connections in sequence (compat probe → bootstrap
+  CREATEs → main work), and the read↔write handoff between them was
+  enough to trip the detector even when no user statement read the
+  metadata directly. An earlier mitigation that pushed callers to
+  `start_at := 'now'` instead of `SET VARIABLE x = (SELECT
+  max(snapshot_id) FROM …ducklake_snapshot)` only removed the visible
+  user-side read; the handoff inside the cdc_* function remained.
+- Status: handled.
+- Handling: `CheckCatalogOrThrow` and `BootstrapConsumerStateOrThrow`
+  now have `Connection&` overloads, and every cdc_* function opens one
+  internal connection up front (`duckdb::Connection conn(*context.db);
+  ConfigureCdcInternalConnection(conn);`) and threads it through the
+  compat probe, the bootstrap CREATEs, and all follow-up reads/writes.
+  Going through a single DuckDB connection means a single SQLite file
+  handle when the metadata is SQLite-backed, so there is no
+  cross-connection lock to mis-classify as a deadlock.
+  `test/sql/dml_schema_shape_pinning.test` exercises the
+  bootstrap-triggering path and is part of the standard release matrix
+  on every supported platform, including Windows MinGW.
 - Notes: DuckLake's documented `META_JOURNAL_MODE 'WAL'` and
   `META_BUSY_TIMEOUT` ATTACH options improve concurrency on SQLite-backed
   catalogs in general (see duckdb/ducklake#128) and should be used by
-  operators who need many concurrent writers; they don't change this
-  specific MinGW-only error path, which is about a within-process lock
-  handoff between sqlite_scanner and our bootstrap connection.
-- Next action: Revisit if a real user hits this on Windows MinGW outside
-  the bootstrap-only window. Concrete mitigations would include reusing
-  the caller's connection for bootstrap (so the bootstrap CREATE
-  statements share the SQLite file handle with the prior sqlite_scanner
-  read) or forcing the first cdc_* call against a catalog to be a
-  read-only one such as `cdc_window` / `cdc_list_consumers`.
+  operators who need many concurrent writers; they're orthogonal to this
+  fix.
+- Next action: If a future cdc_* function adds a code path that opens a
+  second internal connection against the metadata catalog, route it
+  through the existing `conn` instead — the `Connection&` overloads are
+  there for exactly that reason.

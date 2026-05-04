@@ -142,6 +142,15 @@ std::string AuditDdl(const std::string &catalog_name, bool use_state_schema);
 //! Idempotently create the catalog-resident CDC state tables in a DuckLake
 //! catalog. Throws `CDC_INCOMPATIBLE_CATALOG` before any write when the
 //! target catalog format is outside the supported set.
+//!
+//! The `Connection&` overload runs the CREATE writes on the caller-provided
+//! connection. Internal cdc_* callers should prefer it: chaining the
+//! version probe + bootstrap + the cdc_* function's main work onto a
+//! single DuckDB connection means everything goes through one SQLite
+//! file handle when the metadata catalog is SQLite-backed, sidestepping
+//! the Windows MinGW `LockFileEx` `ERROR_POSSIBLE_DEADLOCK` handoff
+//! described in H-022 (`docs/hazard-log.md`).
+void BootstrapConsumerStateOrThrow(duckdb::Connection &conn, const std::string &catalog_name);
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name);
 
 //===--------------------------------------------------------------------===//

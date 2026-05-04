@@ -823,11 +823,16 @@ std::vector<ResolvedSubscriptionInput> ResolveCreateSubscriptions(duckdb::Connec
 }
 
 std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const ConsumerCreateData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Open ONE connection up front so the version probe, the bootstrap
+	// CREATE writes, the start_at snapshot lookup, and the INSERTs all
+	// share a single SQLite file handle when the metadata catalog is
+	// SQLite-backed. The cross-connection variant of this chain trips
+	// Windows MinGW's `LockFileEx` / `ERROR_POSSIBLE_DEADLOCK` path
+	// (H-022 in `docs/hazard-log.md`).
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto subscriptions_table = StateTable(conn, data.catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE);
 	const auto quoted_name = QuoteLiteral(data.consumer_name);
@@ -1003,11 +1008,11 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerResetBind(duckdb::ClientContext
 }
 
 std::vector<duckdb::Value> ResetConsumer(duckdb::ClientContext &context, const ConsumerResetData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	int64_t resolved_snapshot = ResolveResetSnapshot(conn, data.catalog_name, data.to_snapshot);
@@ -1071,11 +1076,11 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerDropBind(duckdb::ClientContext 
 }
 
 std::vector<duckdb::Value> DropConsumer(duckdb::ClientContext &context, const ConsumerDropData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto subscriptions = StateTable(conn, data.catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
@@ -1134,11 +1139,11 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerForceReleaseBind(duckdb::Client
 }
 
 std::vector<duckdb::Value> ForceReleaseConsumer(duckdb::ClientContext &context, const ConsumerForceReleaseData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	const auto details = "{\"previous_token\":" + JsonValue(row.owner_token) +
@@ -1680,7 +1685,7 @@ bool TryCommitPostgresNative(duckdb::Connection &conn, const std::string &catalo
 
 std::vector<duckdb::Value> CommitWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
                                                       const CdcCommitData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
+	CheckCatalogOrThrow(conn, data.catalog_name);
 
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
@@ -1788,10 +1793,9 @@ duckdb::unique_ptr<duckdb::FunctionData> ConsumerHeartbeatBind(duckdb::ClientCon
 }
 
 std::vector<duckdb::Value> HeartbeatConsumer(duckdb::ClientContext &context, const ConsumerHeartbeatData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
-
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
 	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
@@ -2429,7 +2433,7 @@ std::vector<duckdb::Value>
 WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Connection &conn,
                                      const std::string &catalog_name, const std::string &consumer_name,
                                      int64_t timeout_ms, const std::vector<ConsumerSubscriptionRow> &subscriptions) {
-	CheckCatalogOrThrow(context, catalog_name);
+	CheckCatalogOrThrow(conn, catalog_name);
 	if (timeout_ms < 0) {
 		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
 	}
@@ -2548,11 +2552,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerListInit(duckdb::Cl
                                                                       duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<ConsumerListData>();
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	// SELECT order:
 	//   0 consumer_name, 1 consumer_kind, 2 consumer_id, 3 table_id,
 	//   4 last_committed_snapshot, 5 last_committed_schema_version,
@@ -2696,10 +2700,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerSubscriptionsInit(d
                                                                                duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<ConsumerSubscriptionsData>();
-	CheckCatalogOrThrow(context, data.catalog_name);
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	for (const auto &sub : LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name)) {
 		result->rows.push_back({duckdb::Value(sub.consumer_name), duckdb::Value(sub.consumer_kind),
 		                        duckdb::Value::BIGINT(sub.consumer_id), duckdb::Value::BIGINT(sub.subscription_id),
@@ -2975,7 +2980,7 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 
 std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
                                                     const CdcWindowData &data) {
-	CheckCatalogOrThrow(context, data.catalog_name);
+	CheckCatalogOrThrow(conn, data.catalog_name);
 	if (data.max_snapshots > HARD_MAX_SNAPSHOTS) {
 		ThrowMaxSnapshotsExceeded(data.max_snapshots);
 	}

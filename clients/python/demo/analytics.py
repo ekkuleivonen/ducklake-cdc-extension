@@ -1,10 +1,21 @@
 """Lightweight analytics helpers for the DuckLake CDC demo.
 
-Only the surface the knob-free demo actually drives lives here. Anything
-that used to count catalog calls, loop iterations, or DDL events from the
-old demo's hand-rolled fan-out is gone — :class:`ducklake_cdc.CDCApp`
-owns the loop now and the demo's job is to render observable throughput +
-latency on top of it.
+The demo answers four questions, in order:
+
+1. **Workload** — what was produced (tables, workers, batch sizes,
+   update/delete mix) and what reached the consumer (consumers,
+   tables_seen).
+2. **Throughput** — once data started flowing, how many rows landed
+   per second.
+3. **End-to-end latency** — from the producer emitting a row to the
+   consumer's sink seeing it (`fresh` events: insert + update_postimage).
+4. **Where that latency came from** — split by who introduced it:
+   the producer (commit + publish), the CDC extension (listen + commit),
+   and the Python client (Change/DMLBatch materialisation, sink).
+
+The JSON written via ``--summary-output`` mirrors the rendered table
+1-to-1: each section is a top-level object with the same field names as
+the rows on screen.
 """
 
 from __future__ import annotations
@@ -46,26 +57,28 @@ class DemoStats:
     Field groups mirror the rendered :func:`summary_table`:
 
     - throughput: ``consumed_changes`` / ``finished_ns`` - ``first_delivered_ns``;
-    - latency: ``fresh_action_latencies_ms``,
-      ``producer_to_snapshot_ms``, ``snapshot_to_consumer_ms``;
-    - shape: per-table counts, per-change-type counts, producer
+    - end-to-end + stage: ``e2e_ms``, ``producer_ms``, ``pipeline_ms``;
+    - per-batch breakdown: ``extension_listen_ms``, ``python_build_ms``,
+      ``sink_ms``, ``extension_commit_ms``, ``snapshots_per_batch``,
+      ``snapshots_per_listen``;
+    - workload: per-table counts, per-change-type counts, producer
       benchmark payload echoed back from the row data.
     """
 
     started_ns: int = field(default_factory=time.monotonic_ns)
     first_delivered_ns: int | None = None
     finished_ns: int | None = None
-    fresh_action_latencies_ms: list[float] = field(default_factory=list)
+    e2e_ms: list[float] = field(default_factory=list)
     stale_row_latencies_ms: list[float] = field(default_factory=list)
-    producer_to_snapshot_ms: list[float] = field(default_factory=list)
-    snapshot_to_consumer_ms: list[float] = field(default_factory=list)
-    dml_listen_empty_ms: list[float] = field(default_factory=list)
-    dml_listen_nonempty_ms: list[float] = field(default_factory=list)
-    dml_build_batch_ms: list[float] = field(default_factory=list)
-    dml_sink_ms: list[float] = field(default_factory=list)
-    dml_commit_ms: list[float] = field(default_factory=list)
-    dml_snapshot_spans: list[int] = field(default_factory=list)
-    dml_listen_max_snapshots: list[int] = field(default_factory=list)
+    producer_ms: list[float] = field(default_factory=list)
+    pipeline_ms: list[float] = field(default_factory=list)
+    extension_listen_ms: list[float] = field(default_factory=list)
+    extension_listen_empty_ms: list[float] = field(default_factory=list)
+    python_build_ms: list[float] = field(default_factory=list)
+    sink_ms: list[float] = field(default_factory=list)
+    extension_commit_ms: list[float] = field(default_factory=list)
+    snapshots_per_batch: list[int] = field(default_factory=list)
+    snapshots_per_listen: list[int] = field(default_factory=list)
     delivered_batches: int = 0
     consumed_changes: int = 0
     rows_per_batch: list[int] = field(default_factory=list)
@@ -81,10 +94,12 @@ class DemoStats:
     benchmark_worker_counts: set[int] = field(default_factory=set)
     benchmark_update_percents: set[float] = field(default_factory=set)
     benchmark_delete_percents: set[float] = field(default_factory=set)
+    benchmark_batch_mins: set[int] = field(default_factory=set)
+    benchmark_batch_maxes: set[int] = field(default_factory=set)
     error_count: int = 0
     error_type_counts: dict[str, int] = field(default_factory=dict)
-    latency_missing_produced_ns: int = 0
-    latency_clock_skew_clamped: int = 0
+    rows_no_produced_ns: int = 0
+    rows_clock_skew_clamped: int = 0
 
     def finish(self) -> None:
         if self.finished_ns is None:
@@ -135,21 +150,21 @@ class DemoStats:
     def record_dml_listen(
         self, *, elapsed_ms: float, row_count: int, max_snapshots: int
     ) -> None:
-        self.dml_listen_max_snapshots.append(max_snapshots)
+        self.snapshots_per_listen.append(max_snapshots)
         if row_count > 0:
-            self.dml_listen_nonempty_ms.append(elapsed_ms)
+            self.extension_listen_ms.append(elapsed_ms)
         else:
-            self.dml_listen_empty_ms.append(elapsed_ms)
+            self.extension_listen_empty_ms.append(elapsed_ms)
 
     def record_dml_build_batch(self, *, elapsed_ms: float, snapshot_span: int) -> None:
-        self.dml_build_batch_ms.append(elapsed_ms)
-        self.dml_snapshot_spans.append(snapshot_span)
+        self.python_build_ms.append(elapsed_ms)
+        self.snapshots_per_batch.append(snapshot_span)
 
     def record_dml_sink(self, *, elapsed_ms: float) -> None:
-        self.dml_sink_ms.append(elapsed_ms)
+        self.sink_ms.append(elapsed_ms)
 
     def record_dml_commit_duration(self, *, elapsed_ms: float) -> None:
-        self.dml_commit_ms.append(elapsed_ms)
+        self.extension_commit_ms.append(elapsed_ms)
 
     def record_change_observation(
         self,
@@ -182,7 +197,7 @@ class DemoStats:
     ) -> None:
         parsed_produced_ns = parse_int(produced_ns)
         if parsed_produced_ns is None:
-            self.latency_missing_produced_ns += 1
+            self.rows_no_produced_ns += 1
             return
 
         observed_ns = time.monotonic_ns() if consumed_ns is None else consumed_ns
@@ -190,26 +205,26 @@ class DemoStats:
 
         change_type_name = str(change_type)
         if change_type_name in {"insert", "update_postimage"}:
-            self.fresh_action_latencies_ms.append(latency_ms)
+            self.e2e_ms.append(latency_ms)
             parsed_epoch_ns = parse_int(produced_epoch_ns)
             snapshot_epoch_ns = datetime_to_epoch_ns(snapshot_time)
             if parsed_epoch_ns is not None and snapshot_epoch_ns is not None:
-                producer_to_snapshot_ms = (
-                    snapshot_epoch_ns - parsed_epoch_ns
-                ) / NANOS_PER_MILLISECOND
-                if -CLOCK_SKEW_CLAMP_MS < producer_to_snapshot_ms < 0:
-                    producer_to_snapshot_ms = 0.0
-                    self.latency_clock_skew_clamped += 1
-                if producer_to_snapshot_ms >= 0:
-                    self.producer_to_snapshot_ms.append(producer_to_snapshot_ms)
+                producer_ms = (snapshot_epoch_ns - parsed_epoch_ns) / NANOS_PER_MILLISECOND
+                if -CLOCK_SKEW_CLAMP_MS < producer_ms < 0:
+                    producer_ms = 0.0
+                    self.rows_clock_skew_clamped += 1
+                if producer_ms >= 0:
+                    self.producer_ms.append(producer_ms)
                 observed_epoch_ns = (
                     time.time_ns() if consumed_epoch_ns is None else consumed_epoch_ns
                 )
-                self.snapshot_to_consumer_ms.append(
+                self.pipeline_ms.append(
                     (observed_epoch_ns - snapshot_epoch_ns) / NANOS_PER_MILLISECOND
                 )
         elif change_type_name in {"update_preimage", "delete"}:
             self.stale_row_latencies_ms.append(latency_ms)
+
+    # -- summary ---------------------------------------------------------
 
     def summary(self) -> dict[str, Any]:
         end_ns = self.finished_ns if self.finished_ns is not None else time.monotonic_ns()
@@ -219,57 +234,59 @@ class DemoStats:
             if self.first_delivered_ns is not None
             else 0.0
         )
+        rows_per_batch = metric_summary([float(c) for c in self.rows_per_batch])
+        e2e = metric_summary(self.e2e_ms)
+        producer = metric_summary(self.producer_ms)
+        pipeline = metric_summary(self.pipeline_ms)
+        listen = metric_summary(self.extension_listen_ms)
+        build = metric_summary(self.python_build_ms)
+        sink = metric_summary(self.sink_ms)
+        commit = metric_summary(self.extension_commit_ms)
+        snap_per_batch = metric_summary([float(s) for s in self.snapshots_per_batch])
+        snap_per_listen = metric_summary([float(s) for s in self.snapshots_per_listen])
+
         return {
-            "actual_duration_seconds": run_duration_seconds,
-            "active_duration_seconds": active_duration_seconds,
-            "run_duration_seconds": run_duration_seconds,
-            "consumed_changes": self.consumed_changes,
-            "consumed_changes_per_second": divide(
-                self.consumed_changes, active_duration_seconds
-            ),
-            "delivered_batches": self.delivered_batches,
-            "fresh_action_latency_ms": metric_summary(
-                self.fresh_action_latencies_ms
-            ).to_json(),
-            "stale_row_latency_ms": metric_summary(self.stale_row_latencies_ms).to_json(),
-            "producer_to_snapshot_ms": metric_summary(
-                self.producer_to_snapshot_ms
-            ).to_json(),
-            "snapshot_to_consumer_ms": metric_summary(
-                self.snapshot_to_consumer_ms
-            ).to_json(),
-            "dml_listen_empty_ms": metric_summary(self.dml_listen_empty_ms).to_json(),
-            "dml_listen_nonempty_ms": metric_summary(
-                self.dml_listen_nonempty_ms
-            ).to_json(),
-            "dml_build_batch_ms": metric_summary(self.dml_build_batch_ms).to_json(),
-            "dml_sink_ms": metric_summary(self.dml_sink_ms).to_json(),
-            "dml_commit_ms": metric_summary(self.dml_commit_ms).to_json(),
-            "dml_snapshot_span": metric_summary(
-                [float(span) for span in self.dml_snapshot_spans]
-            ).to_json(),
-            "dml_listen_max_snapshots": metric_summary(
-                [float(value) for value in self.dml_listen_max_snapshots]
-            ).to_json(),
-            "rows_per_batch": metric_summary(
-                [float(count) for count in self.rows_per_batch]
-            ).to_json(),
-            "changes_by_table": dict(sorted(self.changes_by_table.items())),
-            "latency_missing_produced_ns": self.latency_missing_produced_ns,
-            "latency_clock_skew_clamped": self.latency_clock_skew_clamped,
-            "consumer_count_seen": len(self.consumer_names),
-            "schema_count_seen": len(self.schema_names),
-            "table_count_seen": len(self.table_names),
-            "dml_count_seen": self._dml_action_count_seen(),
-            "dml_change_type_counts": dict(sorted(self.change_type_counts.items())),
-            "dml_action_shares": self._dml_action_shares(),
-            "producer_workload": self._producer_workload_summary(),
-            "error_count": self.error_count,
-            "error_type_counts": dict(sorted(self.error_type_counts.items())),
-            "fresh_latency_excluded_row_count": (
-                self.latency_missing_produced_ns + len(self.stale_row_latencies_ms)
-            ),
-            "stale_latency_row_count": len(self.stale_row_latencies_ms),
+            "workload": self._workload_section(),
+            "throughput": {
+                "duration_active_s": active_duration_seconds,
+                "duration_run_s": run_duration_seconds,
+                "changes_total": self.consumed_changes,
+                "changes_per_s": divide(
+                    self.consumed_changes, active_duration_seconds
+                ),
+                "batches_total": self.delivered_batches,
+                "rows_per_batch_p95": rows_per_batch.p95,
+            },
+            "e2e_latency_ms": {
+                "p50": e2e.p50,
+                "p95": e2e.p95,
+                "p99": e2e.p99,
+                "max": e2e.max,
+            },
+            "stage_latency_ms": {
+                "producer_p95": producer.p95,
+                "pipeline_p95": pipeline.p95,
+            },
+            "pipeline_breakdown": {
+                "extension_listen_ms_p95": listen.p95,
+                "python_build_ms_p95": build.p95,
+                "snapshots_per_batch_p95": snap_per_batch.p95,
+                "snapshots_per_batch_max": snap_per_batch.max,
+                "snapshots_per_listen_p50": snap_per_listen.p50,
+            },
+            "post_delivery_ms": {
+                "sink_p95": sink.p95,
+                "extension_commit_p95": commit.p95,
+            },
+            "action_mix": self._action_mix_section(),
+            "health": {
+                "errors": self.error_count,
+                "rows_no_produced_ns": self.rows_no_produced_ns,
+                "rows_clock_skew_clamped": self.rows_clock_skew_clamped,
+                "rows_excluded_from_e2e": (
+                    self.rows_no_produced_ns + len(self.stale_row_latencies_ms)
+                ),
+            },
         }
 
     def progress_snapshot(self) -> dict[str, int | float]:
@@ -280,15 +297,63 @@ class DemoStats:
             else 0.0
         )
         return {
-            "active_duration_seconds": active_duration_seconds,
-            "consumed_changes": self.consumed_changes,
-            "consumed_changes_per_second": divide(
-                self.consumed_changes, active_duration_seconds
-            ),
-            "delivered_batches": self.delivered_batches,
-            "consumer_count_seen": len(self.consumer_names),
-            "table_count_seen": len(self.table_names),
-            "error_count": self.error_count,
+            "duration_active_s": active_duration_seconds,
+            "changes_total": self.consumed_changes,
+            "changes_per_s": divide(self.consumed_changes, active_duration_seconds),
+            "batches_total": self.delivered_batches,
+            "consumers": len(self.consumer_names),
+            "tables_seen": len(self.table_names),
+            "errors": self.error_count,
+        }
+
+    def stage_breakdown_p95(self) -> dict[str, float]:
+        """Live attribution view: who introduced each ms.
+
+        Used by the dashboard to render a producer/extension/client
+        breakdown without touching the lower-level metric lists.
+        ``extension`` = listen + commit (both extension SQL).
+        ``client`` = python_build + sink (Python, but ``sink`` is the
+        user-supplied callback so we expose it separately too).
+        """
+        producer_p95 = percentile(self.producer_ms, 95)
+        listen_p95 = percentile(self.extension_listen_ms, 95)
+        build_p95 = percentile(self.python_build_ms, 95)
+        sink_p95 = percentile(self.sink_ms, 95)
+        commit_p95 = percentile(self.extension_commit_ms, 95)
+        return {
+            "producer_p95": producer_p95,
+            "extension_listen_p95": listen_p95,
+            "extension_commit_p95": commit_p95,
+            "python_build_p95": build_p95,
+            "sink_p95": sink_p95,
+            # Convenience aggregates.
+            "extension_p95": listen_p95 + commit_p95,
+            "client_p95": build_p95 + sink_p95,
+        }
+
+    # -- internals -------------------------------------------------------
+
+    def _workload_section(self) -> dict[str, Any]:
+        return {
+            "producer_profile": scalar_or_sorted_str(self.benchmark_profiles),
+            "producer_workers": scalar_or_sorted_int(self.benchmark_worker_counts),
+            "producer_duration_s": scalar_or_sorted_float(self.benchmark_duration_seconds),
+            "producer_schemas": scalar_or_sorted_int(self.benchmark_schema_counts),
+            "producer_tables": scalar_or_sorted_int(self.benchmark_table_counts),
+            "producer_update_pct": scalar_or_sorted_float(self.benchmark_update_percents),
+            "producer_delete_pct": scalar_or_sorted_float(self.benchmark_delete_percents),
+            "producer_batch_min": scalar_or_sorted_int(self.benchmark_batch_mins),
+            "producer_batch_max": scalar_or_sorted_int(self.benchmark_batch_maxes),
+            "consumers": len(self.consumer_names),
+            "tables_seen": len(self.table_names),
+        }
+
+    def _action_mix_section(self) -> dict[str, float]:
+        total = self._dml_action_count_seen()
+        return {
+            "inserts": divide(self.change_type_counts.get("insert", 0), total),
+            "updates": divide(self.change_type_counts.get("update_postimage", 0), total),
+            "deletes": divide(self.change_type_counts.get("delete", 0), total),
         }
 
     def _dml_action_count_seen(self) -> int:
@@ -297,25 +362,6 @@ class DemoStats:
             + self.change_type_counts.get("update_postimage", 0)
             + self.change_type_counts.get("delete", 0)
         )
-
-    def _dml_action_shares(self) -> dict[str, float]:
-        total = self._dml_action_count_seen()
-        return {
-            "insert": divide(self.change_type_counts.get("insert", 0), total),
-            "update": divide(self.change_type_counts.get("update_postimage", 0), total),
-            "delete": divide(self.change_type_counts.get("delete", 0), total),
-        }
-
-    def _producer_workload_summary(self) -> dict[str, object]:
-        return {
-            "profiles": sorted(self.benchmark_profiles),
-            "duration_seconds": scalar_or_sorted(self.benchmark_duration_seconds),
-            "schema_counts": sorted(self.benchmark_schema_counts),
-            "table_counts": sorted(self.benchmark_table_counts),
-            "worker_counts": sorted(self.benchmark_worker_counts),
-            "update_percents": sorted(self.benchmark_update_percents),
-            "delete_percents": sorted(self.benchmark_delete_percents),
-        }
 
     def _record_benchmark_payload(self, values: Mapping[str, object]) -> None:
         profile = values.get("benchmark_profile")
@@ -339,6 +385,179 @@ class DemoStats:
         delete_percent = parse_float(values.get("benchmark_delete_percent"))
         if delete_percent is not None:
             self.benchmark_delete_percents.add(delete_percent)
+        batch_min = parse_int(values.get("benchmark_batch_min"))
+        if batch_min is not None:
+            self.benchmark_batch_mins.add(batch_min)
+        batch_max = parse_int(values.get("benchmark_batch_max"))
+        if batch_max is not None:
+            self.benchmark_batch_maxes.add(batch_max)
+
+
+# ---------------------------------------------------------------------------
+# Renderer
+# ---------------------------------------------------------------------------
+
+
+def summary_table(summary: Mapping[str, Any]) -> str:
+    """Render the demo summary as a sectioned ASCII table.
+
+    The input is the dict returned by :meth:`DemoStats.summary` (the
+    same one written to ``--summary-output``). Each top-level key
+    becomes a titled section; missing sections are silently skipped so
+    runs without delivered batches still produce a useful header.
+    """
+    sections = list(_iter_sections(summary))
+    return _render_sections("DuckLake CDC demo summary", sections)
+
+
+_SECTION_TITLE = {
+    "workload": "Workload",
+    "throughput": "Throughput",
+    "e2e_latency_ms": "End-to-end latency (fresh: insert + update_postimage)",
+    "stage_latency_ms": "Latency by stage  (p95, sums to ~e2e_p95)",
+    "pipeline_breakdown": "Pipeline breakdown  (per delivered batch)",
+    "post_delivery_ms": "Post-delivery overhead  (per batch, not in e2e budget)",
+    "action_mix": "Action mix",
+    "health": "Health",
+}
+
+
+def _iter_sections(
+    summary: Mapping[str, Any],
+) -> "Iterable[tuple[str, list[tuple[str, str, str]]]]":
+    workload = summary.get("workload")
+    if isinstance(workload, Mapping):
+        rows = _workload_rows(workload)
+        if rows:
+            yield _SECTION_TITLE["workload"], rows
+
+    throughput = summary.get("throughput")
+    if isinstance(throughput, Mapping):
+        rows = _throughput_rows(throughput)
+        if rows:
+            yield _SECTION_TITLE["throughput"], rows
+
+    e2e = summary.get("e2e_latency_ms")
+    if _has_latency(e2e):
+        yield _SECTION_TITLE["e2e_latency_ms"], _e2e_rows(e2e)
+
+    stage = summary.get("stage_latency_ms")
+    if _has_latency(stage):
+        yield _SECTION_TITLE["stage_latency_ms"], _stage_rows(stage)
+
+    pipeline = summary.get("pipeline_breakdown")
+    if isinstance(pipeline, Mapping):
+        rows = _pipeline_rows(pipeline)
+        if rows:
+            yield _SECTION_TITLE["pipeline_breakdown"], rows
+
+    post = summary.get("post_delivery_ms")
+    if isinstance(post, Mapping):
+        rows = _post_delivery_rows(post)
+        if rows:
+            yield _SECTION_TITLE["post_delivery_ms"], rows
+
+    mix = summary.get("action_mix")
+    if isinstance(mix, Mapping):
+        yield _SECTION_TITLE["action_mix"], _action_mix_rows(mix)
+
+    health = summary.get("health")
+    if isinstance(health, Mapping):
+        yield _SECTION_TITLE["health"], _health_rows(health)
+
+
+def _workload_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    rows.append(_row("producer_profile", _fmt_value(section.get("producer_profile")), "commit-spacing schedule"))
+    rows.append(_row("producer_workers", _fmt_value(section.get("producer_workers")), "concurrent producer connections"))
+    rows.append(_row("producer_duration_s", _fmt_value(section.get("producer_duration_s")), "target spread; 0 = as fast as possible"))
+    rows.append(_row("producer_schemas", _fmt_value(section.get("producer_schemas")), "configured (vs tables_seen)"))
+    rows.append(_row("producer_tables", _fmt_value(section.get("producer_tables")), "configured per schema"))
+    rows.append(_row("producer_update_pct", _fmt_pct(section.get("producer_update_pct")), "of base actions"))
+    rows.append(_row("producer_delete_pct", _fmt_pct(section.get("producer_delete_pct")), "of base actions"))
+    rows.append(_row("producer_batch_min", _fmt_value(section.get("producer_batch_min")), "rows per commit, lower bound"))
+    rows.append(_row("producer_batch_max", _fmt_value(section.get("producer_batch_max")), "rows per commit, upper bound"))
+    rows.append(_row("consumers", _fmt_value(section.get("consumers")), "distinct consumers observed"))
+    rows.append(_row("tables_seen", _fmt_value(section.get("tables_seen")), "distinct tables observed"))
+    return [r for r in rows if r is not None]
+
+
+def _throughput_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("duration_active_s", format_float(section.get("duration_active_s", 0.0)), "first delivered batch -> exit"),
+        _row("duration_run_s", format_float(section.get("duration_run_s", 0.0)), "wall time of consumer process"),
+        _row("changes_total", _fmt_int(section.get("changes_total", 0)), "rows delivered to sinks"),
+        _row("changes_per_s", format_float(section.get("changes_per_s", 0.0)), "changes_total / duration_active_s"),
+        _row("batches_total", _fmt_int(section.get("batches_total", 0)), "non-empty windows across all consumers"),
+        _row("rows_per_batch_p95", format_float(section.get("rows_per_batch_p95", 0.0)), "typical batch size"),
+    ]
+
+
+def _e2e_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("e2e_p50_ms", format_float(section.get("p50", 0.0)), "produced -> delivered to sink"),
+        _row("e2e_p95_ms", format_float(section.get("p95", 0.0)), ""),
+        _row("e2e_p99_ms", format_float(section.get("p99", 0.0)), ""),
+        _row("e2e_max_ms", format_float(section.get("max", 0.0)), ""),
+    ]
+
+
+def _stage_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("producer_ms_p95", format_float(section.get("producer_p95", 0.0)), "produced -> snapshot landed (commit + publish) *"),
+        _row("pipeline_ms_p95", format_float(section.get("pipeline_p95", 0.0)), "snapshot landed -> delivered to sink"),
+    ]
+
+
+def _pipeline_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("extension_listen_ms_p95", format_float(section.get("extension_listen_ms_p95", 0.0)), "cdc_dml_changes_listen (incl. catalog wait)"),
+        _row("python_build_ms_p95", format_float(section.get("python_build_ms_p95", 0.0)), "Change/DMLBatch materialisation"),
+        _row("snapshots_per_batch_p95", format_float(section.get("snapshots_per_batch_p95", 0.0)), "snapshots coalesced per delivered batch"),
+        _row("snapshots_per_batch_max", format_float(section.get("snapshots_per_batch_max", 0.0)), "worst-case coalescing window"),
+        _row("snapshots_per_listen_p50", format_float(section.get("snapshots_per_listen_p50", 0.0)), "snapshots requested per listen call"),
+    ]
+
+
+def _post_delivery_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("sink_ms_p95", format_float(section.get("sink_p95", 0.0)), "user sink callbacks"),
+        _row("extension_commit_ms_p95", format_float(section.get("extension_commit_p95", 0.0)), "cdc_commit after sink success"),
+    ]
+
+
+def _action_mix_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("share_inserts", format_share(section.get("inserts", 0.0)), ""),
+        _row("share_updates", format_share(section.get("updates", 0.0)), ""),
+        _row("share_deletes", format_share(section.get("deletes", 0.0)), ""),
+    ]
+
+
+def _health_rows(section: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    return [
+        _row("errors", _fmt_int(section.get("errors", 0)), "uncaught consumer/runtime errors"),
+        _row("rows_no_produced_ns", _fmt_int(section.get("rows_no_produced_ns", 0)), "excluded from e2e: missing producer timestamp"),
+        _row("rows_clock_skew_clamped", _fmt_int(section.get("rows_clock_skew_clamped", 0)), "small negative samples clamped to zero"),
+        _row("rows_excluded_from_e2e", _fmt_int(section.get("rows_excluded_from_e2e", 0)), "preimage + delete rows"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _row(metric: str, value: str, description: str) -> tuple[str, str, str]:
+    return (metric, value, description)
+
+
+def _has_latency(section: object) -> bool:
+    if not isinstance(section, Mapping):
+        return False
+    # All zeros means no fresh latencies were recorded — skip the
+    # section entirely instead of rendering rows of 0.000.
+    return any(float(v or 0.0) for v in section.values())
 
 
 def metric_summary(values: list[float]) -> MetricSummary:
@@ -367,293 +586,16 @@ def percentile(values: list[float], percentile_value: float) -> float:
     return (sorted_values[lower] * (1.0 - weight)) + (sorted_values[upper] * weight)
 
 
-def summary_table(summary: Mapping[str, Any]) -> str:
-    """Render a focused, sectioned summary of the metrics that actually matter.
-
-    The full numeric record stays in :meth:`DemoStats.summary` (and the
-    JSON dump). This rendering is the at-a-glance view: throughput, fresh
-    CDC latency, where that latency is spent, and a small workload-shape
-    footer.
-    """
-
-    sections = _summary_sections(summary)
-    return _render_sections("DuckLake CDC demo summary", sections)
-
-
-def _summary_sections(summary: Mapping[str, Any]) -> list[list[tuple[str, str, str]]]:
-    sections: list[list[tuple[str, str, str]]] = []
-
-    sections.append(
-        [
-            (
-                "duration_s",
-                format_float(summary.get("active_duration_seconds", 0.0)),
-                "active time from first delivered batch to exit",
-            ),
-            (
-                "run_duration_s",
-                format_float(summary.get("run_duration_seconds", 0.0)),
-                "wall time of the consumer process",
-            ),
-            (
-                "changes",
-                str(summary["consumed_changes"]),
-                "rows the consumer delivered to the sink",
-            ),
-            (
-                "changes_per_s",
-                format_float(summary["consumed_changes_per_second"]),
-                "throughput across the active delivery window",
-            ),
-            (
-                "batches",
-                str(summary.get("delivered_batches", 0)),
-                "non-empty windows committed across all consumers",
-            ),
-        ]
-    )
-
-    workload = summary.get("producer_workload")
-    if isinstance(workload, Mapping):
-        workload_rows: list[tuple[str, str, str]] = []
-        profiles = workload.get("profiles")
-        if profiles:
-            workload_rows.append(
-                (
-                    "profile",
-                    format_list(profiles),
-                    "producer schedule used for commit spacing",
-                )
-            )
-        duration = workload.get("duration_seconds")
-        if duration not in (None, [], ""):
-            workload_rows.append(
-                (
-                    "producer_duration_s",
-                    format_workload_value(duration),
-                    "target producer spread; 0 means as fast as possible",
-                )
-            )
-        worker_counts = workload.get("worker_counts")
-        if worker_counts:
-            workload_rows.append(
-                (
-                    "producer_workers",
-                    format_workload_value(worker_counts),
-                    "concurrent producer connections",
-                )
-            )
-        if workload_rows:
-            sections.append(workload_rows)
-
-    fresh = summary.get("fresh_action_latency_ms")
-    if _has_observations(fresh):
-        sections.append(
-            [
-                (
-                    "latency_fresh_ms_p50",
-                    format_float(fresh["p50"]),
-                    "end-to-end CDC latency for insert + update_postimage",
-                ),
-                (
-                    "latency_fresh_ms_p95",
-                    format_float(fresh["p95"]),
-                    "  (only events whose produced_ns reflects emission time)",
-                ),
-                ("latency_fresh_ms_p99", format_float(fresh["p99"]), "  tail"),
-                (
-                    "latency_fresh_ms_max",
-                    format_float(fresh["max"]),
-                    "  worst case observed",
-                ),
-            ]
-        )
-
-    breakdown: list[tuple[str, str, str]] = []
-    producer_to_snapshot = summary.get("producer_to_snapshot_ms")
-    if _has_observations(producer_to_snapshot):
-        breakdown.append(
-            (
-                "producer_to_snapshot_ms_p95",
-                format_float(producer_to_snapshot["p95"]),
-                "producer transaction commit time (typically near zero)",
-            )
-        )
-    snapshot_to_consumer = summary.get("snapshot_to_consumer_ms")
-    if _has_observations(snapshot_to_consumer):
-        breakdown.append(
-            (
-                "snapshot_to_consumer_ms_p95",
-                format_float(snapshot_to_consumer["p95"]),
-                "consumer pipeline cost (what this extension owns)",
-            )
-        )
-    if breakdown:
-        sections.append(breakdown)
-
-    pipeline: list[tuple[str, str, str]] = []
-    listen_nonempty = summary.get("dml_listen_nonempty_ms")
-    if _has_observations(listen_nonempty):
-        pipeline.append(
-            (
-                "consumer_listen_ms_p95",
-                format_float(listen_nonempty["p95"]),
-                "extension listen/read + Python row fetch for non-empty windows",
-            )
-        )
-    snapshot_span = summary.get("dml_snapshot_span")
-    if _has_observations(snapshot_span):
-        pipeline.append(
-            (
-                "consumer_snapshot_span_p95",
-                format_float(snapshot_span["p95"]),
-                "snapshots coalesced per delivered DML batch",
-            )
-        )
-        pipeline.append(
-            (
-                "consumer_snapshot_span_max",
-                format_float(snapshot_span["max"]),
-                "largest DML snapshot window delivered",
-            )
-        )
-    listen_max_snapshots = summary.get("dml_listen_max_snapshots")
-    if _has_observations(listen_max_snapshots):
-        pipeline.append(
-            (
-                "consumer_listen_max_snapshots_p50",
-                format_float(listen_max_snapshots["p50"]),
-                "requested DML listen coalescing window",
-            )
-        )
-    build_batch = summary.get("dml_build_batch_ms")
-    if _has_observations(build_batch):
-        pipeline.append(
-            (
-                "consumer_build_ms_p95",
-                format_float(build_batch["p95"]),
-                "Python Change/DMLBatch materialization",
-            )
-        )
-    sink = summary.get("dml_sink_ms")
-    if _has_observations(sink):
-        pipeline.append(
-            (
-                "consumer_sink_ms_p95",
-                format_float(sink["p95"]),
-                "Python demo sink aggregation + latency accounting",
-            )
-        )
-    commit = summary.get("dml_commit_ms")
-    if _has_observations(commit):
-        pipeline.append(
-            (
-                "consumer_commit_ms_p95",
-                format_float(commit["p95"]),
-                "extension cdc_commit after sink success",
-            )
-        )
-    if pipeline:
-        sections.append(pipeline)
-
-    sections.append(
-        [
-            (
-                "count_errors",
-                str(summary.get("error_count", 0)),
-                "uncaught consumer/runtime errors observed before exit",
-            ),
-            (
-                "count_missing_produced_ns",
-                str(summary.get("latency_missing_produced_ns", 0)),
-                "rows delivered but excluded from latency due to missing timestamp",
-            ),
-            (
-                "count_clock_skew_clamped",
-                str(summary.get("latency_clock_skew_clamped", 0)),
-                "near-zero negative producer->snapshot samples clamped to zero",
-            ),
-            (
-                "count_stale_latency_rows",
-                str(summary.get("stale_latency_row_count", 0)),
-                "preimage/delete rows excluded from fresh latency",
-            ),
-            (
-                "count_fresh_latency_excluded",
-                str(summary.get("fresh_latency_excluded_row_count", 0)),
-                "total rows omitted from fresh latency calculations",
-            ),
-        ]
-    )
-
-    shares = summary.get("dml_action_shares")
-    workload_shape: list[tuple[str, str, str]] = [
-        (
-            "count_consumers",
-            str(summary.get("consumer_count_seen", 0)),
-            "distinct consumers represented in this summary",
-        ),
-        (
-            "count_schemas",
-            str(summary.get("schema_count_seen", 0)),
-            "distinct schemas observed in consumed rows",
-        ),
-        (
-            "count_tables",
-            str(summary.get("table_count_seen", 0)),
-            "distinct tables observed in consumed rows",
-        ),
-        (
-            "count_dml",
-            str(summary.get("dml_count_seen", 0)),
-            "logical DML actions: insert + update_postimage + delete",
-        ),
-    ]
-    if isinstance(shares, Mapping):
-        workload_shape.extend(
-            [
-                (
-                    "share_inserts",
-                    format_share(shares.get("insert", 0.0)),
-                    "insert share of logical DML actions",
-                ),
-                (
-                    "share_updates",
-                    format_share(shares.get("update", 0.0)),
-                    "update_postimage share of logical DML actions",
-                ),
-                (
-                    "share_deletes",
-                    format_share(shares.get("delete", 0.0)),
-                    "delete share of logical DML actions",
-                ),
-            ]
-        )
-    sections.append(workload_shape)
-
-    rows_per_batch = summary.get("rows_per_batch")
-    if isinstance(rows_per_batch, Mapping) and int(rows_per_batch.get("count", 0)) > 0:
-        sections.append(
-            [
-                (
-                    "rows_per_batch_p95",
-                    format_float(rows_per_batch["p95"]),
-                    "typical batch size; large -> consider cdc_dml_changes_read",
-                ),
-            ]
-        )
-
-    return sections
-
-
-def _has_observations(metrics: object) -> bool:
-    return isinstance(metrics, Mapping) and int(metrics.get("count", 0) or 0) > 0
-
-
 def _render_sections(
-    title: str, sections: list[list[tuple[str, str, str]]]
+    title: str, sections: "list[tuple[str, list[tuple[str, str, str]]]]"
 ) -> str:
-    all_rows = [row for section in sections for row in section]
+    """Render `(heading, rows)` pairs into a sectioned ASCII table.
+
+    Each section gets a heading line above its block; sections are
+    separated by horizontal rules. Column widths span every section so
+    the rules align across the whole table.
+    """
+    all_rows = [row for _, section in sections for row in section]
     if not all_rows:
         return title
 
@@ -665,24 +607,46 @@ def _render_sections(
     border = (
         f"+-{'-' * metric_width}-+-{'-' * value_width}-+-{'-' * desc_width}-+"
     )
-    lines = [
-        title,
-        border,
-        f"| {'metric'.ljust(metric_width)} | {'value'.rjust(value_width)} | "
-        f"{'description'.ljust(desc_width)} |",
-        border,
-    ]
-    for index, section in enumerate(sections):
-        if index > 0:
+    header = (
+        f"| {'metric'.ljust(metric_width)} "
+        f"| {'value'.rjust(value_width)} "
+        f"| {'description'.ljust(desc_width)} |"
+    )
+    lines = [title, ""]
+    for index, (heading, rows) in enumerate(sections):
+        if index == 0:
+            lines.append(f"  {heading}")
             lines.append(border)
-        for metric, value, description in section:
+            lines.append(header)
+            lines.append(border)
+        else:
+            lines.append(border)
+            lines.append("")
+            lines.append(f"  {heading}")
+            lines.append(border)
+        for metric, value, description in rows:
             lines.append(
-                f"| {metric.ljust(metric_width)} | "
-                f"{value.rjust(value_width)} | "
-                f"{description.ljust(desc_width)} |"
+                f"| {metric.ljust(metric_width)} "
+                f"| {value.rjust(value_width)} "
+                f"| {description.ljust(desc_width)} |"
             )
     lines.append(border)
+    lines.append("")
+    lines.append(
+        "  * producer_ms_p95 is sampled at batch start, before the producer's"
+    )
+    lines.append(
+        "    INSERT/UPDATE executes, so it includes batch-SQL time. With small"
+    )
+    lines.append(
+        "    batches it approaches pure commit + publish cost."
+    )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 
 def format_float(value: object) -> str:
@@ -697,19 +661,49 @@ def format_share(value: object) -> str:
     return str(value)
 
 
-def format_list(value: object) -> str:
-    if isinstance(value, list | tuple | set):
-        return ",".join(str(item) for item in value)
+def _fmt_pct(value: object) -> str:
+    """Format a [0..100] percent value as ``25.0%``.
+
+    Distinct from :func:`format_share`, which expects a [0..1] share.
+    """
+    if value is None or value == "" or value == [] or value == ():
+        return "-"
+    if isinstance(value, list):
+        if len(value) == 1:
+            return _fmt_pct(value[0])
+        return ", ".join(_fmt_pct(v) for v in value)
+    if isinstance(value, int | float):
+        return f"{value:.1f}%"
     return str(value)
 
 
-def format_workload_value(value: object) -> str:
-    if isinstance(value, int | float):
-        return format_float(value)
-    if isinstance(value, list):
-        if len(value) == 1:
-            return format_float(value[0])
-        return format_list(value)
+def _fmt_int(value: object) -> str:
+    if isinstance(value, bool):
+        return str(int(value))
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{int(value):,}"
+    return str(value)
+
+
+def _fmt_value(value: object) -> str:
+    """Render a workload value: scalar, list of scalars, or string."""
+    if value is None or value == "" or value == [] or value == ():
+        return "-"
+    if isinstance(value, list | tuple | set):
+        items = list(value)
+        if len(items) == 1:
+            return _fmt_value(items[0])
+        return ", ".join(_fmt_value(v) for v in items)
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        if value.is_integer():
+            return f"{int(value):,}"
+        return f"{value:.3f}"
     return str(value)
 
 
@@ -739,11 +733,31 @@ def parse_float(value: object) -> float | None:
     return None
 
 
-def scalar_or_sorted(values: list[float]) -> float | list[float]:
-    unique_values = sorted(set(values))
-    if len(unique_values) == 1:
-        return unique_values[0]
-    return unique_values
+def scalar_or_sorted_int(values: "set[int] | list[int]") -> int | list[int] | None:
+    items = sorted(set(values))
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0]
+    return items
+
+
+def scalar_or_sorted_float(values: "set[float] | list[float]") -> float | list[float] | None:
+    items = sorted(set(values))
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0]
+    return items
+
+
+def scalar_or_sorted_str(values: "set[str] | list[str]") -> str | list[str] | None:
+    items = sorted(set(values))
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0]
+    return items
 
 
 def schema_from_table_name(table_name: str) -> str | None:

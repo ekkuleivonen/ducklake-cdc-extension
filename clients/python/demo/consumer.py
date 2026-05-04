@@ -464,8 +464,14 @@ def main() -> None:
         # Construct the dashboard now (cheap) so the spawn sink can
         # attach a DemoSink to every consumer it spawns. The actual
         # alt-screen / signal-handler activation only happens when
-        # ``start()`` runs inside the ``with app:`` block below.
-        dashboard = DemoDashboard(log_path=WORK_DIR / "demo-dashboard.log")
+        # ``start()`` runs inside the ``with app:`` block below. The
+        # dashboard reads from the same ``stats`` the analytical sink
+        # writes into so the live stage-breakdown matches the final
+        # summary.
+        dashboard = DemoDashboard(
+            log_path=WORK_DIR / "demo-dashboard.log",
+            stats=stats,
+        )
 
     try:
         try:
@@ -594,12 +600,12 @@ def _report_progress(stats: DemoStats, stop_event: threading.Event) -> None:
         snapshot = stats.progress_snapshot()
         print(
             "demo consumer: progress "
-            f"{snapshot['consumed_changes']} changes, "
-            f"{snapshot['delivered_batches']} batches, "
-            f"{snapshot['table_count_seen']} table(s), "
-            f"{snapshot['consumer_count_seen']} active consumer(s), "
-            f"{snapshot['consumed_changes_per_second']:.0f} changes/s, "
-            f"{snapshot['error_count']} error(s)",
+            f"{snapshot['changes_total']} changes, "
+            f"{snapshot['batches_total']} batches, "
+            f"{snapshot['tables_seen']} table(s), "
+            f"{snapshot['consumers']} active consumer(s), "
+            f"{snapshot['changes_per_s']:.0f} changes/s, "
+            f"{snapshot['errors']} error(s)",
             flush=True,
         )
 

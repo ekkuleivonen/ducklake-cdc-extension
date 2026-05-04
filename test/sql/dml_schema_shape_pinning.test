@@ -35,24 +35,17 @@ CREATE TABLE lake.t2(id INTEGER, label VARCHAR);
 statement ok
 INSERT INTO lake.t1 VALUES (1, 'a');
 
-# Pin the consumer at the current head. We deliberately use `start_at :=
-# 'now'` instead of `SET VARIABLE x = (SELECT max(snapshot_id) FROM
-# __ducklake_metadata_lake.ducklake_snapshot)` immediately followed by
-# `start_at := getvariable('x')`. That pattern triggers a SQLite-locking
-# deadlock on Windows MinGW ("Invalid Error: Resource deadlock avoided")
-# when a sqlite_scanner read against the metadata SQLite is the
-# statement directly preceding this extension's first bootstrap CREATE
-# SCHEMA / CREATE TABLE writes against the same SQLite file. `'now'`
-# resolves the snapshot inside the extension's own connection (the same
-# connection that runs the bootstrap writes), so there is no
-# cross-connection lock-handoff for the platform's lock-conflict
-# detector to mis-classify as a deadlock. See hazard H-022.
+statement ok
+SET VARIABLE pinned_snapshot = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
 statement ok
 SELECT * FROM cdc_dml_consumer_create(
   'lake',
   'shape_pin',
   table_name := 't1',
-  start_at := 'now'
+  start_at := getvariable('pinned_snapshot')::VARCHAR
 );
 
 # ---------------------------------------------------------------------------
@@ -234,19 +227,17 @@ CREATE TABLE lake.events.audit(id INTEGER, msg VARCHAR);
 statement ok
 INSERT INTO lake.events.audit VALUES (1, 'hello');
 
-# Same SQLite-on-MinGW lock-handoff hazard as the `shape_pin` create
-# above: avoid `SET VARIABLE … = (SELECT … FROM
-# __ducklake_metadata_lake.ducklake_snapshot)` immediately before
-# `cdc_dml_consumer_create`. `'now'` resolves the head inside this
-# extension's own connection, so the bootstrap writes don't have to
-# pick up a SQLite lock just released by sqlite_scanner. See hazard
-# H-022.
+statement ok
+SET VARIABLE pre_drop = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
 statement ok
 SELECT * FROM cdc_dml_consumer_create(
   'lake',
   'audit_sink',
   table_name := 'events.audit',
-  start_at := 'now'
+  start_at := getvariable('pre_drop')::VARCHAR
 );
 
 statement ok

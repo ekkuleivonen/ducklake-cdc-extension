@@ -19,9 +19,10 @@ CDC pipeline.
 
 Layout — fixed height so frames stay still while recording::
 
-    ducklake-cdc · live                                          00:00:23
+    ducklake-cdc · live · 3 tables · 6 consumers                 00:00:23
     ──────────────────────────────────────────────────────────────────────
       2,341 ch/s    ·    p50 1.8 ms / p99 4.2 ms    ·    12,438 changes
+      stage p95  738 ms  [ producer 440 █▒ ext 318 ▏ client 2 ]
 
       events_01     ████████████████░░░░    +1,210  ~340  −38     1.8 ms
       events_02     ████████░░░░░░░░░░░░      +843  ~210  −22     2.1 ms
@@ -38,6 +39,12 @@ Bars in the per-table panel are proportional to each table's *current*
 rate (1 s window), not its lifetime share — this makes the bars animate
 visibly even at sustained throughput. New tail lines render in inverse
 for ~180 ms before settling, so the eye locks onto the motion.
+
+The ``stage p95`` row attributes end-to-end latency by who introduced
+it: producer (commit + publish), extension (cdc_dml_changes_listen +
+cdc_commit), and client (Python materialisation + sink). Segment widths
+are proportional, so a wide yellow band means the producer is the
+bottleneck on this run; a wide cyan band means the CDC pipeline is.
 """
 
 from __future__ import annotations
@@ -55,6 +62,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
 from typing import IO, Any
+
+from analytics import DemoStats
 
 from ducklake_cdc import BaseDMLSink, DMLBatch, SinkContext
 
@@ -78,6 +87,7 @@ GREEN = "\x1b[32m"
 YELLOW = "\x1b[33m"
 RED = "\x1b[31m"
 GREY = "\x1b[90m"
+CYAN = "\x1b[36m"
 HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
 ALT_SCREEN_ON = "\x1b[?1049h"
@@ -250,6 +260,25 @@ def _marker_color(marker: str) -> str:
     return RED
 
 
+def _stage_segment(label: str, ms: float, width: int, color: str) -> str:
+    """Format one segment of the stage-breakdown bar.
+
+    The segment fills exactly ``width`` visible columns. If there is
+    enough room for "label N" surrounded by spaces, the label sits
+    inline, padded with bar fill on the right; otherwise the segment
+    is just a solid colored bar so very narrow segments still convey
+    "this stage exists" without wrapping.
+    """
+    if width <= 0:
+        return ""
+    inline = f"{label} {ms:.0f}"
+    if len(inline) + 2 <= width:
+        pad = width - len(inline) - 2
+        text = " " + inline + " " + ("█" * pad)
+        return f"{color}{text}{RESET}"
+    return f"{color}{'█' * width}{RESET}"
+
+
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
@@ -281,6 +310,7 @@ class DemoDashboard:
         min_bar_width: int = MIN_BAR_WIDTH,
         max_bar_width: int = MAX_BAR_WIDTH,
         log_path: Path | None = None,
+        stats: DemoStats | None = None,
     ) -> None:
         self._stream = stream if stream is not None else sys.stdout
         self._fps = max(1, fps)
@@ -289,6 +319,11 @@ class DemoDashboard:
         self._min_bar_width = max(4, min_bar_width)
         self._max_bar_width = max(self._min_bar_width, max_bar_width)
         self._tty = bool(getattr(self._stream, "isatty", lambda: False)())
+        # Optional stats reference. When set, the stage-breakdown line shows
+        # producer/extension/client p95 attribution by reading directly from
+        # the same :class:`DemoStats` the consumer's stats sink writes into,
+        # so the live view tracks the same numbers as the final summary.
+        self._stats = stats
         # Captured stdout/stderr from C++ extension and Python landing in fd
         # 1/2 would corrupt the alt-screen layout. We dup2 both fds onto a
         # log file while the dashboard owns the screen, and write our frames
@@ -629,6 +664,12 @@ class DemoDashboard:
         lines.append(self._title_line(rule_w, elapsed_s, table_count, consumer_count))
         lines.append(self._top_rule(rule_w))
         lines.append(self._stats_line(overall_rate, p50, p99, total))
+        # Optional second stats line: producer/extension/client p95 attribution.
+        # Reads directly from the same DemoStats the analytical summary uses,
+        # so live + final reports tell the same story.
+        stage_line = self._stage_bar_line(rule_w)
+        if stage_line is not None:
+            lines.append(stage_line)
         lines.append("")
         for _, state, rate in visible:
             lines.append(self._table_line(state, rate, max_rate, bar_w))
@@ -690,6 +731,50 @@ class DemoDashboard:
         total_disp = f"{BOLD}{_fmt_count(total)}{RESET}{DIM} changes total{RESET}"
         sep = f"   {DIM}·{RESET}   "
         return "  " + rate_disp + sep + lat_disp + sep + total_disp
+
+    def _stage_bar_line(self, content_w: int) -> str | None:
+        """Render a stacked attribution bar: producer / extension / client.
+
+        Reads p95 segments from the shared :class:`DemoStats` so the bar
+        reflects the same numbers the final summary will print. Returns
+        ``None`` when no stats reference is set or no fresh latencies
+        have been recorded yet (the dashboard then just hides the row).
+        """
+        if self._stats is None:
+            return None
+        breakdown = self._stats.stage_breakdown_p95()
+        producer = max(0.0, breakdown.get("producer_p95", 0.0))
+        extension = max(0.0, breakdown.get("extension_p95", 0.0))
+        client = max(0.0, breakdown.get("client_p95", 0.0))
+        total = producer + extension + client
+        if total <= 0:
+            return None
+
+        total_label = _fmt_latency(total).strip()
+        # Visible width: "  stage p95  XX ms  […]". The 2-space margin and
+        # closing bracket aren't part of the bar, so subtract them.
+        fixed = len("  stage p95  ") + len(total_label) + len("  [") + len("]")
+        bar_w = max(20, content_w - fixed)
+        # Allocate proportional widths; final segment absorbs the rounding
+        # residual so the three add to exactly ``bar_w``.
+        p_w = round(bar_w * producer / total) if producer > 0 else 0
+        e_w = round(bar_w * extension / total) if extension > 0 else 0
+        c_w = bar_w - p_w - e_w
+        if c_w < 0:
+            # Producer + extension rounded high; trim the larger of the two.
+            if p_w >= e_w:
+                p_w += c_w
+            else:
+                e_w += c_w
+            c_w = 0
+        p_seg = _stage_segment("producer", producer, p_w, YELLOW)
+        e_seg = _stage_segment("ext", extension, e_w, CYAN)
+        c_seg = _stage_segment("client", client, c_w, GREEN)
+        return (
+            f"  {DIM}stage p95{RESET}  "
+            f"{BOLD}{total_label}{RESET}  "
+            f"{DIM}[{RESET}{p_seg}{e_seg}{c_seg}{DIM}]{RESET}"
+        )
 
     def _table_line(
         self, state: _TableState, rate: float, max_rate: float, bar_w: int

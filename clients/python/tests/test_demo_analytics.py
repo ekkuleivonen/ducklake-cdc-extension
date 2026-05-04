@@ -31,38 +31,31 @@ def test_metric_summary_handles_empty_values() -> None:
     }
 
 
-def test_demo_stats_summary_is_json_ready() -> None:
+def test_demo_stats_summary_is_section_keyed() -> None:
     stats = DemoStats(started_ns=0)
     stats.record_consumer("consumer_a")
     stats.record_window(has_changes=True, observed_ns=1_000_000_000)
     stats.record_window(has_changes=True, observed_ns=1_500_000_000)
     stats.record_changes(2, table_name="main.orders")
     stats.record_error(ValueError("boom"))
+    workload_values = {
+        "benchmark_profile": "flat",
+        "benchmark_duration_s": 0.0,
+        "benchmark_schemas": 1,
+        "benchmark_tables": 2,
+        "benchmark_workers": 4,
+        "benchmark_update_percent": 25.0,
+        "benchmark_delete_percent": 10.0,
+        "benchmark_batch_min": 50,
+        "benchmark_batch_max": 250,
+    }
     stats.record_change_observation(
-        change_type="insert",
-        table_name="main.orders",
-        values={
-            "benchmark_profile": "flat",
-            "benchmark_duration_s": 0.0,
-            "benchmark_schemas": 1,
-            "benchmark_tables": 2,
-            "benchmark_workers": 4,
-            "benchmark_update_percent": 25.0,
-            "benchmark_delete_percent": 10.0,
-        },
+        change_type="insert", table_name="main.orders", values=workload_values
     )
     stats.record_change_observation(
         change_type="update_postimage",
         table_name="main.orders",
-        values={
-            "benchmark_profile": "flat",
-            "benchmark_duration_s": 0.0,
-            "benchmark_schemas": 1,
-            "benchmark_tables": 2,
-            "benchmark_workers": 4,
-            "benchmark_update_percent": 25.0,
-            "benchmark_delete_percent": 10.0,
-        },
+        values=workload_values,
     )
     stats.record_commit()
     stats.record_dml_listen(elapsed_ms=10.0, row_count=2, max_snapshots=8)
@@ -74,50 +67,72 @@ def test_demo_stats_summary_is_json_ready() -> None:
 
     summary = stats.summary()
 
-    assert summary["actual_duration_seconds"] == 3.0
-    assert summary["active_duration_seconds"] == 2.0
-    assert summary["run_duration_seconds"] == 3.0
-    assert summary["consumed_changes"] == 2
-    assert summary["consumed_changes_per_second"] == 1.0
-    assert summary["delivered_batches"] == 2
-    assert summary["rows_per_batch"]["p95"] == 2.0
-    assert summary["changes_by_table"] == {"main.orders": 2}
-    assert summary["consumer_count_seen"] == 1
-    assert summary["schema_count_seen"] == 1
-    assert summary["table_count_seen"] == 1
-    assert summary["dml_count_seen"] == 2
-    assert summary["dml_change_type_counts"] == {"insert": 1, "update_postimage": 1}
-    assert summary["dml_action_shares"] == {
-        "insert": 0.5,
-        "update": 0.5,
-        "delete": 0.0,
+    # The top-level keys ARE the rendered sections.
+    assert set(summary) == {
+        "workload",
+        "throughput",
+        "e2e_latency_ms",
+        "stage_latency_ms",
+        "pipeline_breakdown",
+        "post_delivery_ms",
+        "action_mix",
+        "health",
     }
-    assert summary["producer_workload"] == {
-        "profiles": ["flat"],
-        "duration_seconds": 0.0,
-        "schema_counts": [1],
-        "table_counts": [2],
-        "worker_counts": [4],
-        "update_percents": [25.0],
-        "delete_percents": [10.0],
+
+    assert summary["workload"] == {
+        "producer_profile": "flat",
+        "producer_workers": 4,
+        "producer_duration_s": 0.0,
+        "producer_schemas": 1,
+        "producer_tables": 2,
+        "producer_update_pct": 25.0,
+        "producer_delete_pct": 10.0,
+        "producer_batch_min": 50,
+        "producer_batch_max": 250,
+        "consumers": 1,
+        "tables_seen": 1,
     }
-    assert summary["error_count"] == 1
-    assert summary["error_type_counts"] == {"ValueError": 1}
-    assert summary["latency_missing_produced_ns"] == 0
-    assert summary["dml_listen_nonempty_ms"]["p95"] == 10.0
-    assert summary["dml_listen_empty_ms"]["p95"] == 1.0
-    assert summary["dml_build_batch_ms"]["p95"] == 2.0
-    assert summary["dml_sink_ms"]["p95"] == 3.0
-    assert summary["dml_commit_ms"]["p95"] == 4.0
-    assert summary["dml_snapshot_span"]["p95"] == 8.0
-    assert summary["dml_listen_max_snapshots"]["p50"] == 6.0
-    assert summary["fresh_latency_excluded_row_count"] == 0
-    assert summary["stale_latency_row_count"] == 0
-    assert stats.progress_snapshot()["consumed_changes"] == 2
-    assert stats.progress_snapshot()["consumer_count_seen"] == 1
+
+    throughput = summary["throughput"]
+    assert throughput["duration_active_s"] == 2.0
+    assert throughput["duration_run_s"] == 3.0
+    assert throughput["changes_total"] == 2
+    assert throughput["changes_per_s"] == 1.0
+    assert throughput["batches_total"] == 2
+    assert throughput["rows_per_batch_p95"] == 2.0
+
+    pipeline = summary["pipeline_breakdown"]
+    assert pipeline["extension_listen_ms_p95"] == 10.0
+    assert pipeline["python_build_ms_p95"] == 2.0
+    assert pipeline["snapshots_per_batch_p95"] == 8.0
+    assert pipeline["snapshots_per_batch_max"] == 8.0
+    assert pipeline["snapshots_per_listen_p50"] == 6.0
+
+    post = summary["post_delivery_ms"]
+    assert post["sink_p95"] == 3.0
+    assert post["extension_commit_p95"] == 4.0
+
+    assert summary["action_mix"] == {
+        "inserts": 0.5,
+        "updates": 0.5,
+        "deletes": 0.0,
+    }
+
+    health = summary["health"]
+    assert health["errors"] == 1
+    assert health["rows_no_produced_ns"] == 0
+    assert health["rows_clock_skew_clamped"] == 0
+    assert health["rows_excluded_from_e2e"] == 0
+
+    progress = stats.progress_snapshot()
+    assert progress["changes_total"] == 2
+    assert progress["consumers"] == 1
+    assert progress["tables_seen"] == 1
+    assert progress["batches_total"] == 2
+    assert progress["errors"] == 1
 
 
-def test_demo_stats_change_latency_records_fresh_and_breakdown() -> None:
+def test_demo_stats_change_latency_records_fresh_and_stage_split() -> None:
     from datetime import UTC, datetime
 
     stats = DemoStats(started_ns=0)
@@ -146,14 +161,11 @@ def test_demo_stats_change_latency_records_fresh_and_breakdown() -> None:
 
     summary = stats.summary()
 
-    fresh = summary["fresh_action_latency_ms"]
-    assert fresh["count"] == 1
-    assert fresh["max"] == pytest.approx(500.0)
-    assert summary["producer_to_snapshot_ms"]["count"] == 1
-    assert summary["snapshot_to_consumer_ms"]["count"] == 1
-    assert summary["stale_latency_row_count"] == 1
-    assert summary["latency_missing_produced_ns"] == 1
-    assert summary["fresh_latency_excluded_row_count"] == 2
+    assert summary["e2e_latency_ms"]["max"] == pytest.approx(500.0)
+    assert summary["stage_latency_ms"]["producer_p95"] == pytest.approx(5.0)
+    assert summary["stage_latency_ms"]["pipeline_p95"] == pytest.approx(50.0)
+    assert summary["health"]["rows_no_produced_ns"] == 1
+    assert summary["health"]["rows_excluded_from_e2e"] == 2  # 1 stale + 1 missing
 
 
 def test_demo_stats_clamps_near_zero_negative_producer_to_snapshot() -> None:
@@ -175,22 +187,28 @@ def test_demo_stats_clamps_near_zero_negative_producer_to_snapshot() -> None:
 
     summary = stats.summary()
 
-    assert summary["latency_clock_skew_clamped"] == 1
-    assert summary["producer_to_snapshot_ms"]["count"] == 1
-    assert summary["producer_to_snapshot_ms"]["max"] == 0.0
+    assert summary["health"]["rows_clock_skew_clamped"] == 1
+    assert summary["stage_latency_ms"]["producer_p95"] == 0.0
 
 
-def test_summary_table_renders_key_metrics() -> None:
+def test_summary_table_renders_key_sections() -> None:
+    from datetime import UTC, datetime
+
     stats = DemoStats(started_ns=0, finished_ns=2_000_000_000)
     stats.record_consumer("consumer_a")
     stats.record_changes(4)
     stats.record_window(has_changes=True, observed_ns=1_000_000_000)
+    snapshot_time = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+    snapshot_epoch_ns = int(snapshot_time.timestamp() * 1_000_000_000)
+    # Fully populated row so e2e + stage_latency + pipeline + post-delivery
+    # sections all have non-zero data and render in the table.
     stats.record_change_latency(
         change_type="insert",
         produced_ns=1_000_000_000,
-        produced_epoch_ns=None,
-        snapshot_time=None,
+        produced_epoch_ns=snapshot_epoch_ns - 5_000_000,
+        snapshot_time=snapshot_time,
         consumed_ns=1_100_000_000,
+        consumed_epoch_ns=snapshot_epoch_ns + 50_000_000,
     )
     stats.record_change_observation(
         change_type="insert",
@@ -203,6 +221,8 @@ def test_summary_table_renders_key_metrics() -> None:
             "benchmark_workers": 4,
             "benchmark_update_percent": 0.0,
             "benchmark_delete_percent": 0.0,
+            "benchmark_batch_min": 1,
+            "benchmark_batch_max": 10,
         },
     )
     stats.record_dml_listen(elapsed_ms=10.0, row_count=4, max_snapshots=64)
@@ -210,52 +230,60 @@ def test_summary_table_renders_key_metrics() -> None:
     stats.record_dml_sink(elapsed_ms=3.0)
     stats.record_dml_commit_duration(elapsed_ms=4.0)
 
-    table = summary_table({"type": "summary", **stats.summary()})
+    table = summary_table(stats.summary())
 
+    # Title and headings.
     assert "DuckLake CDC demo summary" in table
-    assert "| metric " in table
-    assert "| description " in table
-    assert "| duration_s " in table
-    assert "| run_duration_s " in table
-    assert "| changes " in table
-    assert "| changes_per_s " in table
-    assert "| batches " in table
-    assert "| profile " in table
-    assert "| producer_duration_s " in table
+    assert "Workload" in table
+    assert "Throughput" in table
+    assert "End-to-end latency" in table
+    assert "Latency by stage" in table
+    assert "Pipeline breakdown" in table
+    assert "Post-delivery overhead" in table
+    assert "Action mix" in table
+    assert "Health" in table
+
+    # Workload rows.
+    assert "| producer_profile " in table
     assert "| producer_workers " in table
-    assert "| latency_fresh_ms_p50 " in table
-    assert "| latency_fresh_ms_p95 " in table
-    assert "| consumer_listen_ms_p95 " in table
-    assert "| consumer_snapshot_span_p95 " in table
-    assert "| consumer_snapshot_span_max " in table
-    assert "| consumer_listen_max_snapshots_p50 " in table
-    assert "| consumer_build_ms_p95 " in table
-    assert "| consumer_sink_ms_p95 " in table
-    assert "| consumer_commit_ms_p95 " in table
-    assert "| count_errors " in table
-    assert "| count_missing_produced_ns " in table
-    assert "| count_stale_latency_rows " in table
-    assert "| count_fresh_latency_excluded " in table
-    assert "| count_consumers " in table
-    assert "| count_schemas " in table
-    assert "| count_tables " in table
-    assert "| count_dml " in table
+    assert "| producer_batch_min " in table
+    assert "| producer_batch_max " in table
+    assert "| consumers " in table
+    assert "| tables_seen " in table
+
+    # Throughput rows.
+    assert "| duration_active_s " in table
+    assert "| duration_run_s " in table
+    assert "| changes_total " in table
+    assert "| changes_per_s " in table
+    assert "| batches_total " in table
+    assert "| rows_per_batch_p95 " in table
+
+    # Stage breakdown rows.
+    assert "| e2e_p50_ms " in table
+    assert "| producer_ms_p95 " in table
+    assert "| pipeline_ms_p95 " in table
+    assert "| extension_listen_ms_p95 " in table
+    assert "| python_build_ms_p95 " in table
+    assert "| sink_ms_p95 " in table
+    assert "| extension_commit_ms_p95 " in table
+    assert "| snapshots_per_batch_p95 " in table
+
+    # Action mix and health.
     assert "| share_inserts " in table
     assert "| share_updates " in table
     assert "| share_deletes " in table
-    assert "| rows_per_batch_p95 " in table
+    assert "| errors " in table
+    assert "| rows_no_produced_ns " in table
+    assert "| rows_excluded_from_e2e " in table
 
-    # Things removed from the new knob-free demo's surface should not
-    # leak back into the rendered table.
-    assert "ddl_events" not in table
-    assert "snapshot_events" not in table
-    assert "catalog_queries" not in table
-    assert "lake_tables_calls" not in table
-    assert "iterations" not in table
-    assert "empty_window_ratio" not in table
-    assert "operation_ms" not in table
-    assert "cdc_dml_changes_listen_ms_" not in table
-    assert "cdc_window_ms_" not in table
-    assert "cdc_commit_ms_" not in table
-    assert "count_ddl" not in table
-    assert "count_dropped_rows" not in table
+    # Old names are gone.
+    assert "fresh_action_latency" not in table
+    assert "producer_to_snapshot_ms" not in table
+    assert "snapshot_to_consumer_ms" not in table
+    assert "consumer_listen_ms_p95" not in table
+    assert "consumer_build_ms_p95" not in table
+    assert "consumer_sink_ms_p95" not in table
+    assert "count_consumers" not in table
+    assert "count_tables" not in table
+    assert "count_dml" not in table

@@ -81,10 +81,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
                                                                           duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcConsumerStatsData>();
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
 	                                MetadataTable(data.catalog_name, "ducklake_snapshot"));
@@ -237,10 +237,10 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcAuditEventsInit(duckdb::
                                                                         duckdb::TableFunctionInitInput &input) {
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcAuditEventsData>();
-	BootstrapConsumerStateOrThrow(context, data.catalog_name);
-
+	// Single-connection chain — see CreateConsumer for the H-022 rationale.
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto audit = StateTable(conn, data.catalog_name, AUDIT_TABLE);
 	std::ostringstream where;
 	where << " WHERE epoch(ts::TIMESTAMP WITH TIME ZONE) >= epoch(now()) - " << data.since_seconds;
@@ -369,8 +369,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDoctorInit(duckdb::Clien
 		return std::move(result);
 	}
 	try {
-		CheckCatalogOrThrow(context, data.catalog_name);
-		BootstrapConsumerStateOrThrow(context, data.catalog_name);
+		CheckCatalogOrThrow(conn, data.catalog_name);
+		BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	} catch (std::exception &ex) {
 		AddDoctorRow(*result, "error", "CDC_INCOMPATIBLE_CATALOG", duckdb::Value(), ex.what(), duckdb::Value());
 		return std::move(result);

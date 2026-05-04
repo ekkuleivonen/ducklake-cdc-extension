@@ -203,11 +203,10 @@ void EmitCompatNoticesIfAny(duckdb::DatabaseInstance &db) {
 	}
 }
 
-void CheckCatalogOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
+void CheckCatalogOrThrow(duckdb::Connection &conn, const std::string &catalog_name) {
 	std::string observed_version;
 	try {
 		std::lock_guard<std::mutex> lock(CompatProbeMutex());
-		duckdb::Connection conn(*context.db);
 		observed_version = ReadCatalogVersion(conn, catalog_name);
 	} catch (...) {
 		// A missing metadata schema means this is not a DuckLake catalog. Let
@@ -218,6 +217,18 @@ void CheckCatalogOrThrow(duckdb::ClientContext &context, const std::string &cata
 	if (!observed_version.empty() && !IsSupported(observed_version)) {
 		throw duckdb::CatalogException(BuildIncompatibleMessage(catalog_name, observed_version));
 	}
+}
+
+void CheckCatalogOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
+	// Legacy entry point: opens its own connection. Internal cdc_*
+	// callers prefer the `Connection&` overload so the version probe,
+	// the bootstrap CREATE writes, and the subsequent main work all run
+	// on a single DuckDB connection (and therefore a single SQLite file
+	// handle when the metadata catalog is SQLite-backed). See H-022 in
+	// `docs/hazard-log.md` for the Windows MinGW lock-handoff that this
+	// addresses.
+	duckdb::Connection conn(*context.db);
+	CheckCatalogOrThrow(conn, catalog_name);
 }
 
 } // namespace duckdb_cdc

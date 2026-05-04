@@ -1477,9 +1477,9 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcRangeDdlBind(duckdb::ClientContext &
 	result->schema_ids = DdlInt64ListNamedParameter(input, "schema_ids");
 	result->table_names = DdlStringListNamedParameter(input, "table_names");
 	result->table_ids = DdlInt64ListNamedParameter(input, "table_ids");
-	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, result->catalog_name);
 	result->to_snapshot = RangeDdlToSnapshotParameter(conn, input, result->catalog_name, 2);
 	ValidateDdlRangeBounds(conn, result->catalog_name, result->from_snapshot, result->to_snapshot);
 
@@ -1517,9 +1517,9 @@ duckdb::unique_ptr<duckdb::FunctionData> DdlTicksQueryBind(duckdb::ClientContext
 	result->schema_ids = DdlInt64ListNamedParameter(input, "schema_ids");
 	result->table_names = DdlStringListNamedParameter(input, "table_names");
 	result->table_ids = DdlInt64ListNamedParameter(input, "table_ids");
-	CheckCatalogOrThrow(context, result->catalog_name);
 	duckdb::Connection conn(*context.db);
 	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, result->catalog_name);
 	result->to_snapshot = input.inputs.size() > 2 && !input.inputs[2].IsNull()
 	                          ? input.inputs[2].GetValue<int64_t>()
 	                          : CurrentSnapshot(conn, result->catalog_name);

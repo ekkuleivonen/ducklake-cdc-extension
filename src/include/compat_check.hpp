@@ -82,6 +82,15 @@ void EmitCompatNoticesIfAny(duckdb::DatabaseInstance &db);
 //! Authoritative call-time gate for cdc_* functions that touch a DuckLake
 //! catalog. Unlike the LOAD-time notice path, this throws a structured
 //! `CDC_INCOMPATIBLE_CATALOG` exception before any catalog write.
+//!
+//! The `Connection&` overload runs the version probe on the caller-provided
+//! connection. Prefer it over the `ClientContext&` overload in any cdc_*
+//! function that will go on to do its own SQLite work on a single
+//! connection — chaining the version probe + bootstrap + main work onto
+//! one DuckDB connection avoids the SQLite file-lock handoff that
+//! Windows MinGW `LockFileEx` flags as `ERROR_POSSIBLE_DEADLOCK` (see
+//! H-022 in `docs/hazard-log.md`).
+void CheckCatalogOrThrow(duckdb::Connection &conn, const std::string &catalog_name);
 void CheckCatalogOrThrow(duckdb::ClientContext &context, const std::string &catalog_name);
 
 } // namespace duckdb_cdc

@@ -65,12 +65,19 @@ We are a **poor fit** for:
 
 The Python demo summary separates responsibility:
 
-- `latency_fresh_ms_*` is the headline latency for fresh insert and
-  update-postimage events.
-- `producer_to_snapshot_ms_*` belongs mostly to producer/catalog contention.
-- `snapshot_to_consumer_ms_*` is the consumer/extension-owned slice.
-- `latency_stale_rows_ms_*` covers update preimages and deletes, where the row
-  timestamp represents the previous row version rather than the current action.
+- `e2e_p{50,95,99}_ms` (in `e2e_latency_ms`) is the headline latency for
+  fresh insert and update-postimage events: producer emit ➝ delivered to sink.
+- `stage_latency_ms.producer_p95` is the producer-side cost (commit + publish)
+  and `stage_latency_ms.pipeline_p95` is the consumer/extension-owned slice;
+  the two roughly sum to `e2e_p95_ms`.
+- `pipeline_breakdown.extension_listen_ms_p95` /
+  `pipeline_breakdown.python_build_ms_p95` decompose the pipeline by who
+  introduced the time (extension SQL vs. Python materialization).
+- `post_delivery_ms.{sink_p95, extension_commit_p95}` track the user sink
+  callback and `cdc_commit` after sink success — both run *after* the
+  delivery point, so they affect throughput, not e2e latency.
+- `health.rows_excluded_from_e2e` counts preimage and delete rows whose
+  timestamp represents the previous row version, not the current action.
 
 Recent local runs show the single-table path is no longer dominated by the old
 duplicate window resolution. The next performance questions are multi-table

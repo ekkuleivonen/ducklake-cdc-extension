@@ -259,7 +259,9 @@ def create_layout(lake: DuckLake, args: Args) -> list[TableRef]:
                     benchmark_tables INTEGER,
                     benchmark_workers INTEGER,
                     benchmark_update_percent DOUBLE,
-                    benchmark_delete_percent DOUBLE
+                    benchmark_delete_percent DOUBLE,
+                    benchmark_batch_min INTEGER,
+                    benchmark_batch_max INTEGER
                 )
                 """
             )
@@ -548,7 +550,8 @@ def apply_insert_batch(lake: SqlRunner, actions: list[Action], args: Args) -> No
             f"$benchmark_profile_{idx}, $benchmark_duration_s_{idx}, "
             f"$benchmark_schemas_{idx}, $benchmark_tables_{idx}, "
             f"$benchmark_workers_{idx}, $benchmark_update_percent_{idx}, "
-            f"$benchmark_delete_percent_{idx}"
+            f"$benchmark_delete_percent_{idx}, "
+            f"$benchmark_batch_min_{idx}, $benchmark_batch_max_{idx}"
             ")"
         )
     lake.sql(
@@ -587,7 +590,9 @@ def apply_contiguous_insert_batch(
             $benchmark_tables,
             $benchmark_workers,
             $benchmark_update_percent,
-            $benchmark_delete_percent
+            $benchmark_delete_percent,
+            $benchmark_batch_min,
+            $benchmark_batch_max
         FROM range($first_row_id, $end_row_id) AS generated(row_id)
         """,
         payload_prefix=payload_prefix,
@@ -603,6 +608,8 @@ def apply_contiguous_insert_batch(
         benchmark_workers=args.workers,
         benchmark_update_percent=args.update,
         benchmark_delete_percent=args.delete,
+        benchmark_batch_min=args.batch_min,
+        benchmark_batch_max=args.batch_max,
     ).list()
 
 
@@ -633,7 +640,8 @@ def apply_update_batch(lake: SqlRunner, actions: list[Action], args: Args) -> No
             f"$benchmark_profile_{idx}, $benchmark_duration_s_{idx}, "
             f"$benchmark_schemas_{idx}, $benchmark_tables_{idx}, "
             f"$benchmark_workers_{idx}, $benchmark_update_percent_{idx}, "
-            f"$benchmark_delete_percent_{idx}"
+            f"$benchmark_delete_percent_{idx}, "
+            f"$benchmark_batch_min_{idx}, $benchmark_batch_max_{idx}"
             ")"
         )
     lake.sql(
@@ -651,7 +659,9 @@ def apply_update_batch(lake: SqlRunner, actions: list[Action], args: Args) -> No
             benchmark_tables = source.benchmark_tables,
             benchmark_workers = source.benchmark_workers,
             benchmark_update_percent = source.benchmark_update_percent,
-            benchmark_delete_percent = source.benchmark_delete_percent
+            benchmark_delete_percent = source.benchmark_delete_percent,
+            benchmark_batch_min = source.benchmark_batch_min,
+            benchmark_batch_max = source.benchmark_batch_max
         FROM (
             VALUES {", ".join(rows)}
         ) AS source(
@@ -666,7 +676,9 @@ def apply_update_batch(lake: SqlRunner, actions: list[Action], args: Args) -> No
             benchmark_tables,
             benchmark_workers,
             benchmark_update_percent,
-            benchmark_delete_percent
+            benchmark_delete_percent,
+            benchmark_batch_min,
+            benchmark_batch_max
         )
         WHERE target.id = source.id
         """,
@@ -705,6 +717,8 @@ def _action_params(
         f"benchmark_workers_{idx}": args.workers,
         f"benchmark_update_percent_{idx}": args.update,
         f"benchmark_delete_percent_{idx}": args.delete,
+        f"benchmark_batch_min_{idx}": args.batch_min,
+        f"benchmark_batch_max_{idx}": args.batch_max,
     }
 
 
@@ -741,7 +755,9 @@ def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
                 $benchmark_tables,
                 $benchmark_workers,
                 $benchmark_update_percent,
-                $benchmark_delete_percent
+                $benchmark_delete_percent,
+                $benchmark_batch_min,
+                $benchmark_batch_max
             )
             """,
             id=action.row_id,
@@ -756,6 +772,8 @@ def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
             benchmark_workers=args.workers,
             benchmark_update_percent=args.update,
             benchmark_delete_percent=args.delete,
+            benchmark_batch_min=args.batch_min,
+            benchmark_batch_max=args.batch_max,
         ).list()
     elif action.kind == "update":
         produced_ns = time.monotonic_ns()
@@ -775,7 +793,9 @@ def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
                 benchmark_tables = $benchmark_tables,
                 benchmark_workers = $benchmark_workers,
                 benchmark_update_percent = $benchmark_update_percent,
-                benchmark_delete_percent = $benchmark_delete_percent
+                benchmark_delete_percent = $benchmark_delete_percent,
+                benchmark_batch_min = $benchmark_batch_min,
+                benchmark_batch_max = $benchmark_batch_max
             WHERE id = $id
             """,
             id=action.row_id,
@@ -790,6 +810,8 @@ def apply_action(lake: SqlRunner, action: Action, args: Args) -> None:
             benchmark_workers=args.workers,
             benchmark_update_percent=args.update,
             benchmark_delete_percent=args.delete,
+            benchmark_batch_min=args.batch_min,
+            benchmark_batch_max=args.batch_max,
         ).list()
     elif action.kind == "delete":
         lake.sql(f"DELETE FROM {action.table.qualified} WHERE id = $id", id=action.row_id).list()

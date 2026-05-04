@@ -606,9 +606,10 @@ void InstallPostgresSnapshotNotifyBestEffort(duckdb::Connection &conn, const std
 	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()'; END IF; END $$");
 }
 
-void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
-	CheckCatalogOrThrow(context, catalog_name);
-	duckdb::Connection conn(*context.db);
+void BootstrapConsumerStateOrThrow(duckdb::Connection &conn, const std::string &catalog_name) {
+	// CheckCatalogOrThrow is the caller's responsibility on this overload:
+	// every cdc_* function that follows the "open one conn, probe, bootstrap,
+	// then do work" pattern wants the version probe to share that conn too.
 	auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
 	                                QuoteIdentifier(STATE_SCHEMA));
 	const bool use_state_schema = create_schema && !create_schema->HasError();
@@ -621,6 +622,17 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
 	}
 	InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
+}
+
+void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
+	// Legacy entry point: opens its own connection for the CREATE writes.
+	// Internal cdc_* callers should use the `Connection&` overload to keep
+	// the version probe, bootstrap, and main work on one DuckDB connection
+	// — see H-022 in `docs/hazard-log.md` for the Windows MinGW lock-handoff
+	// that the cross-connection variant triggers.
+	CheckCatalogOrThrow(context, catalog_name);
+	duckdb::Connection conn(*context.db);
+	BootstrapConsumerStateOrThrow(conn, catalog_name);
 }
 
 //===--------------------------------------------------------------------===//

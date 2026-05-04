@@ -4,7 +4,7 @@ A DuckDB extension that adds change-data-capture cursors on top of
 [DuckLake](https://ducklake.select).
 
 
-![Consumer](./docs/assets/consumer.png)
+![Demo](./docs/assets/demo.gif)
 
 > **Status: greenfield CDC contract.** The extension exposes separate DDL and
 > DML consumer streams, explicit read/listen/query modes, durable cursor state,
