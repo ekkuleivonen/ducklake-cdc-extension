@@ -17,6 +17,12 @@ Usage::
     # If attaching to an already-running producer, use:
     python demo/consumer.py --no-reset
 
+When stdout is a TTY the consumer renders a live dashboard (fixed-height
+per-table panel + scrolling tail, designed for screen-recorded GIFs) and
+restores the terminal on exit before printing the analytical summary
+table. When stdout is piped or redirected, the dashboard auto-degrades to
+no-op rendering so logs and CI runs are unaffected.
+
 The consumer starts one DDL watcher, then hot-adds a DML consumer whenever
 the producer creates a table. Each DML consumer starts at the table's DDL
 snapshot, so what gets measured is live writes for every producer-created
@@ -37,6 +43,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -49,10 +56,12 @@ from common import (
     CATALOG_ENV,
     DEFAULT_POSTGRES_CATALOG,
     STORAGE_ENV,
+    WORK_DIR,
     open_demo_lake,
     reset_demo_state,
     retry_on_lock,
 )
+from demosink import DemoDashboard, DemoSink
 
 from ducklake import DuckLakeError
 from ducklake_cdc import (
@@ -211,11 +220,15 @@ class _TableSpawnSink(BaseDDLSink):
         args: argparse.Namespace,
         stats: DemoStats,
         consumer_lakes: list[Any],
+        dashboard: DemoDashboard | None = None,
+        quiet: bool = False,
     ) -> None:
         self._app = app
         self._args = args
         self._stats = stats
         self._consumer_lakes = consumer_lakes
+        self._dashboard = dashboard
+        self._quiet = quiet
         self._active_consumers: set[str] = set()
         self._pending_consumers: set[str] = set()
         self._seen_lock = threading.Lock()
@@ -335,7 +348,7 @@ class _TableSpawnSink(BaseDDLSink):
             try:
                 self._add_table_consumer(request)
             except DuckLakeError as exc:
-                if attempt == 1 or attempt % 10 == 0:
+                if not self._quiet and (attempt == 1 or attempt % 10 == 0):
                     print(
                         "demo consumer: waiting to start DML consumer for "
                         f"{label} (attempt {attempt}): {_exception_summary(exc)}",
@@ -346,11 +359,12 @@ class _TableSpawnSink(BaseDDLSink):
             except Exception as exc:
                 self._release_reservation(consumer_name)
                 self._stats.record_error(exc)
-                print(
-                    "demo consumer: failed to start DML consumer for "
-                    f"{label}: {_exception_summary(exc)}",
-                    flush=True,
-                )
+                if not self._quiet:
+                    print(
+                        "demo consumer: failed to start DML consumer for "
+                        f"{label}: {_exception_summary(exc)}",
+                        flush=True,
+                    )
                 return
 
             self._mark_active(consumer_name)
@@ -358,11 +372,12 @@ class _TableSpawnSink(BaseDDLSink):
 
         self._release_reservation(consumer_name)
         self._stats.record_error("TableSpawnTimeout")
-        print(
-            "demo consumer: timed out starting DML consumer for "
-            f"{label} after {TABLE_SPAWN_MAX_ATTEMPTS} attempts",
-            flush=True,
-        )
+        if not self._quiet:
+            print(
+                "demo consumer: timed out starting DML consumer for "
+                f"{label} after {TABLE_SPAWN_MAX_ATTEMPTS} attempts",
+                flush=True,
+            )
 
     def _add_table_consumer(self, request: _SpawnRequest) -> None:
         lake = _open_lake(self._args)
@@ -373,12 +388,15 @@ class _TableSpawnSink(BaseDDLSink):
                 if request.table_id is not None
                 else {"table": _require_table_name(request.table_name)}
             )
+            sinks: list[Any] = [_StatsSink(self._stats)]
+            if self._dashboard is not None:
+                sinks.append(DemoSink(self._dashboard))
             consumer = _TimedDMLConsumer(
                 lake,
                 _consumer_name_for_request(request),
                 start_at=request.start_at,
                 on_exists="error",
-                sinks=[_StatsSink(self._stats)],
+                sinks=sinks,
                 retry=retry_on_lock,
                 stats=self._stats,
                 fixed_max_snapshots=(
@@ -394,11 +412,12 @@ class _TableSpawnSink(BaseDDLSink):
             raise
 
         self._consumer_lakes.append(lake)
-        print(
-            "demo consumer: streaming "
-            f"{_spawn_label(request)} from snapshot {request.start_at}",
-            flush=True,
-        )
+        if not self._quiet:
+            print(
+                "demo consumer: streaming "
+                f"{_spawn_label(request)} from snapshot {request.start_at}",
+                flush=True,
+            )
 
     def _try_reserve(self, consumer_name: str) -> bool:
         with self._seen_lock:
@@ -422,6 +441,12 @@ class _TableSpawnSink(BaseDDLSink):
 
 def main() -> None:
     args = parse_args()
+    # The dashboard owns the screen when stdout is a TTY, so any
+    # `print()` chatter while it's up would fight the layout. Run quiet
+    # in that case; non-TTY callers (CI, pipes) keep the old chatty
+    # behaviour.
+    use_dashboard = sys.stdout.isatty()
+    quiet = use_dashboard
     if not args.no_reset:
         reset_demo_state(
             catalog=args.catalog,
@@ -434,15 +459,23 @@ def main() -> None:
     app: CDCApp | None = None
     progress_stop = threading.Event()
     progress_thread: threading.Thread | None = None
+    dashboard: DemoDashboard | None = None
+    if use_dashboard:
+        # Construct the dashboard now (cheap) so the spawn sink can
+        # attach a DemoSink to every consumer it spawns. The actual
+        # alt-screen / signal-handler activation only happens when
+        # ``start()`` runs inside the ``with app:`` block below.
+        dashboard = DemoDashboard(log_path=WORK_DIR / "demo-dashboard.log")
 
     try:
         try:
             ddl_lake.load_extension(path=_local_extension_path())
-            print(
-                "demo consumer: watching for producer-created tables, "
-                "press Ctrl+C to stop and see the summary",
-                flush=True,
-            )
+            if not quiet:
+                print(
+                    "demo consumer: watching for producer-created tables, "
+                    "press Ctrl+C to stop and see the summary",
+                    flush=True,
+                )
 
             # ``listen_timeout_ms=200`` keeps the per-listen GIL window
             # short enough that the main thread can always service signal
@@ -455,18 +488,21 @@ def main() -> None:
                 max_snapshots=args.max_snapshots,
                 shutdown_timeout=2.0,
             )
-            progress_thread = threading.Thread(
-                target=_report_progress,
-                args=(stats, progress_stop),
-                name="demo-consumer-progress",
-                daemon=True,
-            )
-            progress_thread.start()
+            if not quiet:
+                progress_thread = threading.Thread(
+                    target=_report_progress,
+                    args=(stats, progress_stop),
+                    name="demo-consumer-progress",
+                    daemon=True,
+                )
+                progress_thread.start()
             spawner = _TableSpawnSink(
                 app=app,
                 args=args,
                 stats=stats,
                 consumer_lakes=consumer_lakes,
+                dashboard=dashboard,
+                quiet=quiet,
             )
             if args.no_reset:
                 existing = [
@@ -478,7 +514,7 @@ def main() -> None:
                         table_name=table_name,
                         start_at="now",
                     )
-                if existing:
+                if existing and not quiet:
                     print(
                         "demo consumer: attached to "
                         f"{len(existing)} existing table(s) at start_at='now'",
@@ -496,16 +532,28 @@ def main() -> None:
             )
 
             with app:
+                # ``CDCApp.__enter__`` installs SIGINT/SIGTERM handlers
+                # that just set a stop flag and let ``run()`` drain. We
+                # start the dashboard *after* that so its signal handler
+                # chains on top: Ctrl+C now restores the user's terminal
+                # immediately, then forwards to CDCApp's flag-setter so
+                # the existing drain still happens.
+                if dashboard is not None:
+                    dashboard.start()
                 try:
-                    app.run(infinite=True)
-                except KeyboardInterrupt:
-                    pass
-                # Harvest worker-thread errors that CDCApp swallowed so
-                # crashes show up in the summary instead of disappearing
-                # behind a "0 changes" line.
-                for health in app.stats():
-                    if health.last_error is not None:
-                        stats.record_error(health.last_error)
+                    try:
+                        app.run(infinite=True)
+                    except KeyboardInterrupt:
+                        pass
+                    # Harvest worker-thread errors that CDCApp swallowed so
+                    # crashes show up in the summary instead of disappearing
+                    # behind a "0 changes" line.
+                    for health in app.stats():
+                        if health.last_error is not None:
+                            stats.record_error(health.last_error)
+                finally:
+                    if dashboard is not None:
+                        dashboard.stop()
         except KeyboardInterrupt:
             pass
         except Exception as exc:
@@ -515,15 +563,18 @@ def main() -> None:
         progress_stop.set()
         if progress_thread is not None:
             progress_thread.join(timeout=1.0)
+        if dashboard is not None:
+            dashboard.stop()
         has_running_workers = (
             app is not None and any(health.running for health in app.stats())
         )
         if has_running_workers:
-            print(
-                "demo consumer: skipping explicit lake close because some "
-                "consumer threads are still unwinding",
-                flush=True,
-            )
+            if not quiet:
+                print(
+                    "demo consumer: skipping explicit lake close because some "
+                    "consumer threads are still unwinding",
+                    flush=True,
+                )
         else:
             for lake in consumer_lakes:
                 try:

@@ -291,3 +291,38 @@ go; this file says what can hurt users or maintainers on the way there.
 - Next action: Revisit only if users are likely to trip over this in the high
   level API; possible mitigations include forbidding `auto_commit=True` with
   required sinks or renaming it to make the unsafe ordering obvious.
+
+### H-022: SQLite-Backed Metadata Lock Handoff on Windows MinGW
+
+- Risk: When the metadata catalog is SQLite-backed and the caller runs a
+  sqlite_scanner read against `__ducklake_metadata_<catalog>.<…>` (typically
+  `SET VARIABLE x = (SELECT max(snapshot_id) FROM …ducklake_snapshot)`)
+  immediately followed by the first `cdc_*_consumer_create` call, the
+  Windows MinGW build can fail with `Invalid Error: Resource deadlock
+  avoided`. The MinGW C runtime maps the underlying `LockFileEx` /
+  `ERROR_POSSIBLE_DEADLOCK` result to `EDEADLK`; MSVC, Linux, and macOS do
+  not surface the same conflict on this code path. The first
+  `cdc_*_consumer_create` is the only call that bootstraps
+  `__ducklake_cdc.__ducklake_cdc_consumers` etc. (a `CREATE SCHEMA IF NOT
+  EXISTS` plus `CREATE TABLE IF NOT EXISTS`), so the cross-connection
+  lock-handoff window is uniquely tight there.
+- Status: accepted.
+- Handling: `test/sql/dml_schema_shape_pinning.test` documents the pattern
+  and uses `start_at := 'now'` (resolved on the extension's own connection)
+  for the bootstrap-triggering call. Any subsequent
+  `cdc_*_consumer_create` that runs after the bootstrap is no longer
+  exposed to the same handoff (the schema/tables already exist), so the
+  `SET VARIABLE`-then-create pattern is safe once at least one cdc_*
+  function has executed against the catalog in this DuckDB process.
+- Notes: DuckLake's documented `META_JOURNAL_MODE 'WAL'` and
+  `META_BUSY_TIMEOUT` ATTACH options improve concurrency on SQLite-backed
+  catalogs in general (see duckdb/ducklake#128) and should be used by
+  operators who need many concurrent writers; they don't change this
+  specific MinGW-only error path, which is about a within-process lock
+  handoff between sqlite_scanner and our bootstrap connection.
+- Next action: Revisit if a real user hits this on Windows MinGW outside
+  the bootstrap-only window. Concrete mitigations would include reusing
+  the caller's connection for bootstrap (so the bootstrap CREATE
+  statements share the SQLite file handle with the prior sqlite_scanner
+  read) or forcing the first cdc_* call against a catalog to be a
+  read-only one such as `cdc_window` / `cdc_list_consumers`.
