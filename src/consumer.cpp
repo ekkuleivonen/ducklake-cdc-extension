@@ -1968,10 +1968,15 @@ void PruneSnapshotChangeCatalogsLocked() {
 	}
 }
 
-void MergeDecodedSnapshotChanges(const std::string &catalog_name, int64_t from_snapshot, int64_t to_snapshot,
+std::string SnapshotChangeIndexCacheKey(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto attachment_key = MetadataAttachmentCacheKey(conn, catalog_name);
+	return attachment_key.empty() ? catalog_name : attachment_key;
+}
+
+void MergeDecodedSnapshotChanges(const std::string &cache_key, int64_t from_snapshot, int64_t to_snapshot,
                                  std::vector<DecodedSnapshotChange> decoded) {
 	std::lock_guard<std::mutex> guard(SNAPSHOT_CHANGE_INDEX_MUTEX);
-	auto &index = SNAPSHOT_CHANGE_INDEXES[catalog_name];
+	auto &index = SNAPSHOT_CHANGE_INDEXES[cache_key];
 	if (index.loaded_to != -1 && to_snapshot < index.loaded_to) {
 		index.changes.clear();
 		index.loaded_from = -1;
@@ -1995,10 +2000,11 @@ std::vector<DecodedSnapshotChange> LoadDecodedSnapshotChanges(duckdb::Connection
 	if (to_snapshot <= from_snapshot) {
 		return cached;
 	}
+	const auto cache_key = SnapshotChangeIndexCacheKey(conn, catalog_name);
 	bool cache_hit = false;
 	{
 		std::lock_guard<std::mutex> guard(SNAPSHOT_CHANGE_INDEX_MUTEX);
-		auto entry = SNAPSHOT_CHANGE_INDEXES.find(catalog_name);
+		auto entry = SNAPSHOT_CHANGE_INDEXES.find(cache_key);
 		if (entry != SNAPSHOT_CHANGE_INDEXES.end() && entry->second.loaded_from <= from_snapshot + 1 &&
 		    entry->second.loaded_to >= to_snapshot) {
 			cache_hit = true;
@@ -2037,7 +2043,7 @@ std::vector<DecodedSnapshotChange> LoadDecodedSnapshotChanges(duckdb::Connection
 		                                       changes_value.IsNull() ? std::string() : changes_value.ToString()));
 	}
 	auto result = decoded;
-	MergeDecodedSnapshotChanges(catalog_name, from_snapshot, to_snapshot, std::move(decoded));
+	MergeDecodedSnapshotChanges(cache_key, from_snapshot, to_snapshot, std::move(decoded));
 	return result;
 }
 

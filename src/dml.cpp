@@ -538,7 +538,6 @@ std::unordered_map<std::string, TableChangesSchemaCacheEntry> TABLE_CHANGES_SCHE
 
 struct DmlSegmentCacheEntry {
 	std::shared_ptr<duckdb::MaterializedQueryResult> segment;
-	size_t estimated_cells = 0;
 	bool ready = false;
 	bool failed = false;
 	uint64_t last_used = 0;
@@ -552,14 +551,9 @@ struct DmlSegmentScanState : public duckdb::GlobalTableFunctionState {
 	duckdb::idx_t offset = 0;
 };
 
-constexpr size_t DML_SEGMENT_CACHE_MAX_ENTRIES = 64;
-constexpr size_t DML_SEGMENT_CACHE_MAX_CELLS = 8 * 1000 * 1000;
-constexpr size_t DML_SEGMENT_CACHE_MAX_CACHEABLE_CELLS = 2 * 1000 * 1000;
-
 std::mutex DML_SEGMENT_CACHE_MUTEX;
 std::condition_variable DML_SEGMENT_CACHE_CV;
 std::unordered_map<std::string, std::shared_ptr<DmlSegmentCacheEntry>> DML_SEGMENT_CACHE;
-size_t DML_SEGMENT_CACHE_CELLS = 0;
 uint64_t DML_SEGMENT_CACHE_CLOCK = 0;
 
 std::string TableChangesSchemaCacheKey(const std::string &catalog_name, int64_t table_id, int64_t schema_version) {
@@ -575,29 +569,6 @@ std::string DmlSegmentCacheKey(const CdcChangesData &data, const std::string &sc
 		key << ":" << change_type;
 	}
 	return key.str();
-}
-
-void PruneDmlSegmentCacheLocked() {
-	while ((DML_SEGMENT_CACHE.size() > DML_SEGMENT_CACHE_MAX_ENTRIES ||
-	        DML_SEGMENT_CACHE_CELLS > DML_SEGMENT_CACHE_MAX_CELLS) &&
-	       !DML_SEGMENT_CACHE.empty()) {
-		auto victim = DML_SEGMENT_CACHE.end();
-		uint64_t oldest = UINT64_MAX;
-		for (auto entry = DML_SEGMENT_CACHE.begin(); entry != DML_SEGMENT_CACHE.end(); ++entry) {
-			if (!entry->second->ready) {
-				continue;
-			}
-			if (entry->second->last_used < oldest) {
-				oldest = entry->second->last_used;
-				victim = entry;
-			}
-		}
-		if (victim == DML_SEGMENT_CACHE.end()) {
-			break;
-		}
-		DML_SEGMENT_CACHE_CELLS -= std::min(DML_SEGMENT_CACHE_CELLS, victim->second->estimated_cells);
-		DML_SEGMENT_CACHE.erase(victim);
-	}
 }
 
 std::shared_ptr<DmlSegmentCacheEntry> ReserveDmlSegment(const std::string &cache_key, bool &build_segment) {
@@ -633,15 +604,12 @@ void PublishDmlSegment(const std::string &cache_key, const std::shared_ptr<DmlSe
                        std::shared_ptr<duckdb::MaterializedQueryResult> segment) {
 	std::lock_guard<std::mutex> guard(DML_SEGMENT_CACHE_MUTEX);
 	entry->segment = std::move(segment);
-	entry->estimated_cells = entry->segment ? entry->segment->RowCount() * entry->segment->ColumnCount() : 0;
 	entry->ready = true;
 	entry->last_used = ++DML_SEGMENT_CACHE_CLOCK;
-	if (entry->segment && entry->estimated_cells <= DML_SEGMENT_CACHE_MAX_CACHEABLE_CELLS) {
-		DML_SEGMENT_CACHE_CELLS += entry->estimated_cells;
-		PruneDmlSegmentCacheLocked();
-	} else {
-		DML_SEGMENT_CACHE.erase(cache_key);
-	}
+	// Keep the cache as an in-flight coalescing map only. Retaining DuckDB
+	// MaterializedQueryResult objects in process-global state can outlive the
+	// database instance in the unittest host and crash during shutdown.
+	DML_SEGMENT_CACHE.erase(cache_key);
 	DML_SEGMENT_CACHE_CV.notify_all();
 }
 
