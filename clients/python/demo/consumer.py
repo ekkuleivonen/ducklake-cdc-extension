@@ -377,7 +377,7 @@ class _TableSpawnSink(BaseDDLSink):
                 lake,
                 _consumer_name_for_request(request),
                 start_at=request.start_at,
-                on_exists="replace",
+                on_exists="error",
                 sinks=[_StatsSink(self._stats)],
                 retry=retry_on_lock,
                 stats=self._stats,
@@ -581,8 +581,8 @@ def _elapsed_ms_since(start_ns: int) -> float:
     return (time.monotonic_ns() - start_ns) / 1_000_000.0
 
 
-def _spawn_worker_count(consumers_per_table: int, requested_workers: int) -> int:
-    return max(1, min(consumers_per_table, requested_workers))
+def _spawn_worker_count(_consumers_per_table: int, requested_workers: int) -> int:
+    return max(1, requested_workers)
 
 
 def _exception_summary(exc: BaseException) -> str:

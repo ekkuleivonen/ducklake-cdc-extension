@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Literal, Self, TypeVar
 
-from ducklake import DuckLake
+from ducklake import DuckLake, DuckLakeQueryError
 from ducklake_cdc.lowlevel import (
     CDCClient,
     ChangeRow,
@@ -273,24 +273,31 @@ class _ConsumerBase:
     def _setup_consumer(self) -> None:
         client = self._require_client()
         name = self._name
-        exists = any(entry.consumer_name == name for entry in client.cdc_list_consumers())
 
-        if exists and self._on_exists == "error":
-            raise RuntimeError(f"consumer {name!r} already exists")
-
-        if exists and self._on_exists == "replace":
-            client.cdc_consumer_force_release(name)
-            client.cdc_consumer_drop(name)
+        if self._on_exists == "replace":
+            self._drop_consumer_if_exists(client)
             self._create_and_position(client)
             return
 
-        if exists:
+        try:
+            self._create_and_position(client)
+            return
+        except DuckLakeQueryError as exc:
+            if not _is_duplicate_consumer_error(exc, name):
+                raise
+
+        if self._on_exists == "error":
+            raise RuntimeError(f"consumer {name!r} already exists") from None
+
+        if self._on_exists == "use":
             return
 
-        self._create_and_position(client)
+        raise AssertionError(f"unsupported on_exists policy: {self._on_exists!r}")
 
     def _setup_and_apply_lease_policy(self) -> None:
         self._setup_consumer()
+        if self._on_exists == "replace":
+            return
         self._apply_lease_policy()
 
     def _create_and_position(self, client: CDCClient) -> None:
@@ -302,8 +309,9 @@ class _ConsumerBase:
         """Resolve a held lease per ``lease_policy`` before listening.
 
         ``replace`` already force-releases as part of `_setup_consumer`, so
-        the policy is effectively bypassed for that path; we still re-check
-        here in case a third party reacquired the lease in the gap.
+        the policy is bypassed for that path. If another process reacquires
+        the lease in the gap, the first listen call will surface the normal
+        busy-consumer error.
         """
 
         client = self._require_client()
@@ -333,6 +341,17 @@ class _ConsumerBase:
                     f"{entry.owner_token})"
                 )
             time.sleep(_LEASE_WAIT_POLL_INTERVAL)
+
+    def _drop_consumer_if_exists(self, client: CDCClient) -> None:
+        def ignore_missing(operation: Callable[[], None]) -> None:
+            try:
+                operation()
+            except DuckLakeQueryError as exc:
+                if not _is_missing_consumer_error(exc, self._name):
+                    raise
+
+        ignore_missing(lambda: client.cdc_consumer_force_release(self._name))
+        ignore_missing(lambda: client.cdc_consumer_drop(self._name))
 
     def _lookup_consumer(self, client: CDCClient) -> ConsumerListEntry | None:
         for entry in client.cdc_list_consumers():
@@ -686,6 +705,25 @@ def _lease_is_alive(entry: ConsumerListEntry) -> bool:
         heartbeat = heartbeat.replace(tzinfo=UTC)
     age = (now - heartbeat).total_seconds()
     return age <= cutoff_age
+
+
+def _is_duplicate_consumer_error(exc: BaseException, consumer_name: str) -> bool:
+    return _consumer_error_contains(exc, consumer_name, "already exists")
+
+
+def _is_missing_consumer_error(exc: BaseException, consumer_name: str) -> bool:
+    return _consumer_error_contains(exc, consumer_name, "does not exist")
+
+
+def _consumer_error_contains(exc: BaseException, consumer_name: str, needle: str) -> bool:
+    current: BaseException | None = exc
+    quoted_name = f"consumer '{consumer_name}'"
+    while current is not None:
+        message = str(current)
+        if quoted_name in message and needle in message:
+            return True
+        current = current.__cause__
+    return False
 
 
 def _sink_name(sink: object) -> str:

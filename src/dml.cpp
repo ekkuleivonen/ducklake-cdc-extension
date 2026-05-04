@@ -25,6 +25,9 @@
 #include "duckdb/main/materialized_query_result.hpp"
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
@@ -533,8 +536,143 @@ struct TableChangesSchemaCacheEntry {
 std::mutex TABLE_CHANGES_SCHEMA_CACHE_MUTEX;
 std::unordered_map<std::string, TableChangesSchemaCacheEntry> TABLE_CHANGES_SCHEMA_CACHE;
 
+struct DmlSegmentCacheEntry {
+	std::shared_ptr<duckdb::MaterializedQueryResult> segment;
+	size_t estimated_cells = 0;
+	bool ready = false;
+	bool failed = false;
+	uint64_t last_used = 0;
+};
+
+struct DmlSegmentScanState : public duckdb::GlobalTableFunctionState {
+	std::shared_ptr<duckdb::MaterializedQueryResult> segment;
+	std::string consumer_name;
+	int64_t start_snapshot = -1;
+	int64_t end_snapshot = -1;
+	duckdb::idx_t offset = 0;
+};
+
+constexpr size_t DML_SEGMENT_CACHE_MAX_ENTRIES = 64;
+constexpr size_t DML_SEGMENT_CACHE_MAX_CELLS = 8 * 1000 * 1000;
+constexpr size_t DML_SEGMENT_CACHE_MAX_CACHEABLE_CELLS = 2 * 1000 * 1000;
+
+std::mutex DML_SEGMENT_CACHE_MUTEX;
+std::condition_variable DML_SEGMENT_CACHE_CV;
+std::unordered_map<std::string, std::shared_ptr<DmlSegmentCacheEntry>> DML_SEGMENT_CACHE;
+size_t DML_SEGMENT_CACHE_CELLS = 0;
+uint64_t DML_SEGMENT_CACHE_CLOCK = 0;
+
 std::string TableChangesSchemaCacheKey(const std::string &catalog_name, int64_t table_id, int64_t schema_version) {
 	return catalog_name + ":" + std::to_string(table_id) + ":" + std::to_string(schema_version);
+}
+
+std::string DmlSegmentCacheKey(const CdcChangesData &data, const std::string &scan_table_name, int64_t start_snapshot,
+                               int64_t end_snapshot) {
+	std::ostringstream key;
+	key << data.catalog_name << ":" << data.table_id << ":" << scan_table_name << ":" << start_snapshot << ":"
+	    << end_snapshot << ":" << data.probe_schema_version;
+	for (const auto &change_type : data.change_types) {
+		key << ":" << change_type;
+	}
+	return key.str();
+}
+
+void PruneDmlSegmentCacheLocked() {
+	while ((DML_SEGMENT_CACHE.size() > DML_SEGMENT_CACHE_MAX_ENTRIES ||
+	        DML_SEGMENT_CACHE_CELLS > DML_SEGMENT_CACHE_MAX_CELLS) &&
+	       !DML_SEGMENT_CACHE.empty()) {
+		auto victim = DML_SEGMENT_CACHE.end();
+		uint64_t oldest = UINT64_MAX;
+		for (auto entry = DML_SEGMENT_CACHE.begin(); entry != DML_SEGMENT_CACHE.end(); ++entry) {
+			if (!entry->second->ready) {
+				continue;
+			}
+			if (entry->second->last_used < oldest) {
+				oldest = entry->second->last_used;
+				victim = entry;
+			}
+		}
+		if (victim == DML_SEGMENT_CACHE.end()) {
+			break;
+		}
+		DML_SEGMENT_CACHE_CELLS -= std::min(DML_SEGMENT_CACHE_CELLS, victim->second->estimated_cells);
+		DML_SEGMENT_CACHE.erase(victim);
+	}
+}
+
+std::shared_ptr<DmlSegmentCacheEntry> ReserveDmlSegment(const std::string &cache_key, bool &build_segment) {
+	std::unique_lock<std::mutex> guard(DML_SEGMENT_CACHE_MUTEX);
+	for (;;) {
+		auto existing = DML_SEGMENT_CACHE.find(cache_key);
+		if (existing == DML_SEGMENT_CACHE.end()) {
+			auto entry = std::make_shared<DmlSegmentCacheEntry>();
+			entry->last_used = ++DML_SEGMENT_CACHE_CLOCK;
+			DML_SEGMENT_CACHE[cache_key] = entry;
+			build_segment = true;
+			return entry;
+		}
+		auto entry = existing->second;
+		if (entry->ready) {
+			entry->last_used = ++DML_SEGMENT_CACHE_CLOCK;
+			build_segment = false;
+			return entry;
+		}
+		DML_SEGMENT_CACHE_CV.wait(guard);
+		if (entry->ready) {
+			entry->last_used = ++DML_SEGMENT_CACHE_CLOCK;
+			build_segment = false;
+			return entry;
+		}
+		if (entry->failed) {
+			DML_SEGMENT_CACHE.erase(cache_key);
+		}
+	}
+}
+
+void PublishDmlSegment(const std::string &cache_key, const std::shared_ptr<DmlSegmentCacheEntry> &entry,
+                       std::shared_ptr<duckdb::MaterializedQueryResult> segment) {
+	std::lock_guard<std::mutex> guard(DML_SEGMENT_CACHE_MUTEX);
+	entry->segment = std::move(segment);
+	entry->estimated_cells = entry->segment ? entry->segment->RowCount() * entry->segment->ColumnCount() : 0;
+	entry->ready = true;
+	entry->last_used = ++DML_SEGMENT_CACHE_CLOCK;
+	if (entry->segment && entry->estimated_cells <= DML_SEGMENT_CACHE_MAX_CACHEABLE_CELLS) {
+		DML_SEGMENT_CACHE_CELLS += entry->estimated_cells;
+		PruneDmlSegmentCacheLocked();
+	} else {
+		DML_SEGMENT_CACHE.erase(cache_key);
+	}
+	DML_SEGMENT_CACHE_CV.notify_all();
+}
+
+void FailDmlSegment(const std::string &cache_key, const std::shared_ptr<DmlSegmentCacheEntry> &entry) {
+	std::lock_guard<std::mutex> guard(DML_SEGMENT_CACHE_MUTEX);
+	entry->failed = true;
+	DML_SEGMENT_CACHE.erase(cache_key);
+	DML_SEGMENT_CACHE_CV.notify_all();
+}
+
+void DmlSegmentScanExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &input,
+                           duckdb::DataChunk &output) {
+	auto &state = input.global_state->Cast<DmlSegmentScanState>();
+	if (!state.segment || state.offset >= state.segment->RowCount()) {
+		return;
+	}
+	duckdb::idx_t count = 0;
+	while (state.offset < state.segment->RowCount() && count < STANDARD_VECTOR_SIZE) {
+		if (state.segment->ColumnCount() + 3 != output.ColumnCount()) {
+			throw duckdb::InternalException("Unaligned cached DML segment row in table function result");
+		}
+		output.SetValue(0, count, duckdb::Value(state.consumer_name));
+		output.SetValue(1, count, duckdb::Value::BIGINT(state.start_snapshot));
+		output.SetValue(2, count, duckdb::Value::BIGINT(state.end_snapshot));
+		for (duckdb::idx_t col = 0; col < state.segment->ColumnCount(); ++col) {
+			output.SetValue(col + 3, count, state.segment->GetValue(col, state.offset));
+		}
+		state.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
 }
 
 void DmlChangesReturnTypes(const CdcChangesData &data, duckdb::vector<duckdb::LogicalType> &return_types,
@@ -787,7 +925,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesListenBind(duckdb::ClientCont
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::ClientContext &context,
                                                                     duckdb::TableFunctionInitInput &input) {
-	auto result = duckdb::make_uniq<MaterializedResultScanState>();
+	auto result = duckdb::make_uniq<DmlSegmentScanState>();
 	auto &data = input.bind_data->Cast<CdcChangesData>();
 	auto max_snapshots = data.max_snapshots;
 	duckdb::Connection conn(*context.db);
@@ -843,10 +981,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	// is constant per row in this read but exposed on each row so a
 	// downstream sink (or join) doesn't need a separate metadata
 	// lookup. `table_id` is similarly self-describing for orchestrators.
-	column_list << QuoteLiteral(data.consumer_name) << " AS consumer_name, " << std::to_string(start_snapshot)
-	            << " AS start_snapshot, " << std::to_string(end_snapshot)
-	            << " AS end_snapshot, tc.snapshot_id, tc.rowid, tc.change_type, " << std::to_string(data.table_id)
-	            << " AS table_id, " << QuoteLiteral(scan_table_name) << " AS table_name";
+	column_list << "tc.snapshot_id, tc.rowid, tc.change_type, " << std::to_string(data.table_id) << " AS table_id, "
+	            << QuoteLiteral(scan_table_name) << " AS table_name";
 	for (const auto &col_name : data.table_column_names) {
 		column_list << ", tc." << QuoteIdentifier(col_name);
 	}
@@ -865,6 +1001,28 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 
 	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 	const auto changes_table = MetadataTable(data.catalog_name, "ducklake_snapshot_changes");
+	const auto cache_key = DmlSegmentCacheKey(data, scan_table_name, start_snapshot, end_snapshot);
+	bool build_segment = false;
+	auto cache_entry = ReserveDmlSegment(cache_key, build_segment);
+	if (!build_segment) {
+		result->segment = cache_entry->segment;
+		result->consumer_name = data.consumer_name;
+		result->start_snapshot = start_snapshot;
+		result->end_snapshot = end_snapshot;
+		const auto row_count = result->segment ? static_cast<int64_t>(result->segment->RowCount()) : 0;
+		if (data.listen && !data.explicit_window) {
+			RecordConsumerListenResult(data.catalog_name, data.consumer_name, "dml_changes", row_count > 0,
+			                           start_snapshot, end_snapshot, row_count, max_snapshots);
+		}
+		if (!data.explicit_window) {
+			if (data.auto_commit || (data.listen && has_changes && row_count == 0)) {
+				CommitConsumerSnapshotWithConnection(context, conn, data.catalog_name, data.consumer_name,
+				                                     end_snapshot);
+			}
+		}
+		return std::move(result);
+	}
+
 	auto query = std::string("WITH tc AS MATERIALIZED (SELECT * FROM ") +
 	             DuckLakeTableChangesCall(data.catalog_name, scan_table_name, start_snapshot, end_snapshot) +
 	             "), snapshot_meta AS MATERIALIZED ("
@@ -875,13 +1033,24 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	             ", sm.snapshot_time, sm.author, sm.commit_message, sm.commit_extra_info FROM tc LEFT JOIN "
 	             "snapshot_meta sm ON sm.snapshot_id = tc.snapshot_id" +
 	             where_clause.str() + " ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
-	auto rows = conn.Query(query);
-	if (!rows || rows->HasError()) {
-		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-		                        rows ? rows->GetError() : "cdc_dml_changes_read scan failed");
+	std::shared_ptr<duckdb::MaterializedQueryResult> segment;
+	try {
+		auto rows = conn.Query(query);
+		if (!rows || rows->HasError()) {
+			const auto error = rows ? rows->GetError() : std::string("cdc_dml_changes_read scan failed");
+			throw duckdb::Exception(duckdb::ExceptionType::INVALID, error);
+		}
+		segment = std::shared_ptr<duckdb::MaterializedQueryResult>(rows.release());
+		PublishDmlSegment(cache_key, cache_entry, segment);
+	} catch (std::exception &ex) {
+		FailDmlSegment(cache_key, cache_entry);
+		throw;
 	}
-	const auto row_count = static_cast<int64_t>(rows->RowCount());
-	result->result = std::move(rows);
+	const auto row_count = static_cast<int64_t>(segment->RowCount());
+	result->segment = std::move(segment);
+	result->consumer_name = data.consumer_name;
+	result->start_snapshot = start_snapshot;
+	result->end_snapshot = end_snapshot;
 	if (data.listen && !data.explicit_window) {
 		RecordConsumerListenResult(data.catalog_name, data.consumer_name, "dml_changes", row_count > 0, start_snapshot,
 		                           end_snapshot, row_count, max_snapshots);
@@ -1164,7 +1333,7 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		    std::string(name).find("_listen") == std::string::npos ? CdcChangesReadBind : CdcChangesListenBind;
 		duckdb::TableFunction changes_function(
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
-		    MaterializedResultScanExecute, bind, CdcChangesInit);
+		    DmlSegmentScanExecute, bind, CdcChangesInit);
 		changes_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;

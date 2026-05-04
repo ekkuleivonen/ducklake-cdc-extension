@@ -96,6 +96,7 @@ def reset_postgres_catalog(dsn: str) -> None:
 
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS __ducklake_cdc CASCADE")
             cur.execute("DROP SCHEMA IF EXISTS public CASCADE")
             cur.execute("CREATE SCHEMA public")
         conn.commit()

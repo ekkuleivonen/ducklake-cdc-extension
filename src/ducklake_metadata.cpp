@@ -194,6 +194,19 @@ std::string MetadataTable(const std::string &catalog_name, const std::string &ta
 	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(table_name);
 }
 
+std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto metadata_database = "__ducklake_metadata_" + catalog_name;
+	auto result = conn.Query("SELECT database_oid, type, path FROM duckdb_databases() WHERE database_name = " +
+	                         QuoteLiteral(metadata_database) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	const auto oid = result->GetValue(0, 0).ToString();
+	const auto type = result->GetValue(1, 0).IsNull() ? "" : result->GetValue(1, 0).ToString();
+	const auto path = result->GetValue(2, 0).IsNull() ? "" : result->GetValue(2, 0).ToString();
+	return metadata_database + "|" + oid + "|" + type + "|" + path;
+}
+
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema) {
 	if (use_state_schema) {
 		return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(STATE_SCHEMA) + "." + QuoteIdentifier(table_name);
@@ -203,27 +216,37 @@ std::string StateTable(const std::string &catalog_name, const std::string &table
 
 namespace {
 
-// Cache catalogs whose `__ducklake_cdc` state schema we've ever observed
-// to exist. Bootstrap creates the schema once and never drops it, so this
-// is monotonic per process. We rely on the cache because DuckDB's catalog
-// enumeration over postgres-attached databases (`duckdb_schemas()` and
-// `duckdb_tables()`) is not always self-consistent across consecutive
-// calls on the same connection: building one SQL string with two
-// `StateTable(...)` calls has been observed to yield `__ducklake_cdc` for
-// the first lookup and `main` for the second, producing
+// Cache attached metadata databases whose `__ducklake_cdc` state schema we've
+// observed to exist. Bootstrap creates the schema once and never drops it for a
+// given attachment, so this is monotonic per attached database. The key must not
+// be just `catalog_name`: CI exercises multiple backend attachments with the
+// same logical alias (`lake`) in one process.
+//
+// We rely on the cache because DuckDB's catalog enumeration over
+// postgres-attached databases (`duckdb_schemas()` and `duckdb_tables()`) is not
+// always self-consistent across consecutive calls on the same connection:
+// building one SQL string with two `StateTable(...)` calls has been observed to
+// yield `__ducklake_cdc` for the first lookup and `main` for the second,
+// producing
 //   Catalog Error: schema "main" does not exist
 // at the listen call site.
 std::mutex STATE_SCHEMA_CACHE_MUTEX;
 std::unordered_set<std::string> STATE_SCHEMA_CACHE;
 
-bool StateSchemaCacheLookup(const std::string &catalog_name) {
+bool StateSchemaCacheLookup(const std::string &cache_key) {
+	if (cache_key.empty()) {
+		return false;
+	}
 	std::lock_guard<std::mutex> guard(STATE_SCHEMA_CACHE_MUTEX);
-	return STATE_SCHEMA_CACHE.count(catalog_name) > 0;
+	return STATE_SCHEMA_CACHE.count(cache_key) > 0;
 }
 
-void StateSchemaCacheRemember(const std::string &catalog_name) {
+void StateSchemaCacheRemember(const std::string &cache_key) {
+	if (cache_key.empty()) {
+		return;
+	}
 	std::lock_guard<std::mutex> guard(STATE_SCHEMA_CACHE_MUTEX);
-	STATE_SCHEMA_CACHE.insert(catalog_name);
+	STATE_SCHEMA_CACHE.insert(cache_key);
 }
 
 bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name) {
@@ -246,11 +269,12 @@ bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name)
 } // namespace
 
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
-	if (StateSchemaCacheLookup(catalog_name)) {
+	const auto cache_key = MetadataAttachmentCacheKey(conn, catalog_name);
+	if (StateSchemaCacheLookup(cache_key)) {
 		return true;
 	}
 	if (ProbeStateSchema(conn, catalog_name)) {
-		StateSchemaCacheRemember(catalog_name);
+		StateSchemaCacheRemember(cache_key);
 		return true;
 	}
 	return false;
@@ -594,7 +618,7 @@ void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::st
 	if (use_state_schema) {
 		// Pre-warm the StateSchemaExists cache so subsequent listen calls
 		// in this process never have to re-probe the catalog enumerator.
-		StateSchemaCacheRemember(catalog_name);
+		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
 	}
 	InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
 }

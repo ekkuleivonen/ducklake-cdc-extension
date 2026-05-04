@@ -44,15 +44,39 @@ class _FakeClient:
     def __init__(self) -> None:
         self.list_calls = 0
         self.created = 0
+        self.create_failures = 0
 
     def cdc_list_consumers(self) -> list[ConsumerListEntry]:
         self.list_calls += 1
-        if self.list_calls == 1:
-            raise RuntimeError("transient setup failure")
         return []
 
     def cdc_dml_consumer_create(self, *_args: Any, **_kwargs: Any) -> None:
+        if self.create_failures > 0:
+            self.create_failures -= 1
+            raise RuntimeError("transient setup failure")
         self.created += 1
+
+    def cdc_consumer_force_release(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("force_release should not be called")
+
+    def cdc_consumer_drop(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("drop should not be called")
+
+
+class _ReplaceClient(_FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.force_releases = 0
+        self.drops = 0
+
+    def cdc_list_consumers(self) -> list[ConsumerListEntry]:
+        raise AssertionError("replace setup should not list every consumer")
+
+    def cdc_consumer_force_release(self, *_args: Any, **_kwargs: Any) -> None:
+        self.force_releases += 1
+
+    def cdc_consumer_drop(self, *_args: Any, **_kwargs: Any) -> None:
+        self.drops += 1
 
 
 def test_dml_consumer_requires_at_least_one_sink() -> None:
@@ -117,6 +141,7 @@ def test_dml_consumer_requires_exactly_one_table_input() -> None:
 
 def test_consumer_enter_applies_retry_policy_to_setup() -> None:
     client = _FakeClient()
+    client.create_failures = 1
     attempts = 0
 
     def retry(operation: Any) -> Any:
@@ -142,7 +167,26 @@ def test_consumer_enter_applies_retry_policy_to_setup() -> None:
         pass
 
     assert attempts == 2
-    assert client.list_calls == 3
+    assert client.list_calls == 1
+    assert client.created == 1
+
+
+def test_replace_setup_avoids_consumer_listing() -> None:
+    client = _ReplaceClient()
+    consumer = DMLConsumer(
+        _fake_lake(),
+        "replace-setup",
+        table="demo_schema.events",
+        on_exists="replace",
+        sinks=[StdoutDMLSink()],
+        client=cast(Any, client),
+    )
+
+    with consumer:
+        pass
+
+    assert client.force_releases == 1
+    assert client.drops == 1
     assert client.created == 1
 
 

@@ -308,9 +308,9 @@ def test_parse_args_accepts_consumers_per_table() -> None:
     assert args.table_spawn_workers == 2
 
 
-def test_spawn_worker_count_is_capped() -> None:
-    assert demo_consumer._spawn_worker_count(1, 4) == 1
-    assert demo_consumer._spawn_worker_count(3, 4) == 3
+def test_spawn_worker_count_uses_requested_worker_limit() -> None:
+    assert demo_consumer._spawn_worker_count(1, 4) == 4
+    assert demo_consumer._spawn_worker_count(3, 4) == 4
     assert demo_consumer._spawn_worker_count(20, 4) == 4
     assert demo_consumer._spawn_worker_count(20, 1) == 1
 

@@ -350,7 +350,7 @@ def test_app_add_consumer_with_existing_name_raises() -> None:
         app.add_consumer(_consumer("dup"))
 
 
-def test_app_serializes_hot_add_consumer_enter() -> None:
+def test_app_hot_add_serializes_consumer_enter() -> None:
     inside_enter = 0
     max_inside_enter = 0
     guard = threading.Lock()
