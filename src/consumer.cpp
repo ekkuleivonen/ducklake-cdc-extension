@@ -1390,11 +1390,11 @@ DmlWindowResolution ResolveDmlWindowIndexed(duckdb::Connection &conn, const std:
 	resolution.current_snapshot = result->GetValue(0, 0).GetValue<int64_t>();
 	resolution.oldest_snapshot = result->GetValue(1, 0);
 	resolution.last_snapshot_exists = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
-	resolution.schema_version =
-	    last_snapshot <= resolution.current_snapshot ? RequiredInt64(result->GetValue(3, 0), "schema_version") : -1;
 	if (!resolution.last_snapshot_exists) {
 		return resolution;
 	}
+	resolution.schema_version =
+	    last_snapshot <= resolution.current_snapshot ? RequiredInt64(result->GetValue(3, 0), "schema_version") : -1;
 
 	const auto first_dml_snapshot =
 	    FirstDmlSubscribedSnapshot(conn, catalog_name, last_snapshot, resolution.current_snapshot, subscriptions);

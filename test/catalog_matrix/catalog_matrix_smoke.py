@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
@@ -316,6 +317,23 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if len(args.backends) > 1:
+        for backend in args.backends:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    __file__,
+                    "--backends",
+                    backend,
+                    "--postgres-dsn",
+                    args.postgres_dsn,
+                ],
+                check=False,
+            )
+            if completed.returncode != 0:
+                return completed.returncode
+        return 0
 
     for backend in args.backends:
         run_backend(backend, args.postgres_dsn)
