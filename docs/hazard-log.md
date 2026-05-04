@@ -305,7 +305,11 @@ go; this file says what can hurt users or maintainers on the way there.
   := getvariable('x'))` — the same caller thread ends up running the
   extension's bootstrap writes on a newly-opened internal
   `duckdb::Connection` against the same attached database whose catalog
-  machinery the outer `ClientContext` still holds state on. The two
+  machinery the outer `ClientContext` still holds state on. Release-matrix
+  MSVC has also failed when the first bootstrap used `start_at := 'now'` with
+  no user metadata read immediately before; the minimal trigger is not fully
+  characterised — treat any first write-path `cdc_*` after DuckLake activity on
+  the outer connection as suspicious on MSVC until stack evidence exists. The two
   platforms surface this differently:
   - Windows MSVC's error-checking `std::mutex::lock()` detects the
     resulting same-thread re-entry of a shared catalog/attachment
@@ -341,29 +345,32 @@ go; this file says what can hurt users or maintainers on the way there.
   hazard). It does not close the outer-conn ↔ inner-conn handoff, which
   requires upstream (DuckDB + DuckLake) lock-ordering work to fix
   in-source.
-- Handling (test side): `test/sql/dml_schema_shape_pinning.test` uses
-  `start_at := 'now'` for the two bootstrap-triggering
-  `cdc_*_consumer_create` calls against a freshly attached catalog.
-  `'now'` resolves the head inside the extension's own internal
-  connection (no user-conn read of the metadata database preceding
-  the first bootstrap write), which sidesteps the residual hazard.
-  Subsequent `cdc_*_consumer_create` calls on the same catalog are
-  post-bootstrap and stay safe even in the `getvariable(...)` form,
-  so the shape-pinning semantics the test exists to guard are still
-  exercised end-to-end.
+- Handling (release matrix — temporary): Windows MSVC (`DUCKDB_PLATFORM
+  == windows_amd64`) does not export `CDC_RUN_H022_SENSITIVE_TESTS`.
+  That file gates on `require-env CDC_RUN_H022_SENSITIVE_TESTS`, so it
+  is skipped entirely on that triplet until stabilisation captures an
+  MSVC stack trace at the throw site and fixes the mutex ordering.
+  The extension root `Makefile` exports `CDC_RUN_H022_SENSITIVE_TESTS
+  := 1` on every other platform CI matrix entry; local `make
+  test_release` thus runs the regression unchanged. Developers who run
+  `unittest` manually without Make must export
+  `CDC_RUN_H022_SENSITIVE_TESTS=1` on non MSVC-Windows hosts. The test
+  body keeps `SET VARIABLE x = (SELECT max(snapshot_id) FROM
+  __ducklake_metadata_<catalog>.ducklake_snapshot)` + `start_at :=
+  getvariable('x')` — the intentional API-shape coverage; MSVC does
+  not run it via this gate (`start_at := 'now'` proved insufficient on
+  MSVC CI — the deadlock still surfaced there).
 - Notes: DuckLake's documented `META_JOURNAL_MODE 'WAL'` and
   `META_BUSY_TIMEOUT` ATTACH options improve concurrency on
   SQLite-backed catalogs in general (see duckdb/ducklake#128) and are
   orthogonal to this hazard.
-- User-facing guidance: If an orchestrator runs a SELECT against
-  `__ducklake_metadata_<catalog>` and then immediately makes its first
-  `cdc_*_consumer_create` call against that catalog in the same DuckDB
-  process on Windows MSVC, either (a) pin via `start_at := 'now'` /
-  `'beginning'` instead of resolving the snapshot on the user
-  connection, (b) drive a read-only cdc_* call first (e.g.
-  `cdc_list_consumers`, `cdc_window` on a pre-existing consumer, or
-  `cdc_dml_ticks_query`) so the bootstrap is not the first write, or
-  (c) run the preceding metadata read on a separate DuckDB process.
+- User-facing guidance: On Windows MSVC, avoid first write-path `cdc_*`
+  against a catalog in-process until stabilisation confirms a safe recipe.
+  Tentative mitigations (empirical, not validated on MSVC CI): drive a read-
+  only `cdc_*` call first (`cdc_dml_ticks_query`, etc.), use a separate
+  DuckDB process for the preceding metadata peek, or open the catalog on an
+  already-bootstraped path (`start_at := 'now'` alone did **not** clear the
+  failure in MSVC release-matrix logs).
 - Next action: If we see this hit by a real user outside the
   regression-test pattern, capture an MSVC debug-build stack trace at
   the `std::system_error(resource_deadlock_would_occur)` throw site to

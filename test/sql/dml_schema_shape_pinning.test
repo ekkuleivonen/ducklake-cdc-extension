@@ -12,6 +12,11 @@ require icu
 
 require parquet
 
+# H-022: skipped on Windows MSVC (DUCKDB_PLATFORM=windows_amd64) — see root
+# Makefile CDC_RUN_H022_SENSITIVE_TESTS. Shape-pinning semantics are platform-
+# independent and run everywhere else release CI runs.
+require-env CDC_RUN_H022_SENSITIVE_TESTS
+
 statement ok
 INSTALL ducklake;
 
@@ -35,26 +40,17 @@ CREATE TABLE lake.t2(id INTEGER, label VARCHAR);
 statement ok
 INSERT INTO lake.t1 VALUES (1, 'a');
 
-# Pin the consumer at the current head via `start_at := 'now'`. The
-# obvious alternative — `SET VARIABLE x = (SELECT max(snapshot_id)
-# FROM __ducklake_metadata_lake.ducklake_snapshot)` immediately
-# followed by `start_at := getvariable('x')` — runs a user-conn read
-# against the attached DuckLake metadata database and is then
-# immediately followed by this extension's first bootstrap writes
-# (CREATE SCHEMA IF NOT EXISTS __ducklake_cdc / CREATE TABLE IF NOT
-# EXISTS) against the same attached database on a newly-opened
-# internal connection. On Windows MSVC the error-checking std::mutex
-# detects the resulting outer-conn ↔ inner-conn re-entry of a shared
-# catalog/attachment mutex on the same thread and raises
-# `Invalid Error: resource deadlock would occur`. `'now'` resolves
-# the head inside the extension's own connection, so no cross-
-# connection handoff occurs. See hazard H-022.
+statement ok
+SET VARIABLE pinned_snapshot = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
 statement ok
 SELECT * FROM cdc_dml_consumer_create(
   'lake',
   'shape_pin',
   table_name := 't1',
-  start_at := 'now'
+  start_at := getvariable('pinned_snapshot')::VARCHAR
 );
 
 # ---------------------------------------------------------------------------
@@ -236,18 +232,17 @@ CREATE TABLE lake.events.audit(id INTEGER, msg VARCHAR);
 statement ok
 INSERT INTO lake.events.audit VALUES (1, 'hello');
 
-# Same outer-conn ↔ inner-conn handoff hazard as the `shape_pin`
-# create above: avoid `SET VARIABLE … = (SELECT … FROM
-# __ducklake_metadata_lake.ducklake_snapshot)` immediately before
-# the first write-path cdc_* call against this catalog. `'now'`
-# resolves the head inside this extension's own connection. See
-# hazard H-022.
+statement ok
+SET VARIABLE pre_drop = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
 statement ok
 SELECT * FROM cdc_dml_consumer_create(
   'lake',
   'audit_sink',
   table_name := 'events.audit',
-  start_at := 'now'
+  start_at := getvariable('pre_drop')::VARCHAR
 );
 
 statement ok

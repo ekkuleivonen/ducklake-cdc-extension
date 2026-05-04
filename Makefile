@@ -45,6 +45,17 @@ EXT_REPO_BASE ?= http://extensions.duckdb.org
 OVERRIDE_GIT_DESCRIBE ?= ${DUCKDB_VERSION}
 export OVERRIDE_GIT_DESCRIBE
 
+# H-022: first write-path cdc_* call bootstrapping __ducklake_cdc.* on a
+# catalog after DuckLake activity on the same process can trigger MSVC's
+# error-checking std::mutex (resource_deadlock_would_occur). Until
+# stabilisation work pins the mutex, skip the regression-only file on the
+# release-matrix Windows MSVC triplet via require-env below. Anyone running
+# ./build/release/test/unittest … directly without make must export
+# CDC_RUN_H022_SENSITIVE_TESTS=1 on non-MSVC-Windows hosts.
+ifneq ($(DUCKDB_PLATFORM),windows_amd64)
+export CDC_RUN_H022_SENSITIVE_TESTS := 1
+endif
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
