@@ -1,0 +1,26 @@
+[project]
+name = "ducklake-cdc-e2e-benchmark"
+version = "0.0.0"
+description = "End-to-end benchmark harness for the ducklake-cdc extension"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb==1.5.2",
+    "ducklake-client>=0.1.2",
+    "ducklake-cdc-client>=0.1.0",
+    "psycopg[binary]>=3.3.3",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 160
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["UP047"]

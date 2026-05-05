@@ -110,7 +110,7 @@ jobs:
     # library whose runtime metadata it doesn't recognise. We therefore
     # gate the sanitiser pass on release time and run only the no-DuckLake
     # smoke set (`SQL_TEST_SMOKE_NO_DUCKLAKE` in the Makefile) — exactly
-    # the test/sql files that don't `INSTALL ducklake`. Catches compile-time
+    # the test/*.test files that don't `INSTALL ducklake`. Catches compile-time
     # UB, init-time UB in the extension's `Load()` path, global-construction
     # bugs, and the `cdc_version()` hot path. Deeper coverage is gated on
     # upstream DuckLake building under sanitisers, tracked in

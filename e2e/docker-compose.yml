@@ -1,0 +1,46 @@
+# E2E stack: Postgres + PgBouncer for high-connection benchmark runs, one DB for all probes.
+#
+# Usage:
+#   docker compose -f e2e/docker-compose.yml up -d --wait
+#   uv run --project e2e/benchmark python e2e/benchmark/runner.py
+#   uv run python e2e/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
+#   uv run python e2e/upstream/enumerate_changes_map.py --check
+#   docker compose -f e2e/docker-compose.yml down -v
+#
+# Ports:
+#   5435 -> PgBouncer (DuckLake benchmark catalog traffic; pool many clients -> few server conns)
+#   5436 -> Postgres direct (compose health, catalog admin/reset, catalog-matrix + upstream smoke)
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: dlcdc-e2e-postgres
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: ducklake
+      POSTGRES_PASSWORD: ducklake
+      POSTGRES_DB: ducklake
+    ports:
+      - "5436:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ducklake -d ducklake"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: dlcdc-e2e-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5435:5432"
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+
+volumes:
+  postgres-data:

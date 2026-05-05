@@ -689,8 +689,8 @@ std::string BuildCreatedViewDetails(duckdb::Connection &conn, const std::string 
 //! either an unquoted qualified name (`schema.table` for tables/views,
 //! `schema` for schemas) or the stringified `<id>` for kinds that
 //! reference catalog rows by id. Per the upstream probe in
-//! `test/upstream/enumerate_changes_map.py` (committed JSONs in
-//! `test/upstream/output/`), all three DuckLake catalog backends
+//! `e2e/upstream/enumerate_changes_map.py` (committed JSONs in
+//! `e2e/upstream/output/`), all three DuckLake catalog backends
 //! (DuckDB, SQLite, Postgres) emit identical MAP key sets for every
 //! DDL operation, so this dispatcher is backend-agnostic by
 //! construction. ADR 0008 makes the MAP form the canonical Stage-1
@@ -916,7 +916,7 @@ void ApplyDdlTableFilter(std::vector<std::vector<duckdb::Value>> &rows, size_t b
 //! rows for every recognised MAP key. Replaces the prior text-token
 //! scan of `__ducklake_metadata_<lake>.ducklake_snapshot_changes.changes_made`
 //! for cdc_ddl_changes_read / cdc_ddl_changes_query. Backend-agnostic (the upstream probe in
-//! `test/upstream/output/` confirms all three DuckLake backends emit
+//! `e2e/upstream/output/` confirms all three DuckLake backends emit
 //! identical MAP key sets); future-proof against the comma-separated
 //! text format moving.
 void ExtractDdlRows(duckdb::Connection &conn, const std::string &catalog_name, int64_t start_snapshot,

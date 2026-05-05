@@ -61,6 +61,7 @@ FROM cdc_ddl_changes_listen('lake', 'schema_watch', timeout_ms := 30000);
 
 - [SQL API](./docs/api.md)
 - [Design notes](./docs/design.md)
-- [Python client](./clients/python/README.md)
+- [Python client](https://pypi.org/project/ducklake-cdc-client/)
+- [E2E benchmark](./e2e/benchmark/README.md)
 
 Developer setup, builds, and tests live in [Development](./docs/development.md).
