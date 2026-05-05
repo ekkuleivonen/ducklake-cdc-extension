@@ -37,13 +37,13 @@ in-process consumer.
 
 ## Where to read the numbers
 
-The smoke harness lives in `bench/runner.py`, with the first workload
-descriptor in `bench/light.yaml`. The manual benchmark workflow downloads the
-`linux_amd64` extension artifact from a successful CI run (or builds locally),
-executes that descriptor against the supported official DuckDB release, and
-uploads the result JSON as an artifact. Selected baselines can be committed
-under `bench/results/` once there is enough history to make a trajectory
-meaningful.
+The smoke harness lives in `e2e/benchmark/runner.py`, with the first workload
+descriptor in `e2e/benchmark/light.yaml`. The manual benchmark workflow
+downloads the `linux_amd64` extension artifact from a successful CI run,
+executes that descriptor through the published Python packages against the
+supported official DuckDB release, and uploads the result JSON as an artifact.
+Selected baselines can be committed under `e2e/benchmark/results/` once there
+is enough history to make a trajectory meaningful.
 
 ## What we are bad at
 
@@ -63,7 +63,7 @@ We are a **poor fit** for:
 
 ## Python Client-Loop Baseline
 
-The Python demo summary separates responsibility:
+The Python benchmark summary separates responsibility:
 
 - `e2e_p{50,95,99}_ms` (in `e2e_latency_ms`) is the headline latency for
   fresh insert and update-postimage events: producer emit ➝ delivered to sink.

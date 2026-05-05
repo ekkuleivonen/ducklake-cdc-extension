@@ -46,9 +46,9 @@ version `XX`:
 5. Exercise the loadable extension in the built DuckDB shell:
    `LOAD ducklake; LOAD parquet; LOAD ducklake_cdc;`, then attach a real
    DuckLake catalog and run the CDC smoke path.
-6. Run the Python smoke probes in `test/smoke/` for behaviours SQLLogicTest
+6. Run the Python smoke probes in `e2e/smoke/` for behaviours SQLLogicTest
    cannot express, especially notices, leases, waits, and backend-specific
-   catalog behaviour. Run the upstream probes in `test/upstream/` when the
+   catalog behaviour. Run the upstream probes in `e2e/upstream/` when the
    DuckLake dependency changes.
 7. Add a CI matrix leg for `XX` and require full CI to pass on the branch.
 8. Update the compatibility docs and release notes with the exact tuple:
@@ -102,10 +102,10 @@ release target.
 Run a single SQLLogicTest file:
 
 ```bash
-build/release/test/unittest --test-dir . "test/sql/ducklake_cdc.test"
+build/release/test/unittest --test-dir . "test/ducklake_cdc.test"
 ```
 
-Swap the path for any file under `test/sql/`.
+Swap the path for any file under `test/`.
 
 ## Formatting
 
@@ -138,15 +138,15 @@ not depend on the developer's system `clang-format` version.
 ## Python smoke and upstream probes
 
 Some behaviours are easier to smoke-test from Python (stderr notices,
-multi-connection leases, explicit interrupts, etc.). Dependencies live in the root `pyproject.toml`; run from the repository root:
+multi-connection leases, explicit interrupts, etc.). Dependencies live in the root `pyproject.toml` (Python **3.14+**, for `ducklake-client`); run from the repository root:
 
 ```bash
-uv run python test/smoke/lease_multiconn_smoke.py
-uv run python test/upstream/enumerate_changes_map.py --check
+uv run python e2e/smoke/lease_multiconn_smoke.py
+uv run python e2e/upstream/enumerate_changes_map.py --check
 ```
 
-See [`test/smoke/README.md`](../test/smoke/README.md) and
-[`test/upstream/README.md`](../test/upstream/README.md) for the full lists.
+See [`e2e/smoke/README.md`](../e2e/smoke/README.md) and
+[`e2e/upstream/README.md`](../e2e/upstream/README.md) for the full lists.
 
 ## Branch and CI flow
 
@@ -183,12 +183,12 @@ feature_* -> main -> manual release
   queries).
 - `src/include/stats.hpp` + `src/stats.cpp` own the observability surface
   (`cdc_consumer_stats`, `cdc_audit_events`, `cdc_doctor`).
-- `test/sql/ducklake_cdc.test` is the smallest extension smoke test.
-- `test/sql/consumer_state.test` and `test/sql/sugar.test` are the best
+- `test/ducklake_cdc.test` is the smallest extension smoke test.
+- `test/consumer_state.test` and `test/sugar.test` are the best
   behavioural specs for the cursor and sugar surfaces.
-- `test/smoke/README.md` documents Python smoke tools that do not fit
+- `e2e/smoke/README.md` documents Python smoke tools that do not fit
   SQLLogicTest well.
-- `test/upstream/README.md` documents DuckLake compatibility probes that pin
+- `e2e/upstream/README.md` documents DuckLake compatibility probes that pin
   upstream behaviour this extension depends on.
 
 For a minimal SQL walk-through of primitives, use the quickstart block in the

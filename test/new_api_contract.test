@@ -1,0 +1,141 @@
+# name: test/new_api_contract.test
+# description: Focused checks for the separated DDL/DML CDC API contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/new_api_contract.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/new_api_contract_data');
+
+statement ok
+CREATE SCHEMA lake.aux;
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid');
+
+statement ok
+CREATE TABLE lake.aux.hidden(id INTEGER);
+
+statement ok
+INSERT INTO lake.aux.hidden VALUES (10);
+
+statement ok
+SET VARIABLE contract_head = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_ticks_query('lake', 0, table_names := ['orders']);
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_ticks_query('lake', 0, table_names := ['aux.hidden']);
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM cdc_dml_ticks_query('lake', 0, table_names := ['orders'])
+WHERE list_contains(table_ids, (
+  SELECT t.table_id
+  FROM __ducklake_metadata_lake.ducklake_table t
+  JOIN __ducklake_metadata_lake.ducklake_schema s USING (schema_id)
+  WHERE s.schema_name = 'aux'
+    AND t.table_name = 'hidden'
+    AND t.begin_snapshot <= getvariable('contract_head')
+    AND (t.end_snapshot IS NULL OR t.end_snapshot > getvariable('contract_head'))
+));
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_ddl_changes_query('lake', 0, schemas := ['aux'])
+WHERE schema_name = 'aux';
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM cdc_ddl_changes_query('lake', 0, schemas := ['aux'])
+WHERE object_name = 'orders';
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_ddl_ticks_query('lake', 0);
+----
+true
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'listen_backlog',
+  table_name := 'orders',
+  start_at := 'now'
+);
+
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'listen_backlog', to_snapshot := 'beginning');
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_ticks_listen('lake', 'listen_backlog', timeout_ms := 0, max_snapshots := 1000);
+----
+true
+
+statement error
+SELECT * FROM cdc_consumer_create('lake', 'legacy');
+----
+Catalog Error
+
+statement error
+SELECT * FROM cdc_wait('lake', 'legacy');
+----
+Catalog Error
+
+statement error
+SELECT * FROM cdc_events('lake', 'legacy');
+----
+Catalog Error
+
+statement error
+SELECT * FROM cdc_changes('lake', 'legacy', 'orders');
+----
+Catalog Error
+
+statement error
+SELECT * FROM cdc_dml_table_changes_read('lake', 'legacy', 'orders');
+----
+Catalog Error
+
+# Generic JSON DML reads were removed: there is one DML payload API
+# (`cdc_dml_changes_read` / `_listen` / `_query`) projecting the consumer's
+# pinned table's native columns. The OLD `cdc_dml_changes_read`/`_listen`
+# took LIST overrides and emitted a JSON `values` column; that surface is
+# gone.
+statement error
+SELECT * FROM cdc_dml_changes_read('lake', 'legacy', table_names := ['orders']);
+----
+Binder Error
+
+statement error
+SELECT * FROM cdc_ddl('lake', 'legacy');
+----
+Catalog Error

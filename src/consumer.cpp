@@ -289,7 +289,7 @@ StateBackendKind CachedStateBackend(duckdb::ClientContext &context, duckdb::Conn
 bool SupportsUpdateReturning(StateBackendKind backend) {
 	// DuckDB's sqlite_scanner and postgres_scanner currently reject
 	// `UPDATE ... RETURNING` for attached tables, even though both underlying
-	// engines support it natively. `test/catalog_matrix/catalog_matrix_smoke.py`
+	// engines support it natively. `e2e/catalog_matrix/catalog_matrix_smoke.py`
 	// has a small probe for this so the gate can be widened when scanners learn
 	// to round-trip RETURNING correctly.
 	return backend == StateBackendKind::DuckDB;

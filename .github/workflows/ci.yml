@@ -23,12 +23,12 @@ on:
     paths-ignore:
       - 'README.md'
       - 'docs/**'
-      - 'bench/results/**'
+      - 'e2e/benchmark/results/**'
   pull_request:
     paths-ignore:
       - 'README.md'
       - 'docs/**'
-      - 'bench/results/**'
+      - 'e2e/benchmark/results/**'
   merge_group:
   workflow_dispatch:
 
@@ -123,10 +123,10 @@ jobs:
 
       - name: Python smoke probes
         run: |
-          uv run --locked python test/smoke/compat_warning_smoke.py
-          uv run --locked python test/smoke/lease_multiconn_smoke.py
-          uv run --locked python test/smoke/cdc_wait_interrupt_smoke.py
-          uv run --locked python test/smoke/toctou_expire_smoke.py
+          uv run --locked python e2e/smoke/compat_warning_smoke.py
+          uv run --locked python e2e/smoke/lease_multiconn_smoke.py
+          uv run --locked python e2e/smoke/cdc_wait_interrupt_smoke.py
+          uv run --locked python e2e/smoke/toctou_expire_smoke.py
 
       # Republish the built ducklake_cdc.duckdb_extension under the same
       # name the full distribution matrix used to produce, so benchmark.yml
@@ -151,9 +151,9 @@ jobs:
         # truncated the runtime range. The probe now mirrors `ReadWindow`
         # read-only; see `CdcChangesBind` in `src/dml.cpp`.
         run: |
-          docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
-          trap 'docker compose -f test/catalog_matrix/docker-compose.yml down -v' EXIT
-          uv run --locked python test/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
+          docker compose -f e2e/docker-compose.yml up -d --wait
+          trap 'docker compose -f e2e/docker-compose.yml down -v' EXIT
+          uv run --locked python e2e/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
 
   upstream-contract-check:
     name: Upstream DuckLake contract check
@@ -170,7 +170,7 @@ jobs:
 
       - name: Check DuckLake changes-map reference
         run: |
-          uv run --locked python test/upstream/enumerate_changes_map.py --check
+          uv run --locked python e2e/upstream/enumerate_changes_map.py --check
 
   ci-pass:
     name: CI Pass

@@ -21,7 +21,7 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: DuckDB, SQLite, and PostgreSQL DuckLake catalogs may diverge in metadata
   encoding, transaction behavior, or extension-visible semantics.
 - Status: partially handled.
-- Handling: `test/catalog_matrix/catalog_matrix_smoke.py` runs a DDL + DML
+- Handling: `e2e/catalog_matrix/catalog_matrix_smoke.py` runs a DDL + DML
   cursor flow and lease rejection flow across DuckDB, SQLite, and PostgreSQL in
   CI.
 - Next action: Add targeted backend tests only when a concrete portability bug
@@ -32,8 +32,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Two readers could process or commit the same consumer window if the
   owner-token lease is wrong.
 - Status: partially handled.
-- Handling: `test/smoke/lease_multiconn_smoke.py`,
-  `test/sql/consumer_state.test`, and the catalog matrix smoke cover
+- Handling: `e2e/smoke/lease_multiconn_smoke.py`,
+  `test/consumer_state.test`, and the catalog matrix smoke cover
   same-connection idempotence, second-reader rejection, force release, and
   stolen-lease commit failure.
 - Notes: `cdc_consumer_force_release` is only for a holder that is
@@ -50,8 +50,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled for the SQL extension surface.
 - Handling: `cdc_window` exposes `schema_changes_pending`,
   `cdc_ddl_changes_read` emits typed DDL events, and
-  `test/sql/always_breaks.test` plus
-  `test/sql/ddl_stage2.test` cover schema boundaries and DDL-before-DML
+  `test/always_breaks.test` plus
+  `test/ddl_stage2.test` cover schema boundaries and DDL-before-DML
   ordering.
 - Next action: Revisit when a client library interleaves DDL and DML into one
   stream.
@@ -61,7 +61,7 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Rename, nested-column, or combined schema changes can produce confusing
   or duplicate DDL events.
 - Status: partially handled.
-- Handling: `test/sql/ddl_stage2.test` covers the `snapshots().changes` MAP
+- Handling: `test/ddl_stage2.test` covers the `snapshots().changes` MAP
   source, rename deduplication, snapshot-bound object lookup, and nested-column
   parent/child ordering.
 - Next action: Add examples before adding more exhaustive cross-products. The
@@ -73,7 +73,7 @@ go; this file says what can hurt users or maintainers on the way there.
   maintenance and silently miss changes.
 - Status: handled for the main gap path.
 - Handling: `cdc_window` raises `CDC_GAP`, `cdc_consumer_reset` supports
-  recovery, and `test/smoke/toctou_expire_smoke.py` covers the compaction gap
+  recovery, and `e2e/smoke/toctou_expire_smoke.py` covers the compaction gap
   path. Planned stateless range helpers must apply the same explicit gap
   handling when `from_snapshot` is older than the oldest available snapshot.
 - Next action: Keep operator docs clear that retention must exceed expected
@@ -86,7 +86,7 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled by docs and warning.
 - Handling: listen functions emit `CDC_WAIT_SHARED_CONNECTION`, clamp excessive
   timeouts, use level-triggered checks before waiting, and
-  `test/smoke/cdc_wait_interrupt_smoke.py` covers interruptibility.
+  `e2e/smoke/cdc_wait_interrupt_smoke.py` covers interruptibility.
 - Notes: SQL users should hold a dedicated connection for listen calls. Batch
   jobs that wake up on a schedule should call `cdc_window` directly instead of
   long-polling.
@@ -120,7 +120,8 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: Early benchmark numbers can be mistaken for production promises.
 - Status: partially handled.
-- Handling: `bench/runner.py`, `bench/light.yaml`, and `bench/README.md`
+- Handling: `e2e/benchmark/runner.py`, `e2e/benchmark/light.yaml`, and
+  `e2e/benchmark/README.md`
   provide smoke-level measurements and explain how to read them.
 - Next action: Publish numbers as observations with commit/hardware context;
   avoid hard performance contracts until repeated runs justify them.
@@ -142,7 +143,7 @@ go; this file says what can hurt users or maintainers on the way there.
   skip small batches.
 - Status: handled for the extension surface.
 - Handling: The extension's discovery logic checks the inlined keys, and
-  `test/upstream/enumerate_changes_map.py` tracks the observed DuckLake key
+  `e2e/upstream/enumerate_changes_map.py` tracks the observed DuckLake key
   set.
 - Next action: Keep any new discovery/filtering code covered by the upstream
   key probe or a focused SQL test.
@@ -166,7 +167,7 @@ go; this file says what can hurt users or maintainers on the way there.
   `DATA_INLINING_ROW_LIMIT = 100`, but DuckLake's default is 10. That can make
   tests miss the inlined-data path entirely.
 - Status: handled in upstream probes.
-- Handling: `test/upstream/enumerate_changes_map.py` sets
+- Handling: `e2e/upstream/enumerate_changes_map.py` sets
   `DATA_INLINING_ROW_LIMIT = 10` explicitly.
 - Next action: Set `DATA_INLINING_ROW_LIMIT` explicitly in any test that cares
   about inlined-vs-materialized behavior.

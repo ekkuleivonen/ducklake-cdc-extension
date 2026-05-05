@@ -1,0 +1,13 @@
+name: light
+duration_seconds: 60
+schemas: 1
+tables_per_schema: 1
+target_snapshots_per_second: 0.5
+target_rows_per_snapshot: 100
+consumers_per_table: 1
+producer_workers: 1
+update_percent: 25
+delete_percent: 10
+batch_min: 100
+batch_max: 100
+max_snapshots: 100

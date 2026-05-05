@@ -2,7 +2,7 @@
 # Manual benchmark workflow.
 #
 # Intentionally outside the regular CI gate. Today it runs the light
-# benchmark smoke workload; over time it can grow into scheduled benchmark
+# e2e benchmark smoke workload; over time it can grow into scheduled benchmark
 # coverage without making every PR and release wait for the full benchmark path.
 #
 
@@ -38,11 +38,16 @@ jobs:
         id: duckdb
         run: echo "version=$(cat .github/duckdb-version)" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: uv.lock
+          cache-dependency-glob: e2e/benchmark/uv.lock
 
       - name: Resolve CI run
         id: ci
@@ -79,19 +84,21 @@ jobs:
           run-id: ${{ steps.ci.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      - name: Run light benchmark against official DuckDB
+      - name: Start e2e services
+        run: docker compose -f e2e/docker-compose.yml up -d --wait
+
+      - name: Run light e2e benchmark against official DuckDB
         run: |
-          uv run --locked python bench/runner.py \
-            --runtime official \
+          uv run --project e2e/benchmark --locked python e2e/benchmark/runner.py \
             --cdc-extension build/benchmark/extensions/ducklake_cdc.duckdb_extension \
-            --workload bench/light.yaml
-          uv run --locked python bench/runner.py \
-            --runtime official \
-            --cdc-extension build/benchmark/extensions/ducklake_cdc.duckdb_extension \
-            --workload bench/empty-window.yaml
+            --workload e2e/benchmark/light.yaml
+
+      - name: Stop e2e services
+        if: always()
+        run: docker compose -f e2e/docker-compose.yml down -v
 
       - name: Upload benchmark result
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-light-result
-          path: bench/results/*.json
+          path: e2e/benchmark/results/*.json
