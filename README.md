@@ -1,12 +1,12 @@
 # ducklake-cdc
 
 Turn DuckLake snapshots into durable change streams, so you can build realtime
-sinks, cache invalidation, and lakehouse automation from plain DuckDB SQL.
+sinks, cache invalidation, and lakehouse automation from SQL or Python.
 
 ![Demo](./docs/assets/demo.gif)
 
 > **Pre-alpha.** The current public API is in good shape, but names and row
-> shapes may still change over the next 30 days.
+> shapes may still change.
 
 ## Who This Is For
 
@@ -21,6 +21,23 @@ Use it if you want to:
 - Keep durable consumer cursors without adding Kafka, Debezium, or a separate
   state store.
 - Experiment with CDC workflows while staying inside DuckDB.
+
+### Use Cases
+
+- [Streamable datalake schemas](./e2e/01_schema_safe_consumer/README.md):
+  turn evolving schemas into live diffs, stop row consumers at schema
+  boundaries, migrate, then resume safely.
+- [Materialized views without full refreshes](./e2e/02_incremental_materialized_view/README.md):
+  maintain derived DuckLake tables by applying changed rows instead of
+  rescanning the lake.
+- [Durable catchup after restarts](./e2e/03_backfill_live_catchup/README.md):
+  let producers keep writing while a consumer restarts, then drain exactly the
+  missed snapshots.
+- [Refresh signals, not row streams](./e2e/04_cache_refresh/README.md):
+  wake caches, search indexes, vector indexes, or service-local materializations
+  with metadata-only ticks.
+- [CDC-native pipeline DAGs](./e2e/05_pipeline_dag/README.md):
+  build multi-stage lakehouse pipelines where each node owns a durable cursor.
 
 ## What This Is Not
 
@@ -45,6 +62,10 @@ FROM cdc_dml_consumer_create(
 
 SELECT *
 FROM cdc_dml_changes_read('lake', 'orders_sink');
+
+-- After your sink write succeeds, commit the batch's end_snapshot.
+SELECT *
+FROM cdc_commit('lake', 'orders_sink', <batch_end_snapshot>);
 ```
 
 Listen for schema changes:
@@ -61,6 +82,7 @@ FROM cdc_ddl_changes_listen('lake', 'schema_watch', timeout_ms := 30000);
 
 - [SQL API](./docs/api.md)
 - [Design notes](./docs/design.md)
-- [Python client](./clients/python/README.md)
+- [Python client](https://pypi.org/project/ducklake-cdc-client/)
+- [End-to-end demos](./e2e/README.md)
 
 Developer setup, builds, and tests live in [Development](./docs/development.md).

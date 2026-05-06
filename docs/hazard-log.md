@@ -21,9 +21,9 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: DuckDB, SQLite, and PostgreSQL DuckLake catalogs may diverge in metadata
   encoding, transaction behavior, or extension-visible semantics.
 - Status: partially handled.
-- Handling: `test/catalog_matrix/catalog_matrix_smoke.py` runs a DDL + DML
-  cursor flow and lease rejection flow across DuckDB, SQLite, and PostgreSQL in
-  CI.
+- Handling: SQL tests, smoke probes, and the user-facing demo CI gates exercise
+  the primary catalog paths. Targeted backend probes should be added when a
+  concrete portability bug appears.
 - Next action: Add targeted backend tests only when a concrete portability bug
   appears or a user-reported workflow depends on it.
 
@@ -32,10 +32,10 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Two readers could process or commit the same consumer window if the
   owner-token lease is wrong.
 - Status: partially handled.
-- Handling: `test/smoke/lease_multiconn_smoke.py`,
-  `test/sql/consumer_state.test`, and the catalog matrix smoke cover
-  same-connection idempotence, second-reader rejection, force release, and
-  stolen-lease commit failure.
+- Handling: `e2e/smoke/lease_multiconn_smoke.py`,
+  `test/consumer_lifecycle.test`, and `test/dml_schema_shape_pinning.test`
+  cover same-connection idempotence, second-reader rejection, force release,
+  and stolen-lease commit failure.
 - Notes: `cdc_consumer_force_release` is only for a holder that is
   demonstrably dead. A longer `lease_interval_seconds` gives long batches more
   room, but also makes dead holders take longer to clear.
@@ -50,8 +50,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled for the SQL extension surface.
 - Handling: `cdc_window` exposes `schema_changes_pending`,
   `cdc_ddl_changes_read` emits typed DDL events, and
-  `test/sql/always_breaks.test` plus
-  `test/sql/ddl_stage2.test` cover schema boundaries and DDL-before-DML
+  `test/always_breaks.test` plus
+  `test/ddl_stage2.test` cover schema boundaries and DDL-before-DML
   ordering.
 - Next action: Revisit when a client library interleaves DDL and DML into one
   stream.
@@ -61,7 +61,7 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Rename, nested-column, or combined schema changes can produce confusing
   or duplicate DDL events.
 - Status: partially handled.
-- Handling: `test/sql/ddl_stage2.test` covers the `snapshots().changes` MAP
+- Handling: `test/ddl_stage2.test` covers the `snapshots().changes` MAP
   source, rename deduplication, snapshot-bound object lookup, and nested-column
   parent/child ordering.
 - Next action: Add examples before adding more exhaustive cross-products. The
@@ -73,8 +73,8 @@ go; this file says what can hurt users or maintainers on the way there.
   maintenance and silently miss changes.
 - Status: handled for the main gap path.
 - Handling: `cdc_window` raises `CDC_GAP`, `cdc_consumer_reset` supports
-  recovery, and `test/smoke/toctou_expire_smoke.py` covers the compaction gap
-  path. Planned stateless range helpers must apply the same explicit gap
+  recovery, and `test/retention_gap.test` covers the compaction gap path.
+  Planned stateless range helpers must apply the same explicit gap
   handling when `from_snapshot` is older than the oldest available snapshot.
 - Next action: Keep operator docs clear that retention must exceed expected
   consumer lag.
@@ -86,12 +86,32 @@ go; this file says what can hurt users or maintainers on the way there.
 - Status: handled by docs and warning.
 - Handling: listen functions emit `CDC_WAIT_SHARED_CONNECTION`, clamp excessive
   timeouts, use level-triggered checks before waiting, and
-  `test/smoke/cdc_wait_interrupt_smoke.py` covers interruptibility.
+  `e2e/smoke/cdc_wait_interrupt_smoke.py` covers interruptibility.
 - Notes: SQL users should hold a dedicated connection for listen calls. Batch
   jobs that wake up on a schedule should call `cdc_window` directly instead of
   long-polling.
+- Known false positive (high-level Python client): `DMLConsumer` and
+  `DDLConsumer` derive and own a dedicated DuckDB connection on
+  `__enter__` (via `lake.connection.cursor()`) and hold it for the
+  consumer's lifetime, so the operator-facing assumption baked into
+  the warning ("you might be sharing this connection") is already
+  false on that code path. The advisory still fires because
+  `MaybeEmitWaitSharedConnectionWarning` in `src/consumer.cpp` is
+  unconditional on first listen per connection -- the extension has
+  no way to introspect that the caller has guaranteed dedication.
+  Operators running `e2e/01_pipeline_dag` see one advisory per stage
+  on startup (3 in v2, growing with stage count); the message is
+  noise, not a problem signal.
 - Next action: Client libraries should hide this by using dedicated wait
-  connections.
+  connections (already done for the high-level Python client). To make
+  the advisory match reality, add a per-connection opt-out the high-
+  level client can set on the dedicated connection it owns -- e.g. a
+  session-local pragma `SET cdc_dedicated_listen_connection = true`
+  that suppresses `MaybeEmitWaitSharedConnectionWarning` for that
+  `connection_id`. Alternative: make the warning conditional on
+  having seen a non-CDC query on the same connection (requires
+  per-connection bookkeeping in the extension and is the heavier
+  fix).
 
 ### H-007: Sink Failure Semantics
 
@@ -120,8 +140,9 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: Early benchmark numbers can be mistaken for production promises.
 - Status: partially handled.
-- Handling: `bench/runner.py`, `bench/light.yaml`, and `bench/README.md`
-  provide smoke-level measurements and explain how to read them.
+- Handling: `e2e/ci_demo_assertions.py` applies conservative performance floors
+  to demos whose story depends on throughput or latency, while docs describe
+  those numbers as smoke signals rather than contracts.
 - Next action: Publish numbers as observations with commit/hardware context;
   avoid hard performance contracts until repeated runs justify them.
 
@@ -142,7 +163,7 @@ go; this file says what can hurt users or maintainers on the way there.
   skip small batches.
 - Status: handled for the extension surface.
 - Handling: The extension's discovery logic checks the inlined keys, and
-  `test/upstream/enumerate_changes_map.py` tracks the observed DuckLake key
+  `e2e/smoke/enumerate_changes_map.py` tracks the observed DuckLake key
   set.
 - Next action: Keep any new discovery/filtering code covered by the upstream
   key probe or a focused SQL test.
@@ -166,7 +187,7 @@ go; this file says what can hurt users or maintainers on the way there.
   `DATA_INLINING_ROW_LIMIT = 100`, but DuckLake's default is 10. That can make
   tests miss the inlined-data path entirely.
 - Status: handled in upstream probes.
-- Handling: `test/upstream/enumerate_changes_map.py` sets
+- Handling: `e2e/smoke/enumerate_changes_map.py` sets
   `DATA_INLINING_ROW_LIMIT = 10` explicitly.
 - Next action: Set `DATA_INLINING_ROW_LIMIT` explicitly in any test that cares
   about inlined-vs-materialized behavior.
@@ -199,10 +220,9 @@ go; this file says what can hurt users or maintainers on the way there.
   a prefixed-table fallback for SQLite. Repeated string fields use portable JSON
   text because SQLite does not preserve DuckDB LIST columns through the scanner
   layer.
-- Notes: DuckDB and SQLite are covered by the catalog matrix smoke. PostgreSQL
-  still needs the same focused probe before this is treated as fully portable.
-- Next action: Extend the backend matrix probe to PostgreSQL and add explicit
-  cleanup/migration coverage for the state tables.
+- Notes: DuckDB and SQLite have focused smoke coverage. PostgreSQL still needs
+  the same focused probe before this is treated as fully portable.
+- Next action: Add explicit cleanup/migration coverage for the state tables.
 
 ### H-016: CDC State and DuckLake Snapshot Atomicity
 
@@ -325,6 +345,18 @@ go; this file says what can hurt users or maintainers on the way there.
     SQLite-backed metadata. Linux, macOS, and Wasm don't error-check
     `std::mutex` re-entry on the same thread, so the same code path
     slides past silently on those platforms.
+  - macOS (libc++/libpthread) has now also been observed surfacing the
+    race during DuckDB's parallel-pipeline teardown: when an exception
+    from inside the bootstrapping query fires while a worker thread is
+    in flight, `std::thread::join` returns either `EDEADLK` (printed
+    `_duckdb.Error: thread::join failed: Resource deadlock avoided`) or
+    `EINVAL` (`thread::join failed: Invalid argument`) depending on
+    which join-state the racing thread reached. Both errno values are
+    surfaces of the same first-bootstrap mutex re-entry — they do not
+    indicate a different bug. Reproduces on inline-DuckDB catalogs by
+    making `cdc_consumer_force_release(<fresh catalog>, <missing
+    consumer>)` the very first cdc_* call against the lake; ~1-in-5
+    attempts on darwin 25.3 / Python 3.14.
   The most plausible shared mutex is inside the auto-loaded DuckLake
   extension's catalog (it owns the attached metadata database and
   sees both the outer read and the inner bootstrap write against it);
@@ -371,6 +403,44 @@ go; this file says what can hurt users or maintainers on the way there.
   DuckDB process for the preceding metadata peek, or open the catalog on an
   already-bootstraped path (`start_at := 'now'` alone did **not** clear the
   failure in MSVC release-matrix logs).
+- Python-client mitigation: `ducklake_cdc_client.retry.retry_on_transient`
+  is the high-level consumers' default retry policy. It treats both
+  `database is locked` (SQLite catalog under contention) and any
+  `thread::join failed: <errno>` (the macOS surfaces of this hazard) as
+  retryable, with a short fixed backoff and a small attempt cap. The second
+  attempt always finds the catalog already bootstrapped, so the racy first-
+  time mutex re-entry doesn't recur. Callers who explicitly want the raw
+  exception can opt out with `retry=ducklake_cdc_client.no_retry`.
+- New finding (May 2026, postgres + populated catalog): the ``retry_on_transient``
+  recovery is **not** sufficient when the H-022 race fires against an
+  already-bootstrapped postgres catalog (e.g. a process that ATTACHes a
+  catalog containing `__ducklake_cdc.*` from a prior run, runs a few
+  `CREATE TABLE IF NOT EXISTS` calls on the lake, then issues
+  `cdc_dml_consumer_create`). On that path the same-connection retry
+  also fails with the same ``thread::join failed`` errno, presumably
+  because the parent ``ClientContext``'s catalog-machinery state is
+  poisoned by the first failed attempt and a fresh internal connection
+  on the same outer context re-enters the same mutex. Empirically reliable
+  workaround: call :func:`ducklake_cdc_client.prewarm` (or construct
+  :class:`ducklake_cdc_client.CDCClient` with default ``prewarm_connection=True``,
+  which runs the same cheap ``cdc_version()`` scalar) on **each** DuckDB
+  handle that will run ``cdc_*`` table functions, **immediately after**
+  ``LOAD ducklake_cdc`` and before any ``CREATE TABLE`` /
+  ``cdc_*_consumer_create`` / ``cdc_consumer_stats`` on that handle. This
+  warms connection-side state; derived cursors that reach CDC first should
+  run :func:`~ducklake_cdc_client.prewarm` on the cursor as well (see
+  ``e2e/_lib/load.py``). ``e2e/_lib/config.py::load_cdc_extension`` uses
+  prewarm on ``lake.connection``. A secondary
+  occurrence pattern -- the parent connection runs N catalog-touching
+  reads (`SELECT count(*) FROM lake.<table>`) and *then* issues a
+  `cdc_consumer_stats('lake')` table function -- still trips the
+  race even after the initial pre-warm; the workaround there is to
+  use a derived cursor (`lake.connection.cursor()`) for the cdc_*
+  call so the catalog-touched cursor and the cdc-call cursor are
+  distinct (`e2e/01_pipeline_dag/inspect_lake.py` and the
+  `DMLConsumer` lease connection both follow this pattern). Both
+  workarounds are example-side; closing the hazard at source still
+  needs the upstream lock-ordering fix the original notes describe.
 - Next action: If we see this hit by a real user outside the
   regression-test pattern, capture an MSVC debug-build stack trace at
   the `std::system_error(resource_deadlock_would_occur)` throw site to

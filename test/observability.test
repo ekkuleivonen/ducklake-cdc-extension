@@ -1,0 +1,87 @@
+# name: test/observability.test
+# description: consumer stats, audit log, and doctor contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/observability.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/observability_data');
+
+statement ok
+CREATE TABLE lake.items(id INTEGER, payload VARCHAR);
+
+statement ok
+INSERT INTO lake.items VALUES (1, 'one');
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'items_obs',
+  table_name := 'items',
+  start_at := 'beginning'
+);
+
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM cdc_consumer_stats('lake'));
+----
+consumer_name	VARCHAR
+consumer_kind	VARCHAR
+consumer_id	BIGINT
+last_committed_snapshot	BIGINT
+current_snapshot	BIGINT
+lag_snapshots	BIGINT
+lag_seconds	DOUBLE
+oldest_available_snapshot	BIGINT
+gap_distance	BIGINT
+subscription_count	BIGINT
+subscriptions_active	BIGINT
+subscriptions_renamed	BIGINT
+subscriptions_dropped	BIGINT
+owner_token	UUID
+owner_acquired_at	TIMESTAMP WITH TIME ZONE
+owner_heartbeat_at	TIMESTAMP WITH TIME ZONE
+lease_interval_seconds	INTEGER
+lease_alive	BOOLEAN
+
+query II
+SELECT count(*) = 1,
+       max(subscription_count) >= 1
+FROM cdc_consumer_stats('lake', consumer := 'items_obs');
+----
+true	true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_audit_events('lake', consumer := 'items_obs', since_seconds := 3600)
+WHERE action = 'consumer_create';
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_doctor('lake')
+WHERE code = 'CDC_METADATA_OK';
+----
+true
+
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM cdc_doctor('lake', consumer := 'items_obs'));
+----
+severity	VARCHAR
+code	VARCHAR
+consumer_name	VARCHAR
+message	VARCHAR
+details	VARCHAR

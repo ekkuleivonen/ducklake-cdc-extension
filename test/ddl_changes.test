@@ -1,0 +1,64 @@
+# name: test/ddl_changes.test
+# description: parsed DDL change query contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ddl_changes.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/ddl_changes_data');
+
+statement ok
+CREATE SCHEMA lake.aux;
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+CREATE TABLE lake.aux.hidden(id INTEGER);
+
+query I
+SELECT count(*) >= 1
+FROM cdc_ddl_changes_query('lake', 0)
+WHERE object_kind = 'table'
+  AND object_name = 'orders';
+----
+true
+
+query I
+SELECT count(*) >= 1
+FROM cdc_ddl_changes_query('lake', 0, schemas := ['aux'])
+WHERE schema_name = 'aux';
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM cdc_ddl_changes_query('lake', 0, schemas := ['aux'])
+WHERE object_name = 'orders';
+----
+true
+
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM cdc_ddl_changes_query('lake', 0, schemas := ['aux']));
+----
+snapshot_id	BIGINT
+snapshot_time	TIMESTAMP WITH TIME ZONE
+event_kind	VARCHAR
+object_kind	VARCHAR
+schema_id	BIGINT
+schema_name	VARCHAR
+object_id	BIGINT
+object_name	VARCHAR
+details	VARCHAR

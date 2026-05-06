@@ -1,0 +1,40 @@
+# Garage S3-compatible object store for local e2e development.
+#
+# Single-tier, single-node, replication_factor=1 -- this is a DEV box, not a
+# production deployment. The rpc_secret and admin tokens below are committed
+# on purpose; this server is only ever reachable on localhost via the ports
+# in e2e/docker-compose.yml. Do not reuse this config or these tokens for
+# anything else.
+#
+# Bootstrap (one-time after `docker compose up`):
+#   ./e2e/setup-garage.sh
+#
+# The bootstrap script prints the env block at the end; paste it into
+# e2e/.env once and examples auto-load it. See e2e/README.md ("Storage
+# backends") for the full flow.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+replication_factor = 1
+compression_level = 2
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+rpc_secret = "4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "dev_admin_token_for_local_use_only"
+metrics_token = "dev_metrics_token"

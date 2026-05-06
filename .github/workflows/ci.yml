@@ -23,12 +23,10 @@ on:
     paths-ignore:
       - 'README.md'
       - 'docs/**'
-      - 'bench/results/**'
   pull_request:
     paths-ignore:
       - 'README.md'
       - 'docs/**'
-      - 'bench/results/**'
   merge_group:
   workflow_dispatch:
 
@@ -110,7 +108,7 @@ jobs:
           make release
           ccache -s
 
-      - name: SQL tests (smoke + default)
+      - name: SQL tests (all sqllogictest files under test/)
         # `make prepare_tests` (a prerequisite of test_release_*) curls the
         # official `ducklake.duckdb_extension` for the pinned DuckDB version
         # into ~/.duckdb/extensions/<version>/<platform>/ so the
@@ -123,15 +121,14 @@ jobs:
 
       - name: Python smoke probes
         run: |
-          uv run --locked python test/smoke/compat_warning_smoke.py
-          uv run --locked python test/smoke/lease_multiconn_smoke.py
-          uv run --locked python test/smoke/cdc_wait_interrupt_smoke.py
-          uv run --locked python test/smoke/toctou_expire_smoke.py
+          uv run --locked python e2e/smoke/compat_warning_smoke.py
+          uv run --locked python e2e/smoke/lease_multiconn_smoke.py
+          uv run --locked python e2e/smoke/cdc_wait_interrupt_smoke.py
 
       # Republish the built ducklake_cdc.duckdb_extension under the same
-      # name the full distribution matrix used to produce, so benchmark.yml
-      # (and any other workflow that wants a binary from a successful CI
-      # run) keeps working without rebuilding from source.
+      # name the full distribution matrix used to produce, so any workflow
+      # that wants a binary from a successful CI run can reuse it without
+      # rebuilding from source.
       - name: Upload linux_amd64 extension artifact
         uses: actions/upload-artifact@v4
         with:
@@ -140,20 +137,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Catalog matrix smoke (DuckDB / SQLite / Postgres)
-        # Phase 2's portability gate: the Phase 1 cursor-loop semantics must
-        # hold against every catalog backend DuckLake supports. The earlier
-        # follow-up flag (post-DDL DML reads returning the OLD schema
-        # against runtime-installed DuckLake) was a Bind-time probe-snapshot
-        # bug — the probe was anchored at `last_committed_snapshot + 1`
-        # instead of mirroring `ReadWindow`'s actual end-snapshot computation,
-        # so the bind could pick the wrong column set when schema boundaries
-        # truncated the runtime range. The probe now mirrors `ReadWindow`
-        # read-only; see `CdcChangesBind` in `src/dml.cpp`.
+      - name: Demo CI gates
         run: |
-          docker compose -f test/catalog_matrix/docker-compose.yml up -d --wait
-          trap 'docker compose -f test/catalog_matrix/docker-compose.yml down -v' EXIT
-          uv run --locked python test/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
+          docker compose -f e2e/docker-compose.yml up -d --wait
+          trap 'docker compose -f e2e/docker-compose.yml down -v' EXIT
+          uv run --project e2e --locked python e2e/ci_demo_assertions.py
 
   upstream-contract-check:
     name: Upstream DuckLake contract check
@@ -170,7 +158,7 @@ jobs:
 
       - name: Check DuckLake changes-map reference
         run: |
-          uv run --locked python test/upstream/enumerate_changes_map.py --check
+          uv run --locked python e2e/smoke/enumerate_changes_map.py --check
 
   ci-pass:
     name: CI Pass

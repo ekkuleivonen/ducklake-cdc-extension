@@ -37,13 +37,11 @@ in-process consumer.
 
 ## Where to read the numbers
 
-The smoke harness lives in `bench/runner.py`, with the first workload
-descriptor in `bench/light.yaml`. The manual benchmark workflow downloads the
-`linux_amd64` extension artifact from a successful CI run (or builds locally),
-executes that descriptor against the supported official DuckDB release, and
-uploads the result JSON as an artifact. Selected baselines can be committed
-under `bench/results/` once there is enough history to make a trajectory
-meaningful.
+The user-facing demos double as the current smoke-level performance checks.
+Each demo can emit a final `--json-summary`, and
+`e2e/ci_demo_assertions.py` applies conservative floors for the tick and DAG
+workloads. Those gates are meant to catch obvious regressions, not publish
+stable benchmark claims.
 
 ## What we are bad at
 
@@ -61,30 +59,6 @@ We are a **poor fit** for:
   reverse ETL but not for cache invalidation in the critical path of a
   user request.
 
-## Python Client-Loop Baseline
-
-The Python demo summary separates responsibility:
-
-- `e2e_p{50,95,99}_ms` (in `e2e_latency_ms`) is the headline latency for
-  fresh insert and update-postimage events: producer emit ➝ delivered to sink.
-- `stage_latency_ms.producer_p95` is the producer-side cost (commit + publish)
-  and `stage_latency_ms.pipeline_p95` is the consumer/extension-owned slice;
-  the two roughly sum to `e2e_p95_ms`.
-- `pipeline_breakdown.extension_listen_ms_p95` /
-  `pipeline_breakdown.python_build_ms_p95` decompose the pipeline by who
-  introduced the time (extension SQL vs. Python materialization).
-- `post_delivery_ms.{sink_p95, extension_commit_p95}` track the user sink
-  callback and `cdc_commit` after sink success — both run *after* the
-  delivery point, so they affect throughput, not e2e latency.
-- `health.rows_excluded_from_e2e` counts preimage and delete rows whose
-  timestamp represents the previous row version, not the current action.
-
-Recent local runs show the single-table path is no longer dominated by the old
-duplicate window resolution. The next performance questions are multi-table
-single-consumer fan-out and multi-consumer catalog pressure. The target API
-captures those as generic consumer-level DML reads/listens plus typed
-single-table reads for application processing.
-
 ## The four axes
 
 Performance discussions on this project always frame against four axes:
@@ -98,23 +72,16 @@ A change that improves one axis at the cost of another is a tradeoff
 worth documenting in commit / PR text. A change that improves all four
 is rare and worth celebrating.
 
-## Current benchmark discipline
+## Current CI discipline
 
-The manual benchmark gate is **"the harness ran and produced a number"**.
-Soft gates print `::warning::` annotations when:
+The CI gate is **"the demos still prove their operating property"**:
 
-- `lag_snapshots_max > 0` over the 60-second light smoke run, or
-- `catalog_qps_avg > 5` (one consumer at default backoff).
+- correctness assertions are hard gates for every demo (`errors=0`,
+  invariants, drained row counts);
+- performance assertions are conservative hard gates only where the demo story
+  depends on them (`04_cache_refresh` tick rate/latency and `05_pipeline_dag`
+  throughput/apply latency).
 
-Latency thresholds are recorded but not gated. The absolute target
-(`p99 < 1s` for the `light` workload) is a design target, not a hard
-contract. The useful discipline for now is "no surprising regression vs.
-previous run for this workload + commit-relative hardware label" — the
-trajectory matters more than the absolute number until the project has enough
-history.
-
-The benchmark workflow already runs after the extension distribution
-matrix by downloading the matrix-built artifact. The likely future regular
-CI gate is a 5-minute `medium` workload on every platform the matrix
-builds and every supported catalog backend available there. Long soaks, heavy
-workloads, and variable-load profiles are not part of the default PR loop.
+The thresholds live in `e2e/ci_demo_assertions.py`. They should move slowly and
+stay intentionally below good local numbers so they catch broken paths rather
+than normal CI variance.

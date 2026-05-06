@@ -43,6 +43,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <sys/select.h>
+#include <unistd.h>
+#endif
+
 namespace duckdb_cdc {
 
 //===--------------------------------------------------------------------===//
@@ -145,6 +151,151 @@ const int64_t ADAPTIVE_LISTEN_TARGET_SNAPSHOTS = 8;
 const int64_t ADAPTIVE_LISTEN_MIN_COALESCE_MS = 5;
 const int64_t ADAPTIVE_LISTEN_MAX_COALESCE_MS = 50;
 const int64_t ADAPTIVE_LISTEN_POLL_MS = 5;
+
+#ifndef _WIN32
+struct LibpqSymbols {
+	void *handle = nullptr;
+	void *(*connectdb)(const char *) = nullptr;
+	int (*status)(void *) = nullptr;
+	void (*finish)(void *) = nullptr;
+	void *(*exec)(void *, const char *) = nullptr;
+	void (*clear)(void *) = nullptr;
+	int (*result_status)(void *) = nullptr;
+	int (*socket)(void *) = nullptr;
+	int (*consume_input)(void *) = nullptr;
+	void *(*notifies)(void *) = nullptr;
+	void (*freemem)(void *) = nullptr;
+	const char *(*error_message)(void *) = nullptr;
+
+	bool Available() const {
+		return handle && connectdb && status && finish && exec && clear && result_status && socket && consume_input &&
+		       notifies && freemem && error_message;
+	}
+};
+
+LibpqSymbols LoadLibpqSymbols() {
+	LibpqSymbols out;
+	const char *candidates[] = {"libpq.dylib",
+	                            "libpq.5.dylib",
+	                            "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
+	                            "/opt/homebrew/lib/libpq.5.dylib",
+	                            "/usr/local/opt/libpq/lib/libpq.5.dylib",
+	                            "libpq.so.5",
+	                            "libpq.so"};
+	for (const auto *candidate : candidates) {
+		out.handle = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
+		if (out.handle) {
+			break;
+		}
+	}
+	if (!out.handle) {
+		return out;
+	}
+	out.connectdb = reinterpret_cast<void *(*)(const char *)>(dlsym(out.handle, "PQconnectdb"));
+	out.status = reinterpret_cast<int (*)(void *)>(dlsym(out.handle, "PQstatus"));
+	out.finish = reinterpret_cast<void (*)(void *)>(dlsym(out.handle, "PQfinish"));
+	out.exec = reinterpret_cast<void *(*)(void *, const char *)>(dlsym(out.handle, "PQexec"));
+	out.clear = reinterpret_cast<void (*)(void *)>(dlsym(out.handle, "PQclear"));
+	out.result_status = reinterpret_cast<int (*)(void *)>(dlsym(out.handle, "PQresultStatus"));
+	out.socket = reinterpret_cast<int (*)(void *)>(dlsym(out.handle, "PQsocket"));
+	out.consume_input = reinterpret_cast<int (*)(void *)>(dlsym(out.handle, "PQconsumeInput"));
+	out.notifies = reinterpret_cast<void *(*)(void *)>(dlsym(out.handle, "PQnotifies"));
+	out.freemem = reinterpret_cast<void (*)(void *)>(dlsym(out.handle, "PQfreemem"));
+	out.error_message = reinterpret_cast<const char *(*)(void *)>(dlsym(out.handle, "PQerrorMessage"));
+	if (!out.Available()) {
+		dlclose(out.handle);
+		out = LibpqSymbols();
+	}
+	return out;
+}
+
+LibpqSymbols &Libpq() {
+	static LibpqSymbols symbols = LoadLibpqSymbols();
+	return symbols;
+}
+
+class PostgresSnapshotListener {
+public:
+	PostgresSnapshotListener(const std::string &dsn, const std::string &channel) {
+		auto &pq = Libpq();
+		if (!pq.Available() || dsn.empty()) {
+			return;
+		}
+		conn = pq.connectdb(dsn.c_str());
+		if (!conn || pq.status(conn) != 0) { // CONNECTION_OK == 0
+			Close();
+			return;
+		}
+		const auto sql = "LISTEN " + QuoteIdentifier(channel);
+		auto result = pq.exec(conn, sql.c_str());
+		if (!result || pq.result_status(result) != 1) { // PGRES_COMMAND_OK == 1
+			if (result) {
+				pq.clear(result);
+			}
+			Close();
+			return;
+		}
+		pq.clear(result);
+		DrainNotifications();
+		ok = true;
+	}
+
+	~PostgresSnapshotListener() {
+		Close();
+	}
+
+	bool Available() const {
+		return ok;
+	}
+
+	bool Wait(int64_t timeout_ms) {
+		if (!ok || timeout_ms <= 0) {
+			return false;
+		}
+		auto &pq = Libpq();
+		const auto fd = pq.socket(conn);
+		if (fd < 0) {
+			return false;
+		}
+		fd_set input;
+		FD_ZERO(&input);
+		FD_SET(fd, &input);
+		timeval timeout;
+		timeout.tv_sec = timeout_ms / 1000;
+		timeout.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+		const auto ready = select(fd + 1, &input, nullptr, nullptr, &timeout);
+		if (ready <= 0) {
+			return false;
+		}
+		if (pq.consume_input(conn) == 0) {
+			return false;
+		}
+		return DrainNotifications();
+	}
+
+private:
+	void *conn = nullptr;
+	bool ok = false;
+
+	bool DrainNotifications() {
+		auto &pq = Libpq();
+		bool got = false;
+		while (auto notification = pq.notifies(conn)) {
+			got = true;
+			pq.freemem(notification);
+		}
+		return got;
+	}
+
+	void Close() {
+		if (conn) {
+			Libpq().finish(conn);
+			conn = nullptr;
+		}
+		ok = false;
+	}
+};
+#endif
 
 //===--------------------------------------------------------------------===//
 // Lease / cache helpers
@@ -289,9 +440,8 @@ StateBackendKind CachedStateBackend(duckdb::ClientContext &context, duckdb::Conn
 bool SupportsUpdateReturning(StateBackendKind backend) {
 	// DuckDB's sqlite_scanner and postgres_scanner currently reject
 	// `UPDATE ... RETURNING` for attached tables, even though both underlying
-	// engines support it natively. `test/catalog_matrix/catalog_matrix_smoke.py`
-	// has a small probe for this so the gate can be widened when scanners learn
-	// to round-trip RETURNING correctly.
+	// engines support it natively. Keep this gate narrow until scanners learn
+	// to round-trip RETURNING correctly for attached tables.
 	return backend == StateBackendKind::DuckDB;
 }
 
@@ -641,6 +791,58 @@ bool ResolveTableByIdAt(duckdb::Connection &conn, const std::string &catalog_nam
 	return true;
 }
 
+bool StartAtMeansBeginning(const std::string &start_at) {
+	const auto lower = duckdb::StringUtil::Lower(start_at);
+	return lower == "beginning" || lower == "oldest" || lower == "oldest_available";
+}
+
+bool ResolveFirstLiveTableById(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
+                               int64_t &snapshot_id, int64_t &schema_id, std::string &qualified_name) {
+	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, s.schema_name || '.' || t.table_name FROM " +
+	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) +
+	                         " AND s.begin_snapshot <= t.begin_snapshot "
+	                         "AND (s.end_snapshot IS NULL OR s.end_snapshot > t.begin_snapshot) "
+	                         "ORDER BY t.begin_snapshot ASC LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
+	    result->GetValue(1, 0).IsNull() || result->GetValue(2, 0).IsNull()) {
+		return false;
+	}
+	snapshot_id = result->GetValue(0, 0).GetValue<int64_t>();
+	schema_id = result->GetValue(1, 0).GetValue<int64_t>();
+	qualified_name = result->GetValue(2, 0).ToString();
+	return true;
+}
+
+bool ResolveFirstLiveTableByName(duckdb::Connection &conn, const std::string &catalog_name,
+                                 const std::string &qualified_name, int64_t &snapshot_id, int64_t &schema_id,
+                                 int64_t &table_id) {
+	const auto dot = qualified_name.find('.');
+	if (dot == std::string::npos) {
+		return ResolveFirstLiveTableByName(conn, catalog_name, std::string("main.") + qualified_name, snapshot_id,
+		                                   schema_id, table_id);
+	}
+	const auto schema_name = qualified_name.substr(0, dot);
+	const auto table_name = qualified_name.substr(dot + 1);
+	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, t.table_id FROM " +
+	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) +
+	                         " AND t.table_name = " + QuoteLiteral(table_name) +
+	                         " AND s.begin_snapshot <= t.begin_snapshot "
+	                         "AND (s.end_snapshot IS NULL OR s.end_snapshot > t.begin_snapshot) "
+	                         "ORDER BY t.begin_snapshot ASC LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
+	    result->GetValue(1, 0).IsNull() || result->GetValue(2, 0).IsNull()) {
+		return false;
+	}
+	snapshot_id = result->GetValue(0, 0).GetValue<int64_t>();
+	schema_id = result->GetValue(1, 0).GetValue<int64_t>();
+	table_id = result->GetValue(2, 0).GetValue<int64_t>();
+	return true;
+}
+
 std::string SubscriptionJsonArray(const std::vector<ResolvedSubscriptionInput> &subscriptions) {
 	std::ostringstream out;
 	out << "[";
@@ -746,13 +948,22 @@ std::vector<ResolvedSubscriptionInput> ResolveDmlCreateSubscriptions(duckdb::Con
 	if (!data.table_id.IsNull()) {
 		table_id = data.table_id.GetValue<int64_t>();
 		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, qualified)) {
-			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
-			                                    static_cast<long long>(table_id));
+			int64_t first_live_snapshot = -1;
+			if (!StartAtMeansBeginning(data.start_at) ||
+			    !ResolveFirstLiveTableById(conn, catalog_name, table_id, first_live_snapshot, schema_id, qualified)) {
+				throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
+				                                    static_cast<long long>(table_id));
+			}
 		}
 	} else {
 		qualified = QualifyTableInput(data.table_name.GetValue<std::string>(), duckdb::Value());
 		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
-			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live", qualified);
+			int64_t first_live_snapshot = -1;
+			if (!StartAtMeansBeginning(data.start_at) ||
+			    !ResolveFirstLiveTableByName(conn, catalog_name, qualified, first_live_snapshot, schema_id, table_id)) {
+				throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live",
+				                                    qualified);
+			}
 		}
 	}
 	std::vector<ResolvedSubscriptionInput> out;
@@ -1828,12 +2039,14 @@ struct ListenWaitData : public duckdb::TableFunctionData {
 	std::string catalog_name;
 	std::string consumer_name;
 	int64_t timeout_ms;
+	int64_t poll_min_ms = WAIT_INITIAL_INTERVAL_MS;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<ListenWaitData>();
 		result->catalog_name = catalog_name;
 		result->consumer_name = consumer_name;
 		result->timeout_ms = timeout_ms;
+		result->poll_min_ms = poll_min_ms;
 		return std::move(result);
 	}
 
@@ -2423,19 +2636,24 @@ duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &c
 	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->timeout_ms = TimeoutMsParameter(input);
+	result->poll_min_ms = PollMinMsParameter(input);
 
-	names = {"snapshot_id"};
-	return_types = {duckdb::LogicalType::BIGINT};
+	names = {"snapshot_id", "snapshot_span"};
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT};
 	return std::move(result);
 }
 
 std::vector<duckdb::Value>
 WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Connection &conn,
                                      const std::string &catalog_name, const std::string &consumer_name,
-                                     int64_t timeout_ms, const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+                                     int64_t timeout_ms, const std::vector<ConsumerSubscriptionRow> &subscriptions,
+                                     int64_t poll_min_ms) {
 	CheckCatalogOrThrow(conn, catalog_name);
 	if (timeout_ms < 0) {
 		throw duckdb::InvalidInputException("listen timeout_ms must be >= 0");
+	}
+	if (poll_min_ms < 0) {
+		throw duckdb::InvalidInputException("listen poll_min_ms must be >= 0");
 	}
 	const auto clamped_timeout_ms = std::min<int64_t>(timeout_ms, HARD_WAIT_TIMEOUT_MS);
 	if (timeout_ms > HARD_WAIT_TIMEOUT_MS) {
@@ -2444,8 +2662,12 @@ WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Con
 	if (clamped_timeout_ms > 0) {
 		MaybeEmitWaitSharedConnectionWarning(context, clamped_timeout_ms);
 	}
-	auto interval_ms = WAIT_INITIAL_INTERVAL_MS;
+	auto interval_ms = std::min<int64_t>(std::max<int64_t>(poll_min_ms, 1), WAIT_MAX_INTERVAL_MS);
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(clamped_timeout_ms);
+#ifndef _WIN32
+	const auto pg_dsn = MetadataBackendIsPostgres(conn, catalog_name) ? PostgresMetadataDsn(conn, catalog_name) : "";
+	PostgresSnapshotListener pg_listener(pg_dsn, SnapshotNotifyChannel(catalog_name));
+#endif
 	while (true) {
 		if (context.interrupted) {
 			throw duckdb::InterruptException();
@@ -2461,7 +2683,14 @@ WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Con
 			return {duckdb::Value()};
 		}
 		const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-		std::this_thread::sleep_for(std::chrono::milliseconds(std::min(interval_ms, remaining_ms)));
+#ifndef _WIN32
+		if (pg_listener.Available()) {
+			pg_listener.Wait(std::min<int64_t>(std::max<int64_t>(remaining_ms, 0), clamped_timeout_ms));
+		} else
+#endif
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(std::min(interval_ms, remaining_ms)));
+		}
 		interval_ms = std::min<int64_t>(interval_ms * 2, WAIT_MAX_INTERVAL_MS);
 	}
 }
@@ -2471,7 +2700,7 @@ std::vector<duckdb::Value> WaitForNextSnapshot(duckdb::ClientContext &context, c
 	ConfigureCdcInternalConnection(conn);
 	const auto subscriptions = LoadConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	return WaitForNextSnapshotWithSubscriptions(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
-	                                            subscriptions);
+	                                            subscriptions, data.poll_min_ms);
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ListenWaitInit(duckdb::ClientContext &context,
@@ -2978,6 +3207,18 @@ int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input) {
 	return entry->second.GetValue<int64_t>();
 }
 
+int64_t PollMinMsParameter(duckdb::TableFunctionBindInput &input) {
+	auto entry = input.named_parameters.find("poll_min_ms");
+	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
+		return WAIT_INITIAL_INTERVAL_MS;
+	}
+	const auto value = entry->second.GetValue<int64_t>();
+	if (value < 0) {
+		throw duckdb::InvalidInputException("listen poll_min_ms must be >= 0");
+	}
+	return value;
+}
+
 std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &context, duckdb::Connection &conn,
                                                     const CdcWindowData &data) {
 	CheckCatalogOrThrow(conn, data.catalog_name);
@@ -3185,19 +3426,23 @@ std::vector<duckdb::Value> CommitConsumerSnapshotWithConnection(duckdb::ClientCo
 }
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
-                                                   const std::string &consumer_name, int64_t timeout_ms) {
+                                                   const std::string &consumer_name, int64_t timeout_ms,
+                                                   int64_t poll_min_ms) {
 	ListenWaitData data;
 	data.catalog_name = catalog_name;
 	data.consumer_name = consumer_name;
 	data.timeout_ms = timeout_ms;
+	data.poll_min_ms = poll_min_ms;
 	return WaitForNextSnapshot(context, data);
 }
 
 std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &context, duckdb::Connection &conn,
                                                       const std::string &catalog_name, const std::string &consumer_name,
                                                       int64_t timeout_ms,
-                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions) {
-	return WaitForNextSnapshotWithSubscriptions(context, conn, catalog_name, consumer_name, timeout_ms, subscriptions);
+                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions,
+                                                      int64_t poll_min_ms) {
+	return WaitForNextSnapshotWithSubscriptions(context, conn, catalog_name, consumer_name, timeout_ms, subscriptions,
+	                                            poll_min_ms);
 }
 
 int64_t AdaptiveListenDelayMs(const std::string &catalog_name, const std::string &consumer_name,

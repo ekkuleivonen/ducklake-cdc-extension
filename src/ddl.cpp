@@ -689,8 +689,8 @@ std::string BuildCreatedViewDetails(duckdb::Connection &conn, const std::string 
 //! either an unquoted qualified name (`schema.table` for tables/views,
 //! `schema` for schemas) or the stringified `<id>` for kinds that
 //! reference catalog rows by id. Per the upstream probe in
-//! `test/upstream/enumerate_changes_map.py` (committed JSONs in
-//! `test/upstream/output/`), all three DuckLake catalog backends
+//! `e2e/smoke/enumerate_changes_map.py` (committed JSONs in
+//! `e2e/smoke/output/`), all three DuckLake catalog backends
 //! (DuckDB, SQLite, Postgres) emit identical MAP key sets for every
 //! DDL operation, so this dispatcher is backend-agnostic by
 //! construction. ADR 0008 makes the MAP form the canonical Stage-1
@@ -916,7 +916,7 @@ void ApplyDdlTableFilter(std::vector<std::vector<duckdb::Value>> &rows, size_t b
 //! rows for every recognised MAP key. Replaces the prior text-token
 //! scan of `__ducklake_metadata_<lake>.ducklake_snapshot_changes.changes_made`
 //! for cdc_ddl_changes_read / cdc_ddl_changes_query. Backend-agnostic (the upstream probe in
-//! `test/upstream/output/` confirms all three DuckLake backends emit
+//! `e2e/smoke/output/` confirms all three DuckLake backends emit
 //! identical MAP key sets); future-proof against the comma-separated
 //! text format moving.
 void ExtractDdlRows(duckdb::Connection &conn, const std::string &catalog_name, int64_t start_snapshot,
@@ -1032,6 +1032,7 @@ struct CdcDdlData : public duckdb::TableFunctionData {
 	bool auto_commit = false;
 	bool listen = false;
 	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
+	int64_t poll_min_ms = WAIT_INITIAL_INTERVAL_MS;
 	bool explicit_window = false;
 	int64_t start_snapshot = -1;
 	int64_t end_snapshot = -1;
@@ -1045,6 +1046,7 @@ struct CdcDdlData : public duckdb::TableFunctionData {
 		result->auto_commit = auto_commit;
 		result->listen = listen;
 		result->timeout_ms = timeout_ms;
+		result->poll_min_ms = poll_min_ms;
 		result->explicit_window = explicit_window;
 		result->start_snapshot = start_snapshot;
 		result->end_snapshot = end_snapshot;
@@ -1100,6 +1102,7 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcDdlBindBase(duckdb::ClientContext &c
 	result->listen = listen;
 	result->ticks = ticks;
 	result->timeout_ms = DdlTimeoutMsParameter(input);
+	result->poll_min_ms = PollMinMsParameter(input);
 	auto auto_commit_entry = input.named_parameters.find("auto_commit");
 	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
 		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
@@ -1244,7 +1247,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	auto &data = input.bind_data->Cast<CdcDdlData>();
 	auto max_snapshots = data.max_snapshots;
 	if (data.listen && !data.explicit_window) {
-		auto ready = WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms);
+		auto ready =
+		    WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms, data.poll_min_ms);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}
@@ -1872,6 +1876,7 @@ void RegisterDdlFunctions(duckdb::ExtensionLoader &loader) {
 		ddl_function.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
 		ddl_function.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;
 		ddl_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		ddl_function.named_parameters["poll_min_ms"] = duckdb::LogicalType::BIGINT;
 		ddl_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(ddl_function);
 	}

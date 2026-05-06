@@ -1,0 +1,38 @@
+[project]
+name = "ducklake-cdc-e2e"
+version = "0.0.0"
+description = "End-to-end use-case examples and shared lib for the ducklake-cdc extension"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb==1.5.2",
+    "ducklake-client>=0.5.1",
+    "ducklake-cdc-client>=0.5.1",
+    "psycopg[binary]>=3.3.3",
+    # Live dashboards across all examples. See _lib/README.md for the rationale
+    # (use a library, do not hand-roll). `rich` is small, no event loop required,
+    # renders cleanly to non-TTY under --headless.
+    "rich>=13.7",
+    # Reserved for future sink examples that publish into Redis Streams.
+    "redis>=5.0",
+    # Lightweight HTTP probes/helpers for examples that need them.
+    "httpx>=0.27",
+    # ``--storage s3`` hermetic resets. DuckDB's httpfs handles read/write
+    # but not delete-by-prefix, so the per-example reset path uses boto3
+    # to LIST + DELETE under the per-example prefix. Same client works
+    # against Garage (local-dev default) and any real AWS-S3 bucket.
+    "boto3>=1.35",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 160
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["UP047"]

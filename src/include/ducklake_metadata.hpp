@@ -91,6 +91,9 @@ std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::stri
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema);
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name);
 std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name);
+std::string SnapshotNotifyChannel(const std::string &catalog_name);
+bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &catalog_name);
+std::string PostgresMetadataDsn(duckdb::Connection &conn, const std::string &catalog_name);
 
 //===--------------------------------------------------------------------===//
 // Snapshot fact lookups

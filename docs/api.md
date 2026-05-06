@@ -295,10 +295,13 @@ DML consumers do not dynamically subscribe to future tables through schema or
 catalog filters. That policy belongs in application code, usually driven by a
 separate DDL consumer.
 
-Name input is resolved at `start_at` and persisted as `table_id`. The
-table subscription follows the same `table_id` across renames. Drop +
-recreate with the same name is a new identity and requires a new
-subscription/consumer.
+Name input is resolved at `start_at` and persisted as `table_id`. For
+`start_at := 'beginning'`, `'oldest'`, or `'oldest_available'`, DML creation
+resolves `table_name` / `table_id` at the table's first live snapshot while
+leaving the consumer cursor at the requested beginning snapshot, so a consumer
+can be created directly over existing physical history. The table subscription
+follows the same `table_id` across renames. Drop + recreate with the same name
+is a new identity and requires a new subscription/consumer.
 
 DML consumers are pinned to the schema shape of their subscribed table at
 creation time. The shape is implicit: it is whatever shape applies at
@@ -522,12 +525,19 @@ FROM cdc_ddl_changes_listen(
   name,
   timeout_ms    := 30000,
   max_snapshots := 100,
+  poll_min_ms   := 50,
   auto_commit   := FALSE
 );
 ```
 
 Waits until DDL changes matching the consumer are available or the deadline is
 reached, then returns parsed DDL changes.
+
+`poll_min_ms` controls the initial polling interval for backends without an
+event wakeup path (or when the wakeup path is unavailable). The interval
+backs off exponentially after each empty probe. PostgreSQL catalogs use the
+snapshot `LISTEN`/`NOTIFY` fast path when available and fall back to this
+polling loop otherwise.
 
 `auto_commit := TRUE` advances the cursor after the extension produces the rows.
 It is useful for dashboards and best-effort consumers, but not the safe default
@@ -580,6 +590,7 @@ FROM cdc_ddl_ticks_listen(
   name,
   timeout_ms    := 30000,
   max_snapshots := 100,
+  poll_min_ms   := 50,
   auto_commit   := FALSE
 );
 ```
@@ -651,12 +662,21 @@ FROM cdc_dml_changes_listen(
   name,
   timeout_ms    := 30000,
   max_snapshots := 100,
+  poll_min_ms   := 50,
   auto_commit   := FALSE
 );
 ```
 
 Waits until DML rows for the consumer's pinned table are available or the
 deadline is reached, then returns typed DML rows.
+
+`poll_min_ms` has the same meaning as for `cdc_ddl_changes_listen`: it tunes
+the fallback polling loop; PostgreSQL catalogs use the snapshot notification
+fast path when available.
+
+`"coalesce" := TRUE` lets the extension briefly delay repeated small DML listen
+results during bursts so more snapshots can be returned in one window. Set it
+to `FALSE` for workloads that prefer the first matching snapshot immediately.
 
 Returns the same variable row shape as `cdc_dml_changes_read`.
 
@@ -715,11 +735,14 @@ FROM cdc_dml_ticks_listen(
   name,
   timeout_ms    := 30000,
   max_snapshots := 100,
+  poll_min_ms   := 50,
+  "coalesce"    := TRUE,
   auto_commit   := FALSE
 );
 ```
 
 Waits for DML-relevant snapshot ticks and returns snapshot/table metadata only.
+`"coalesce"` has the same meaning as for `cdc_dml_changes_listen`.
 
 Returns the same row shape as `cdc_dml_ticks_read`.
 
@@ -749,10 +772,6 @@ snapshot_id BIGINT
 snapshot_time TIMESTAMPTZ
 schema_version BIGINT
 table_ids BIGINT[]
-insert_count BIGINT
-update_count BIGINT
-delete_count BIGINT
-change_count BIGINT
 ```
 
 ---

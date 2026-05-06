@@ -1,0 +1,75 @@
+# name: test/retention_gap.test
+# description: CDC_GAP and reset recovery after DuckLake snapshot expiry
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/retention_gap.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/retention_gap_data');
+
+statement ok
+CREATE TABLE lake.toctou(id INTEGER);
+
+statement ok
+INSERT INTO lake.toctou VALUES (1);
+
+statement ok
+INSERT INTO lake.toctou VALUES (2);
+
+statement ok
+INSERT INTO lake.toctou VALUES (3);
+
+statement ok
+SET VARIABLE expire_snapshot = (
+  SELECT snapshot_id FROM lake.snapshots() ORDER BY snapshot_id LIMIT 1 OFFSET 0
+);
+
+statement ok
+SET VARIABLE pin_snapshot = (
+  SELECT snapshot_id FROM lake.snapshots() ORDER BY snapshot_id LIMIT 1 OFFSET 1
+);
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'toctou',
+  table_name := 'toctou',
+  start_at := getvariable('pin_snapshot')::VARCHAR
+);
+
+query I
+SELECT has_changes
+FROM cdc_window('lake', 'toctou');
+----
+true
+
+statement ok
+CALL ducklake_expire_snapshots(
+  'lake',
+  versions => [getvariable('expire_snapshot'), getvariable('pin_snapshot')]
+);
+
+statement error
+SELECT * FROM cdc_window('lake', 'toctou');
+----
+CDC_GAP
+
+statement ok
+SELECT * FROM cdc_consumer_reset('lake', 'toctou');
+
+query I
+SELECT count(*)
+FROM cdc_window('lake', 'toctou');
+----
+1
