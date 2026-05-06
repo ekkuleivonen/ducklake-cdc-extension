@@ -1,5 +1,16 @@
 # E2E Benchmark
 
+> **Being replaced.** This synthetic benchmark harness is being superseded by
+> the use-case examples at `e2e/01_pipeline_dag/`, `e2e/03_publish_redis/`,
+> etc. Each example will carry its own `--mode bench` so perf characterization
+> happens through the real use cases, not a synthetic shape.
+>
+> This directory stays runnable until the examples carry equivalent bench
+> coverage. The 6 workload YAMLs (`light/throughput/latency/mutation_heavy/
+> fanout/bursty`) and the synthetic load generator in `producer.py` will be
+> migrated to `e2e/_lib/load.py` as part of building example 01. After that,
+> this directory is removed.
+
 This benchmark runs the published Python packages (`ducklake-client` and
 `ducklake-cdc-client`) against a locally built `ducklake_cdc` extension artifact.
 It preserves the former Python demo's analytics summary and live dashboard, but

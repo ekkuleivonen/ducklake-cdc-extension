@@ -1,0 +1,40 @@
+[project]
+name = "ducklake-cdc-e2e"
+version = "0.0.0"
+description = "End-to-end use-case examples and shared lib for the ducklake-cdc extension"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb==1.5.2",
+    "ducklake-client>=0.1.2",
+    "ducklake-cdc-client>=0.1.0",
+    "psycopg[binary]>=3.3.3",
+    # Live dashboards across all examples. See _lib/README.md for the rationale
+    # (use a library, do not hand-roll). `rich` is small, no event loop required,
+    # renders cleanly to non-TTY under --headless.
+    "rich>=13.7",
+    # 03_publish_redis: redis>=5.0 supports Streams natively
+    "redis>=5.0",
+    # 02_ticks: tiny embedded HTTP/SSE server for the browser-tab demo
+    "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+# Local sibling clients win over PyPI so an example demos against in-flight
+# client changes without a release dance. Comment out (and `uv lock`) to
+# re-pin to PyPI.
+[tool.uv.sources]
+ducklake-cdc-client = { path = "../../ducklake-cdc-python-client", editable = true }
+ducklake-client = { path = "../../ducklake-python-client", editable = true }
+
+[tool.ruff]
+line-length = 160
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["UP047"]

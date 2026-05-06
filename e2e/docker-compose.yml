@@ -1,15 +1,25 @@
-# E2E stack: Postgres + PgBouncer for high-connection benchmark runs, one DB for all probes.
+# E2E stack:
+#   - Postgres + PgBouncer for the DuckLake catalog (used by every example).
+#   - Garage for an S3-compatible object store backing examples that opt in
+#     with --storage s3. Garage is bootstrapped once via e2e/garage/setup-garage.sh.
+#
+# Examples will add more services as they are built (Redis for 03_publish_redis,
+# a serving Postgres for 05_reverse_etl).
 #
 # Usage:
 #   docker compose -f e2e/docker-compose.yml up -d --wait
-#   uv run --project e2e/benchmark python e2e/benchmark/runner.py
+#   ./e2e/setup-garage.sh                         # one-time, writes credentials
+#   uv run --project e2e python e2e/01_pipeline_dag/app.py
 #   uv run python e2e/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
 #   uv run python e2e/upstream/enumerate_changes_map.py --check
 #   docker compose -f e2e/docker-compose.yml down -v
 #
 # Ports:
-#   5435 -> PgBouncer (DuckLake benchmark catalog traffic; pool many clients -> few server conns)
+#   5435 -> PgBouncer       (DuckLake catalog traffic; pool many clients -> few server conns)
 #   5436 -> Postgres direct (compose health, catalog admin/reset, catalog-matrix + upstream smoke)
+#   3900 -> Garage S3 API   (used when an example is run with --storage s3)
+#   3902 -> Garage web      (static files; not used by examples; handy for poking around)
+#   3903 -> Garage admin    (key/bucket management; used by setup-garage.sh)
 
 services:
   postgres:
@@ -42,5 +52,19 @@ services:
       - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
       - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
 
+  garage:
+    image: dxflrs/garage:v2.0.0
+    container_name: dlcdc-e2e-garage
+    restart: unless-stopped
+    ports:
+      - "3900:3900"   # S3 API
+      - "3903:3903"   # admin (used by setup-garage.sh)
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+
 volumes:
   postgres-data:
+  garage-meta:
+  garage-data:

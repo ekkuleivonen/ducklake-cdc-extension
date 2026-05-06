@@ -35,12 +35,16 @@ e2e/benchmark/results/*.json
 *.sqlite-shm
 demo_*_data/
 
+# Each example's headless run writes a metrics JSON here per (example, catalog, storage).
+.results/
+
 # Local path-dev symlinks (e.g. `ducklake_client` -> ../ducklake-python-client); not used by CI.
 .deps/
 
-# Local secrets shared by `e2e/docker-compose.yml` and the benchmark
-# (DUCKLAKE_BENCHMARK_S3_*, etc). Never commit. Use `e2e/.env.example`
-# for the template if you want one tracked.
+# Local secrets shared by `e2e/docker-compose.yml` and the e2e examples
+# (S3_* from setup-garage.sh, DUCKLAKE_BENCHMARK_S3_* from the legacy
+# benchmark, etc). Never commit. Use `e2e/.env.example` for the template
+# if you want one tracked.
 .env
 *.env
 !*.env.example
