@@ -14,7 +14,7 @@ and lightweight wakeups for systems that re-read from DuckLake.
 | # | folder | story | status |
 |---|--------|-------|--------|
 | 01 | `01_schema_safe_consumer/` | Stop DML at schema boundaries, process DDL, migrate, then resume safely. | Spec only |
-| 02 | `02_incremental_materialized_view/` | Maintain derived DuckLake tables incrementally instead of rescanning. | Spec only |
+| 02 | `02_incremental_materialized_view/` | Maintain derived DuckLake tables incrementally instead of rescanning. | Runnable |
 | 03 | `03_backfill_live_catchup/` | Start at snapshot 0, process history, then switch into live listen mode. | Spec only |
 | 04 | `04_cache_refresh/` | Use metadata-only ticks to refresh caches, search indexes, or vector indexes. | Runnable |
 | 05 | `05_pipeline_dag/` | Run a multi-stage lakehouse DAG with durable CDC cursors. | Runnable |
@@ -30,11 +30,11 @@ application built on the primitives looks like.
 docker compose -f e2e/docker-compose.yml up -d --wait
 make release
 
-# Runnable today: cache/search refresh ticks
-uv run --project e2e python e2e/04_cache_refresh/app.py --headless --duration 30
+# Runnable today: schema-safe consumer
+uv run --project e2e python e2e/01_schema_safe_consumer/app.py --headless
 
-# Runnable today: multi-stage CDC DAG
-uv run --project e2e python e2e/05_pipeline_dag/app.py --headless --duration 30
+# Runnable today: incremental materialized view
+uv run --project e2e python e2e/02_incremental_materialized_view/app.py --headless
 ```
 
 Most examples support the shared flags:
@@ -53,7 +53,7 @@ DuckLake's catalog backend matters more than these demos should hide.
 | example | duckdb | sqlite | postgres | notes |
 |---------|--------|--------|----------|-------|
 | 01 schema-safe consumer | yes | no | yes | Demonstrates sink-write + `cdc_commit` transaction; SQLite lock behavior distracts from the schema story. |
-| 02 incremental materialized view | yes | yes | yes | Single-process first; Postgres for concurrent writers. |
+| 02 incremental materialized view | yes | no | yes | Demonstrates aggregate update + `cdc_commit` transaction; SQLite lock behavior distracts from the incremental-maintenance story. |
 | 03 backfill/live catchup | yes | yes | yes | Backfill is bounded reads; listen mode follows catalog limits. |
 | 04 cache refresh | yes | yes | yes | Postgres gets `LISTEN`/`NOTIFY`; others poll. |
 | 05 pipeline DAG | no | no | yes | Five concurrent writers; embedded/file catalogs contend too hard. |
