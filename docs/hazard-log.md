@@ -377,15 +377,22 @@ go; this file says what can hurt users or maintainers on the way there.
   hazard). It does not close the outer-conn ↔ inner-conn handoff, which
   requires upstream (DuckDB + DuckLake) lock-ordering work to fix
   in-source.
-- Handling (release matrix — temporary): Windows MSVC (`DUCKDB_PLATFORM
-  == windows_amd64`) does not export `CDC_RUN_H022_SENSITIVE_TESTS`.
-  That file gates on `require-env CDC_RUN_H022_SENSITIVE_TESTS`, so it
-  is skipped entirely on that triplet until stabilisation captures an
-  MSVC stack trace at the throw site and fixes the mutex ordering.
-  The extension root `Makefile` exports `CDC_RUN_H022_SENSITIVE_TESTS
-  := 1` on every other platform CI matrix entry; local `make
-  test_release` thus runs the regression unchanged. Developers who run
-  `unittest` manually without Make must export
+- Handling (release matrix — temporary): release automation passes
+  `skip_tests: true` to DuckDB's full extension distribution matrix.
+  That matrix remains the gate that every shipped binary builds, while
+  day-to-day PR CI on Linux remains the SQL test gate. This avoids
+  blocking releases on Windows release-triplet surfaces of this hazard,
+  including MinGW's `Resource deadlock avoided` during
+  `cdc_dml_consumer_create`. Local `make test_release` and Linux PR CI
+  still run the regression unchanged.
+- Handling (targeted regression gate — temporary): Windows MSVC
+  (`DUCKDB_PLATFORM == windows_amd64`) still does not export
+  `CDC_RUN_H022_SENSITIVE_TESTS`. `dml_schema_shape_pinning.test` gates
+  on `require-env CDC_RUN_H022_SENSITIVE_TESTS`, so it is skipped on
+  that triplet until stabilisation captures an MSVC stack trace at the
+  throw site and fixes the mutex ordering. The extension root `Makefile`
+  exports `CDC_RUN_H022_SENSITIVE_TESTS := 1` on every other platform;
+  developers who run `unittest` manually without Make must export
   `CDC_RUN_H022_SENSITIVE_TESTS=1` on non MSVC-Windows hosts. The test
   body keeps `SET VARIABLE x = (SELECT max(snapshot_id) FROM
   __ducklake_metadata_<catalog>.ducklake_snapshot)` + `start_at :=
