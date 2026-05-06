@@ -579,6 +579,15 @@ bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &cata
 	return type == "postgres" || type == "postgres_scanner";
 }
 
+std::string PostgresMetadataDsn(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto result = conn.Query("SELECT path FROM duckdb_databases() WHERE database_name = " +
+	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
 void PostgresExecuteBestEffort(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
 	auto result = conn.Query("CALL postgres_execute(" + QuoteLiteral("__ducklake_metadata_" + catalog_name) + ", " +
 	                         QuoteLiteral(sql) + ")");

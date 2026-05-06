@@ -48,6 +48,8 @@ struct DmlTicksData : public duckdb::TableFunctionData {
 	bool auto_commit = false;
 	bool listen = false;
 	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
+	int64_t poll_min_ms = WAIT_INITIAL_INTERVAL_MS;
+	bool coalesce = true;
 	bool explicit_window = false;
 	int64_t start_snapshot = -1;
 	int64_t end_snapshot = -1;
@@ -65,6 +67,8 @@ struct DmlTicksData : public duckdb::TableFunctionData {
 		result->auto_commit = auto_commit;
 		result->listen = listen;
 		result->timeout_ms = timeout_ms;
+		result->poll_min_ms = poll_min_ms;
+		result->coalesce = coalesce;
 		result->explicit_window = explicit_window;
 		result->start_snapshot = start_snapshot;
 		result->end_snapshot = end_snapshot;
@@ -202,18 +206,13 @@ void DmlTicksReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types, duck
 		names.clear();
 		return_types.clear();
 	}
-	for (const auto &name : {"snapshot_id", "snapshot_time", "schema_version", "table_ids", "insert_count",
-	                         "update_count", "delete_count", "change_count"}) {
+	for (const auto &name : {"snapshot_id", "snapshot_time", "schema_version", "table_ids"}) {
 		names.push_back(name);
 	}
 	return_types.push_back(duckdb::LogicalType::BIGINT);
 	return_types.push_back(duckdb::LogicalType::TIMESTAMP_TZ);
 	return_types.push_back(duckdb::LogicalType::BIGINT);
 	return_types.push_back(duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT));
-	return_types.push_back(duckdb::LogicalType::BIGINT);
-	return_types.push_back(duckdb::LogicalType::BIGINT);
-	return_types.push_back(duckdb::LogicalType::BIGINT);
-	return_types.push_back(duckdb::LogicalType::BIGINT);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> DmlTicksBindBase(duckdb::ClientContext &context,
@@ -229,6 +228,11 @@ duckdb::unique_ptr<duckdb::FunctionData> DmlTicksBindBase(duckdb::ClientContext 
 	result->max_snapshots = MaxSnapshotsParameter(input);
 	result->listen = listen;
 	result->timeout_ms = TimeoutMsParameter(input);
+	result->poll_min_ms = PollMinMsParameter(input);
+	auto coalesce_entry = input.named_parameters.find("coalesce");
+	if (coalesce_entry != input.named_parameters.end() && !coalesce_entry->second.IsNull()) {
+		result->coalesce = coalesce_entry->second.GetValue<bool>();
+	}
 	auto auto_commit_entry = input.named_parameters.find("auto_commit");
 	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
 		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
@@ -282,14 +286,9 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID, rows ? rows->GetError() : "DML ticks scan failed");
 	}
 	for (duckdb::idx_t i = 0; i < rows->RowCount(); ++i) {
-		const auto snapshot_id = rows->GetValue(0, i).GetValue<int64_t>();
 		const auto changes_value = rows->GetValue(3, i);
 		const auto changes = changes_value.IsNull() ? std::string() : changes_value.ToString();
 		std::unordered_set<int64_t> touched_table_ids;
-		std::unordered_set<int64_t> counted_table_ids;
-		int64_t insert_count = 0;
-		int64_t update_count = 0;
-		int64_t delete_count = 0;
 		for (const auto &token : SplitEventTokens(changes)) {
 			int64_t table_id = 0;
 			std::string change_type;
@@ -299,18 +298,11 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
 			if (filter_table_ids != nullptr && filter_table_ids->count(table_id) == 0) {
 				continue;
 			}
-			const auto qualified = CurrentQualifiedTableName(conn, catalog_name, table_id, snapshot_id);
-			if (qualified.empty()) {
-				continue;
-			}
-			int64_t schema_id = 0;
-			int64_t ignored_table = 0;
-			ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, ignored_table);
 			if (subscriptions != nullptr) {
 				bool covered = false;
 				for (const auto &subscription : *subscriptions) {
-					if (subscription.event_category == "dml" &&
-					    SubscriptionCoversTable(subscription, schema_id, table_id, "dml")) {
+					if (subscription.event_category == "dml" && subscription.scope_kind == "table" &&
+					    !subscription.table_id.IsNull() && subscription.table_id.GetValue<int64_t>() == table_id) {
 						covered = true;
 						break;
 					}
@@ -320,42 +312,6 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
 				}
 			}
 			touched_table_ids.insert(table_id);
-			if (!counted_table_ids.insert(table_id).second) {
-				continue;
-			}
-			std::vector<std::string> counted_change_types = {"insert", "update_preimage", "update_postimage", "delete"};
-			if (subscriptions != nullptr) {
-				counted_change_types = MatchingDmlChangeTypes(*subscriptions, schema_id, table_id);
-			}
-			std::ostringstream type_filter;
-			if (!counted_change_types.empty()) {
-				type_filter << " WHERE change_type IN (";
-				for (size_t type_idx = 0; type_idx < counted_change_types.size(); ++type_idx) {
-					if (type_idx > 0) {
-						type_filter << ", ";
-					}
-					type_filter << QuoteLiteral(counted_change_types[type_idx]);
-				}
-				type_filter << ")";
-			}
-			auto counts = conn.Query("SELECT change_type, count(*) FROM " +
-			                         DuckLakeTableChangesCall(catalog_name, qualified, snapshot_id, snapshot_id) +
-			                         type_filter.str() + " GROUP BY change_type");
-			if (!counts || counts->HasError()) {
-				throw duckdb::Exception(duckdb::ExceptionType::INVALID,
-				                        counts ? counts->GetError() : "DML tick count scan failed");
-			}
-			for (duckdb::idx_t count_idx = 0; count_idx < counts->RowCount(); ++count_idx) {
-				const auto counted_type = counts->GetValue(0, count_idx).ToString();
-				const auto counted_rows = counts->GetValue(1, count_idx).GetValue<int64_t>();
-				if (counted_type == "insert") {
-					insert_count += counted_rows;
-				} else if (counted_type == "update_preimage" || counted_type == "update_postimage") {
-					update_count += counted_rows;
-				} else if (counted_type == "delete") {
-					delete_count += counted_rows;
-				}
-			}
 		}
 		if (touched_table_ids.empty()) {
 			continue;
@@ -372,10 +328,6 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
 		row.push_back(rows->GetValue(1, i));
 		row.push_back(rows->GetValue(2, i));
 		row.push_back(BigIntListValue(table_ids));
-		row.push_back(duckdb::Value::BIGINT(insert_count));
-		row.push_back(duckdb::Value::BIGINT(update_count));
-		row.push_back(duckdb::Value::BIGINT(delete_count));
-		row.push_back(duckdb::Value::BIGINT(insert_count + update_count + delete_count));
 		out.push_back(std::move(row));
 	}
 }
@@ -390,12 +342,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> DmlTicksInit(duckdb::Client
 	const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 	if (data.listen && !data.explicit_window) {
 		auto ready = WaitForDmlConsumerSnapshot(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
-		                                        subscriptions);
+		                                        subscriptions, data.poll_min_ms);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}
-		MaybeCoalesceConsumerListenWithConnection(context, conn, data.catalog_name, data.consumer_name, "dml_ticks",
-		                                          data.timeout_ms, max_snapshots, ready[0].GetValue<int64_t>());
+		if (data.coalesce) {
+			MaybeCoalesceConsumerListenWithConnection(context, conn, data.catalog_name, data.consumer_name, "dml_ticks",
+			                                          data.timeout_ms, max_snapshots, ready[0].GetValue<int64_t>());
+		}
 		if (ready.size() > 1 && !ready[1].IsNull()) {
 			max_snapshots = std::max<int64_t>(max_snapshots, ready[1].GetValue<int64_t>());
 		}
@@ -494,6 +448,8 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 	bool auto_commit = false;
 	bool listen = false;
 	int64_t timeout_ms = DEFAULT_WAIT_TIMEOUT_MS;
+	int64_t poll_min_ms = WAIT_INITIAL_INTERVAL_MS;
+	bool coalesce = true;
 	// Column names + types belonging to the underlying DuckLake table (the
 	// `<table cols>` segment of `table_changes(...)` output, after the
 	// fixed `(snapshot_id, rowid, change_type)` prefix). Discovered during
@@ -518,6 +474,8 @@ struct CdcChangesData : public duckdb::TableFunctionData {
 		result->auto_commit = auto_commit;
 		result->listen = listen;
 		result->timeout_ms = timeout_ms;
+		result->poll_min_ms = poll_min_ms;
+		result->coalesce = coalesce;
 		result->table_column_names = table_column_names;
 		result->table_column_types = table_column_types;
 		return std::move(result);
@@ -727,6 +685,11 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->listen = listen;
 	result->timeout_ms = TimeoutMsParameter(input);
+	result->poll_min_ms = PollMinMsParameter(input);
+	auto coalesce_entry = input.named_parameters.find("coalesce");
+	if (coalesce_entry != input.named_parameters.end() && !coalesce_entry->second.IsNull()) {
+		result->coalesce = coalesce_entry->second.GetValue<bool>();
+	}
 	auto auto_commit_entry = input.named_parameters.find("auto_commit");
 	if (auto_commit_entry != input.named_parameters.end() && !auto_commit_entry->second.IsNull()) {
 		result->auto_commit = auto_commit_entry->second.GetValue<bool>();
@@ -902,12 +865,15 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 	                               : std::vector<ConsumerSubscriptionRow>();
 	if (data.listen && !data.explicit_window) {
 		auto ready = WaitForDmlConsumerSnapshot(context, conn, data.catalog_name, data.consumer_name, data.timeout_ms,
-		                                        subscriptions);
+		                                        subscriptions, data.poll_min_ms);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}
-		MaybeCoalesceConsumerListenWithConnection(context, conn, data.catalog_name, data.consumer_name, "dml_changes",
-		                                          data.timeout_ms, max_snapshots, ready[0].GetValue<int64_t>());
+		if (data.coalesce) {
+			MaybeCoalesceConsumerListenWithConnection(context, conn, data.catalog_name, data.consumer_name,
+			                                          "dml_changes", data.timeout_ms, max_snapshots,
+			                                          ready[0].GetValue<int64_t>());
+		}
 		if (ready.size() > 1 && !ready[1].IsNull()) {
 			max_snapshots = std::max<int64_t>(max_snapshots, ready[1].GetValue<int64_t>());
 		}
@@ -1288,6 +1254,8 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		    RowScanExecute, bind, DmlTicksInit);
 		events_function.named_parameters["max_snapshots"] = duckdb::LogicalType::BIGINT;
 		events_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		events_function.named_parameters["poll_min_ms"] = duckdb::LogicalType::BIGINT;
+		events_function.named_parameters["coalesce"] = duckdb::LogicalType::BOOLEAN;
 		events_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(events_function);
 	}
@@ -1305,6 +1273,8 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		changes_function.named_parameters["start_snapshot"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["end_snapshot"] = duckdb::LogicalType::BIGINT;
 		changes_function.named_parameters["timeout_ms"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["poll_min_ms"] = duckdb::LogicalType::BIGINT;
+		changes_function.named_parameters["coalesce"] = duckdb::LogicalType::BOOLEAN;
 		changes_function.named_parameters["auto_commit"] = duckdb::LogicalType::BOOLEAN;
 		loader.RegisterFunction(changes_function);
 	}

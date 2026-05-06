@@ -1,142 +1,107 @@
 # 02 &mdash; Low-latency ticks
 
-> *"Sub-50&nbsp;ms change-tap that doesn't move bytes."*
-
-A consumer that wakes on every new snapshot, sends a tiny notification
-("snapshot N is here for table T"), and **never reads the row payload**. The
-recipient (a cache, a CDN, a microservice, a browser tab) re-reads its own
-data when it cares to. Data isn't shuffled twice.
-
-This is the latency-floor demo. It exists to prove a specific claim:
-*"DuckLake CDC can notify a downstream system within milliseconds of a commit
-without ever materializing the changes inside the CDC consumer."*
-
-## API surface used
-
-- `cdc_dml_consumer_create` &mdash; per watched table
-- `cdc_window` &mdash; metadata-only snapshot probe (the **only** read on the
-  hot path; no `cdc_dml_changes_read` ever called)
-- `cdc_commit` &mdash; cursor advance after the notification is acknowledged
-
-Notifications themselves go out over Server-Sent Events to a tiny HTML page.
-SSE is the demo transport; the same shape works with WebSockets, Redis Pub/Sub,
-HTTP webhooks, or just direct calls to a downstream service.
-
-## Extension prerequisite (blocks this example)
-
-Today's `cdc_window` is a polling primitive. Polling at 1&nbsp;ms gives
-sub-2&nbsp;ms detection but burns CPU; polling at 100&nbsp;ms is cheap but
-caps the demo at 100+&nbsp;ms latency floor. Neither is the story we want.
-
-The example is **gated on adding a long-poll variant** to the extension:
-
-```sql
-SELECT * FROM cdc_window_wait(
-    'lake', 'consumer_name',
-    timeout_ms := 5000  -- block up to 5s; return immediately on new snapshot
-);
-```
-
-Semantics: returns the same row shape as `cdc_window`. If a new snapshot is
-already available, returns immediately. Otherwise blocks inside the extension
-on a condition variable signaled by the catalog's snapshot-pointer update,
-returning either when a snapshot arrives or when `timeout_ms` elapses (with
-`has_changes := false`).
-
-This is a contained extension change &mdash; one new table function, no
-changes to the storage format or to existing primitives. The smoke probe in
-`e2e/smoke/cdc_wait_interrupt_smoke.py` already proves DuckDB interrupts
-propagate cleanly, which is the hardest part.
-
-The example's `app.py` should not be merged until `cdc_window_wait` is in.
-The README should ship now; it doubles as the spec for the extension work.
-
-## Demo visualization
-
-Bespoke. Two panes, side by side:
-
-- **Left**: a tiny browser tab open to `localhost:8765`. Every tick, the page
-  flashes briefly and shows the snapshot ID + the table name. Visceral
-  proof of liveness.
-- **Right**: a terminal histogram of *commit&nbsp;&rarr;&nbsp;tick* latency,
-  measured by injecting writes whose timestamp is read back through the tick
-  payload. p50, p99, max updated live.
+A change-tap that wakes on every commit to a watched table, records
+the commit-to-tick latency, and advances the cursor. The consumer
+holds one DuckDB connection in `cdc_dml_ticks_listen` and **never
+reads the row payload** &mdash; the tick carries `snapshot_id`,
+`snapshot_time`, and `table_ids` only.
 
 ```
-  commit -> tick latency  (n = 8421)
-   <  5ms ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░ 6312
-  5-10ms ▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░ 1488
-  10-25ms ▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░  421
-   >25ms ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  200
-
-  p50 3.2 ms  ·  p99 18.4 ms  ·  max 41 ms
+  raw_ticks  →  cdc_dml_ticks_listen  →  latency histogram
+                  (metadata only;
+                   no row materialisation)
 ```
 
-## Acceptance criteria
+## Real-life use case
 
-In addition to the suite-wide criteria:
+The "cache invalidation" / "wake the workers" / "notify the
+microservice" pattern. A SaaS app commits to DuckLake; a downstream
+recipient &mdash; a CDN, a Redis cache, a search index, a service
+that re-reads its slice on demand &mdash; just needs to know
+"something new happened in table T at snapshot N" so it can decide
+whether to act.
 
-- [ ] **`cdc_window_wait` primitive lands in the extension** with a
-      SQLLogic test and a smoke probe (`e2e/smoke/cdc_window_wait_smoke.py`).
-- [ ] On a known machine class (Apple M-series laptop), median
-      commit&nbsp;&rarr;&nbsp;tick latency &le; 10&nbsp;ms; p99 &le; 50&nbsp;ms,
-      sustained for a 10-minute run at 50 commits/sec.
-- [ ] Idle CPU is &lt; 1% per watched table (the long-poll variant blocks
-      inside the extension; no busy loop in Python).
-- [ ] Killing and restarting the example resumes ticks from the last
-      committed snapshot. At-least-once delivery is the target here, not
-      exactly-once: the recipient is expected to be idempotent.
-- [ ] Demo HTML page is openable on `localhost:8765` with no extra setup,
-      and visibly flashes within one frame of every tick.
+The classic alternative is to publish every changed row to a queue.
+That doubles the bandwidth (rows go out twice: once into DuckLake,
+once into the queue), couples the publisher to every recipient's
+schema, and forces materialisation on the publisher even if the
+recipient only wants to invalidate a key. This example is the
+opposite trade-off: the publisher's hot path is one metadata-only
+listen + one cursor advance per commit.
 
-## Talk story
+This example is the *measurement harness* for that pattern. The
+forwarding layer (Redis Pub/Sub, WebSocket, HTTP webhook,
+in-process callback) is a downstream concern; what matters here is
+that the listen primitive itself is cheap and the wake-up is fast.
 
-> "Most CDC systems force you to materialize every change before you can
-> react to it. We don't. Here's a write to DuckLake. Here's a browser tab
-> reacting to that write. Look at the timestamp difference."
+## Limitations
 
-10-second demo. Memorable. Closes the talk.
+**At-least-once, not exactly-once.** The tick is recorded before
+`cdc_commit` advances the cursor, so a crash between publish and
+commit re-emits the tick on restart. Real recipients should be
+idempotent (cache invalidation by snapshot id is naturally
+idempotent; so is "re-read this table"). If your downstream needs
+exactly-once, look at example 01's stage transactions instead.
 
-## Open questions
+**Latency floor is bounded by commit cost and metadata wakeup work.**
+Postgres catalogs use the snapshot `LISTEN`/`NOTIFY` fast path when
+available; other backends use the `poll_min_ms` fallback. The visible
+commit-to-tick latency still includes producer commit time and the
+metadata work inside `cdc_dml_ticks_listen`; the tick itself does not
+read changed rows or compute per-operation counts. SQLite serialises
+producer + consumer through a single file lock, which adds hundreds of ms.
+This demo disables listen coalescing because it measures first-tick latency,
+not throughput-oriented batching.
 
-1. **Coalescing.** If 100 commits land in 5&nbsp;ms, do we send 100 ticks or
-   one tick covering the snapshot range? Probably configurable per consumer:
-   `coalesce: true` for cache invalidation (one tick is enough),
-   `coalesce: false` for audit-style consumers that need to see every
-   snapshot ID. Default: coalesce.
-2. **Backpressure on the recipient.** If the SSE client falls behind, do we
-   buffer or drop? For cache-invalidation semantics, dropping is fine
-   (latest tick subsumes earlier ones). The example should make this
-   explicit and let the operator choose.
-3. **Ticks across schema boundaries.** A tick during an `ALTER TABLE`
-   should still go out; the recipient should treat schema-change ticks
-   as a stronger signal ("re-read everything, the shape changed"). Decide
-   the API shape with the extension change.
-
-## Running this example
-
-(Once the extension primitive lands and `app.py` is built.)
+## Run
 
 ```bash
 docker compose -f e2e/docker-compose.yml up -d --wait
 make release
 
-# default: live TUI + browser tab on localhost:8765
+# live TUI: latency histogram + p50/p95/p99 + tick rate
 uv run --project e2e python e2e/02_ticks/app.py
 
-# CI: same workload, no TUI, asserts + writes metrics JSON
-uv run --project e2e python e2e/02_ticks/app.py --headless --catalog postgres
+# unattended: no TUI, periodic stderr summary
+uv run --project e2e python e2e/02_ticks/app.py --headless --duration 30
+
+# any catalog (single-process; all three apply)
+uv run --project e2e python e2e/02_ticks/app.py --headless --duration 30 --catalog duckdb
+uv run --project e2e python e2e/02_ticks/app.py --headless --duration 30 --catalog sqlite
 ```
 
-Catalog support: `duckdb`, `sqlite`, `postgres`. The tick consumer is
-intrinsically single-process, so all three apply.
+The lake is reset before and after each run.
 
-Storage: `--storage disk` (default) or `--storage s3`. Latency is
-storage-sensitive here &mdash; the README's numbers should report both so the
-"sub-50&nbsp;ms" claim is grounded in the realistic backend mix.
+## Reading the numbers
 
-## Status
+The final stderr line (and the live TUI) report:
 
-TODO &mdash; **blocked on extension `cdc_window_wait` primitive**. README is
-the spec; safe to ship the README now and treat it as the design doc for the
-extension work.
+```
+producer=N        → commits the producer made into raw_ticks
+ticks=N           → ticks the consumer delivered (one per snapshot the producer wrote)
+rate=N/s          → ticks delivered per second
+p50, p95, p99     → commit → tick latency percentiles
+                    (snapshot_time from the catalog vs wall-clock at tick arrival)
+hist=[a,b,c,d,e]  → latency bin counts: <5ms, 5-10ms, 10-25ms, 25-100ms, >100ms
+errors=N          → unhandled exceptions in the consumer or commit path
+```
+
+A healthy run:
+
+- `producer == ticks` (or off by 1 if a tick is in flight at shutdown).
+  The 1:1 mapping is the proof that the listen primitive doesn't drop
+  snapshots.
+- `errors=0`.
+- Latency depends almost entirely on the catalog choice. On a
+  laptop-class machine, expect roughly:
+
+  | catalog  | p50    | p99    | notes |
+  |----------|--------|--------|-------|
+  | duckdb   | ~55 ms | ~130 ms | embedded; the floor for this stack |
+  | postgres | ~90 ms | ~190 ms | network + bookkeeping per commit |
+  | sqlite   | ~500 ms | ~3 s   | single-file lock contention |
+
+If `ticks < producer - 1` after the run finishes, the consumer
+didn't drain in time. Bump `--duration` (the consumer has one
+`LISTEN_TIMEOUT_MS` cycle of grace at shutdown) or reduce
+`PRODUCER_INTERVAL_S` in `app.py` so the tail is shorter.

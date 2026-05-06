@@ -42,6 +42,15 @@ FROM cdc_dml_ticks_query('lake', 0, table_names := ['orders']);
 ----
 true
 
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM cdc_dml_ticks_query('lake', 0, table_names := ['orders']));
+----
+snapshot_id	BIGINT
+snapshot_time	TIMESTAMP WITH TIME ZONE
+schema_version	BIGINT
+table_ids	BIGINT[]
+
 query I
 SELECT count(*) >= 1
 FROM cdc_dml_ticks_query('lake', 0, table_names := ['aux.hidden']);
@@ -97,6 +106,12 @@ SELECT * FROM cdc_consumer_reset('lake', 'listen_backlog', to_snapshot := 'begin
 query I
 SELECT count(*) >= 1
 FROM cdc_dml_ticks_listen('lake', 'listen_backlog', timeout_ms := 0, max_snapshots := 1000);
+----
+true
+
+query I
+SELECT count(*) >= 0
+FROM cdc_dml_ticks_listen('lake', 'listen_backlog', timeout_ms := 0, "coalesce" := false);
 ----
 true
 

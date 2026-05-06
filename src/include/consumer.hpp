@@ -126,6 +126,7 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 //! Pull the `max_snapshots` named parameter out of the bind input,
 //! defaulting to `DEFAULT_MAX_SNAPSHOTS` when omitted.
 int64_t MaxSnapshotsParameter(duckdb::TableFunctionBindInput &input);
+int64_t PollMinMsParameter(duckdb::TableFunctionBindInput &input);
 
 //! Run the cdc_window state machine: reuse a fresh cached lease or
 //! acquire/extend the consumer's lease and compute the visible
@@ -155,12 +156,14 @@ std::vector<duckdb::Value> CommitConsumerSnapshotWithConnection(duckdb::ClientCo
                                                                 const std::string &consumer_name, int64_t snapshot_id);
 
 std::vector<duckdb::Value> WaitForConsumerSnapshot(duckdb::ClientContext &context, const std::string &catalog_name,
-                                                   const std::string &consumer_name, int64_t timeout_ms);
+                                                   const std::string &consumer_name, int64_t timeout_ms,
+                                                   int64_t poll_min_ms);
 
 std::vector<duckdb::Value> WaitForDmlConsumerSnapshot(duckdb::ClientContext &context, duckdb::Connection &conn,
                                                       const std::string &catalog_name, const std::string &consumer_name,
                                                       int64_t timeout_ms,
-                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions);
+                                                      const std::vector<ConsumerSubscriptionRow> &subscriptions,
+                                                      int64_t poll_min_ms);
 
 //! Reactively coalesce integrated listen calls after this process observes a
 //! burst of quick, small non-empty results for the same consumer/stream.
