@@ -89,8 +89,8 @@ The flag set is deliberately tiny:
 
 | flag | what it does | when to use |
 |------|--------------|-------------|
-| (none) | live TUI, runs until Ctrl-C, metrics emitted on clean shutdown | local dev, talks |
-| `--headless` | no TUI; runs to completion; metrics JSON to `./.results/` | CI |
+| (none) | live TUI, runs until Ctrl-C, summary printed on clean shutdown | local dev, talks |
+| `--headless` | no TUI; periodic stderr summary; runs for `--duration` seconds | CI |
 | `--catalog {duckdb,sqlite,postgres}` | catalog backend (per-example matrix below) | any |
 | `--storage {disk,s3}` | local disk (default) vs S3 via the Garage service | any |
 
@@ -177,10 +177,10 @@ CI invokes each example with `--headless`, fanned across the supported
 both gates merges (correctness assertions) and produces the perf numbers
 release tooling collects.
 
-Each headless run writes a metrics JSON to
-`./.results/<example>-<catalog>-<storage>.json` on clean shutdown. Schema
-lives in `_lib/README.md`. Release tooling aggregates these across the
-matrix into a perf report.
+Each headless run prints a final summary line to stderr on clean
+shutdown; that's the result. Examples that need machine-readable
+output for release tooling can build it from `MetricsRecorder.snapshot()`
+themselves.
 
 Examples should size their workload so a single headless run completes in
 **&lt;3 min**. That keeps the per-PR matrix sweep inside a normal CI budget

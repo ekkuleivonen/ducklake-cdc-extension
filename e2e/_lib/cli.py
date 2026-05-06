@@ -1,16 +1,11 @@
 """Shared CLI surface for every example.
 
-Every ``e2e/NN_xxx/app.py`` accepts the same minimal flag set so the
-"how to run an example" section in ``e2e/README.md`` is universally true:
+Every ``e2e/NN_xxx/app.py`` accepts the same minimal flag set:
 
-    --headless                no TUI; runs to completion; writes metrics JSON
+    --headless                no TUI; periodic stderr summary instead
     --catalog {duckdb,sqlite,postgres}
-                              catalog backend (per-example matrix in suite README)
     --storage {disk,s3}       local disk (default) or Garage S3
-    --duration <seconds>      hard stop for headless runs (CI safety net)
-
-Examples can ``add_argument`` more on top via the returned parser without
-breaking the contract.
+    --duration <seconds>      hard stop (CI safety net for --headless)
 """
 
 from __future__ import annotations
@@ -62,7 +57,7 @@ def make_parser(
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="No TUI. Periodic stderr summary. Writes metrics JSON.",
+        help="No TUI. Periodic stderr summary instead.",
     )
     parser.add_argument(
         "--catalog",

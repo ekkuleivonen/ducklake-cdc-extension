@@ -202,22 +202,40 @@ def open_lake(
 
 
 def reset_lake(*, example: str, catalog: CatalogChoice, storage: StorageChoice) -> None:
-    """Drop and recreate the catalog + clear the storage for ``example``.
+    """Drop and recreate the catalog + clear the storage + drop the load corpus.
 
     Headless runs call this so each invocation starts from a known-empty
     state. Demo mode skips it by default so you can inspect leftover
     state across local restarts.
+
+    The load corpus (pre-built parquet files written by
+    :class:`_lib.load.LoadCorpus`) is treated as part of the example's
+    state for reset purposes -- a config change that retunes
+    ``rows_per_file`` between runs would otherwise silently reuse
+    parquet files of the wrong shape, and a "leave nothing behind on
+    success" run would leave stale corpora lying around. Symmetric
+    with the catalog and storage clears.
     """
     work_dir(example).mkdir(parents=True, exist_ok=True)
     catalog_handle = _catalog_for(catalog, example=example)
     storage_handle = _storage_for(storage, example=example)
     _reset_catalog(catalog_handle)
     _reset_storage(storage_handle)
+    _reset_load_corpus(example)
 
 
 def work_dir(example: str) -> Path:
     """Per-example scratch dir under e2e/.work/, used for embedded catalogs and disk storage."""
     return WORK_ROOT / example
+
+
+def load_dir(example: str) -> Path:
+    """Per-example pre-built load corpora dir; cleared by :func:`reset_lake`."""
+    return work_dir(example) / "load"
+
+
+def _reset_load_corpus(example: str) -> None:
+    shutil.rmtree(load_dir(example), ignore_errors=True)
 
 
 # Note on retry policy: the suite intentionally does NOT define its own
@@ -270,17 +288,35 @@ def _s3_storage_from_env(*, example: str) -> S3Storage:
             "Run ./e2e/setup-garage.sh and paste the printed env block into e2e/.env, "
             "or set S3_BUCKET (and S3_ENDPOINT / S3_ACCESS_KEY / S3_SECRET_KEY) yourself."
         )
+    endpoint = _env("endpoint")
     return S3Storage(
         bucket=bucket,
         # Per-example prefix so two examples sharing one bucket don't collide.
         prefix=f"e2e/{example}/",
-        endpoint=_env("endpoint"),
+        endpoint=endpoint,
         region=_env("region"),
         url_style=_url_style(),
-        use_ssl=_optional_bool(_env("use_ssl")),
+        # Default ``use_ssl`` from the endpoint's scheme when the env
+        # var isn't set explicitly: ``http://`` -> False, ``https://``
+        # / unspecified -> leave as ``None`` so DuckDB's httpfs default
+        # (which is True) applies. Without this, a Garage-style local
+        # endpoint (``http://localhost:3900``) with no
+        # ``S3_USE_SSL=false`` in ``.env`` will force httpfs into
+        # https mode and fail with "SSL connect error" on the first
+        # parquet upload. The explicit env var still wins.
+        use_ssl=_use_ssl_from_env(endpoint),
         key_id=_env("access_key"),
         secret_access_key=_env("secret_key"),
     )
+
+
+def _use_ssl_from_env(endpoint: str | None) -> bool | None:
+    explicit = _optional_bool(_env("use_ssl"))
+    if explicit is not None:
+        return explicit
+    if endpoint and endpoint.lower().startswith("http://"):
+        return False
+    return None
 
 
 def _env(field: str) -> str | None:
@@ -318,10 +354,67 @@ def _reset_storage(storage: DiskStorage | S3Storage) -> None:
     if isinstance(storage, DiskStorage):
         shutil.rmtree(Path(str(storage.path)), ignore_errors=True)
         return
-    # S3 reset for headless runs is intentionally not implemented in v1: the
-    # per-example prefix isolates collisions, and full delete-by-prefix
-    # against Garage is a separate concern. If we end up needing it, fall
-    # back to ``boto3`` here -- not pulling that dep in just for resets yet.
+    _reset_s3_prefix(storage)
+
+
+def _reset_s3_prefix(storage: S3Storage) -> None:
+    """Delete every object under ``storage.prefix`` in ``storage.bucket``.
+
+    Symmetric with the disk reset: a fresh run starts from no parquet
+    files (the postgres reset that runs alongside this drops every
+    catalog reference, but stale parquet objects would otherwise pile
+    up under the per-example prefix across runs and Garage'd never
+    garbage-collect them).
+
+    Uses boto3 because DuckDB's httpfs handles read/write but not
+    delete. The ``S3Storage`` config we built from ``e2e/.env`` already
+    has every credential we need; we just hand it back to a boto3
+    client. Works identically against Garage (local dev) and a real
+    AWS S3 bucket.
+
+    Paginates through ``list_objects_v2`` and batches deletes 1,000 at
+    a time -- the S3 ``delete_objects`` per-call limit. Empty prefixes
+    are a no-op.
+    """
+    try:
+        import boto3  # local import so non-S3 paths don't pay the import cost
+    except ImportError as exc:
+        raise RuntimeError(
+            "S3 reset requires the boto3 package; add it to e2e/pyproject.toml."
+        ) from exc
+
+    endpoint = str(storage.endpoint) if storage.endpoint else None
+    use_ssl = bool(storage.use_ssl) if storage.use_ssl is not None else True
+    client_kwargs: dict[str, object] = {
+        "service_name": "s3",
+        "endpoint_url": endpoint,
+        "aws_access_key_id": storage.key_id,
+        "aws_secret_access_key": storage.secret_access_key,
+        "region_name": storage.region,
+        "use_ssl": use_ssl,
+    }
+    # Garage requires path-style addressing; vhost-style would try
+    # ``e2e.localhost:3900`` which doesn't resolve. Mirror DuckLake's
+    # ``url_style`` choice into boto3's ``s3.addressing_style`` config.
+    if str(storage.url_style) == "path":
+        from botocore.config import Config
+
+        client_kwargs["config"] = Config(s3={"addressing_style": "path"})
+
+    s3 = boto3.client(**client_kwargs)
+    bucket = str(storage.bucket)
+    prefix = str(storage.prefix) if storage.prefix else ""
+
+    paginator = s3.get_paginator("list_objects_v2")
+    pending: list[dict[str, str]] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", ()):
+            pending.append({"Key": obj["Key"]})
+            if len(pending) >= 1000:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": pending})
+                pending = []
+    if pending:
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": pending})
 
 
 def _reset_postgres_database(dsn: str) -> None:
