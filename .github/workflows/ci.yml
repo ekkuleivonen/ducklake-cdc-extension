@@ -108,7 +108,7 @@ jobs:
           make release
           ccache -s
 
-      - name: SQL tests (smoke + default)
+      - name: SQL tests (all sqllogictest files under test/)
         # `make prepare_tests` (a prerequisite of test_release_*) curls the
         # official `ducklake.duckdb_extension` for the pinned DuckDB version
         # into ~/.duckdb/extensions/<version>/<platform>/ so the

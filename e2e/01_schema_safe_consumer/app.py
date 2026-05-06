@@ -279,10 +279,11 @@ def listen_and_apply(
         return 0
 
     end_snapshot = max(row.end_snapshot or row.snapshot_id for row in rows)
+    sink_columns = sink_column_names(lake)
     applied = 0
     with lake.transaction():
         for row in rows:
-            if apply_change(lake, row):
+            if apply_change(lake, row, sink_columns):
                 applied += 1
                 state.add_dml(format_change(row, epoch))
         client.cdc_commit(consumer_name, end_snapshot)
@@ -299,7 +300,18 @@ def listen_and_apply(
     return applied
 
 
-def apply_change(lake: Any, row: ChangeRow) -> bool:
+def sink_column_names(lake: Any) -> tuple[str, ...]:
+    return tuple(
+        col.name
+        for col in lake.table.info(
+            "derived_orders",
+            include_snapshots=False,
+            include_row_count=False,
+        ).columns
+    )
+
+
+def apply_change(lake: Any, row: ChangeRow, sink_columns: tuple[str, ...]) -> bool:
     conn = lake.connection
     values = dict(row.values)
     order_id = values.get("id")
@@ -313,14 +325,6 @@ def apply_change(lake: Any, row: ChangeRow) -> bool:
     if row.change_type not in (ChangeType.INSERT, ChangeType.UPDATE_POSTIMAGE):
         return False
 
-    sink_columns = [
-        col.name
-        for col in lake.table.info(
-            "derived_orders",
-            include_snapshots=False,
-            include_row_count=False,
-        ).columns
-    ]
     conn.execute(f"DELETE FROM {SINK_TABLE} WHERE id = ?", [order_id])
     insert_values = [value_for_sink_column(column, values) for column in sink_columns]
     placeholders = ", ".join("?" for _ in sink_columns)
@@ -473,7 +477,7 @@ def update_row_counts(lake: Any, state: DemoState) -> None:
 
 
 def verify_invariant(lake: Any, state: DemoState) -> str:
-    current_columns = [column.name for column in describe_table(lake, SOURCE_TABLE)]
+    current_columns = [column.name for column in describe_table(lake, "orders")]
     comparable_columns = [column for column in current_columns if column != "updated_at"]
     projection = ", ".join(comparable_columns)
     mismatch = int(

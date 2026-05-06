@@ -1,12 +1,14 @@
 # E2E stack:
 #   - Postgres + PgBouncer for the DuckLake catalog (used by every example).
 #   - Garage for an S3-compatible object store backing examples that opt in
-#     with --storage s3. Garage is bootstrapped once via e2e/garage/setup-garage.sh.
+#     with --storage s3. Start it with --profile s3 and bootstrap once via
+#     e2e/garage/setup-garage.sh.
 #
 # Future sink demos may add more services (Redis, serving Postgres, etc.).
 #
 # Usage:
 #   docker compose -f e2e/docker-compose.yml up -d --wait
+#   docker compose -f e2e/docker-compose.yml --profile s3 up -d --wait
 #   ./e2e/setup-garage.sh                         # one-time, writes credentials
 #   uv run --project e2e python e2e/04_cache_refresh/app.py
 #   uv run --project e2e python e2e/ci_demo_assertions.py
@@ -54,6 +56,7 @@ services:
   garage:
     image: dxflrs/garage:v2.0.0
     container_name: dlcdc-e2e-garage
+    profiles: ["s3"]
     restart: unless-stopped
     ports:
       - "3900:3900"   # S3 API

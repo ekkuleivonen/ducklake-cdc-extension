@@ -14,17 +14,10 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 ENABLE_EXTENSION_AUTOLOADING=1
 ENABLE_EXTENSION_AUTOINSTALL=1
 
-# `_NO_DUCKLAKE` set is the subset that does not `INSTALL ducklake; LOAD ducklake;`
-# at runtime. It exists so the sanitiser CI lane (`make debug` + ASan/UBSan
-# default flags) has something to run: the official prebuilt
-# `ducklake.duckdb_extension` is a release build with no sanitiser runtime,
-# and ASan refuses to LOAD a shared library that wasn't built with the
-# matching runtime. Tests in the broader smoke / default sets that do
-# `INSTALL ducklake` therefore can't run on the sanitiser binary; this
-# subset is what does.
+# `_NO_DUCKLAKE` filename list is the only subset used outside release unittest:
+# sanitiser CI (`make debug` + ASan/UBSan) cannot LOAD the official prebuilt
+# `ducklake.duckdb_extension`. Tests that `INSTALL ducklake` skip there.
 SQL_TEST_SMOKE_NO_DUCKLAKE=test/version_and_load.test
-SQL_TEST_SMOKE=test/version_and_load.test, test/compat_check.test
-SQL_TEST_DEFAULT=test/version_and_load.test, test/compat_check.test, test/consumer_lifecycle.test, test/dml_ticks.test, test/dml_changes.test, test/dml_schema_shape_pinning.test, test/ddl_ticks.test, test/ddl_changes.test, test/schema_diff.test, test/observability.test, test/retention_gap.test
 
 # DuckLake binary cache layout: ~/.duckdb/extensions/<version>/<platform>/
 # Pre-staging the binary here lets sqllogictest's `INSTALL ducklake` resolve
@@ -59,7 +52,7 @@ endif
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-.PHONY: prepare_tests install-git-hooks test_local_sanitizer test_local_full test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_smoke test_release_default test_release_full
+.PHONY: prepare_tests install-git-hooks test_local_sanitizer test_local_full test_debug_smoke_no_ducklake test_debug_smoke test_debug_default test_debug_full test_release_default test_release_full
 
 install-git-hooks:
 	git config core.hooksPath .githooks
@@ -107,10 +100,9 @@ test_debug_full:
 	@echo "Run 'make test_local_sanitizer' for ASan/UBSan coverage or 'make test_local_full' for full SQL coverage."
 	@exit 2
 
-test_release_smoke: prepare_tests
-	./build/release/$(TEST_PATH) "$(SQL_TEST_SMOKE)"
-
+# Same unittest invocation as extension-ci-tools `test_release_internal`:
+# all `test/*.test` files (respects SUBSET_EXTENSIONS_TESTS / TESTS_BASE_DIRECTORY).
 test_release_default: prepare_tests
-	./build/release/$(TEST_PATH) "$(SQL_TEST_DEFAULT)"
+	./build/release/$(TEST_PATH) "$(TESTS_BASE_DIRECTORY)*"
 
-test_release_full: prepare_tests test
+test_release_full: test_release_default

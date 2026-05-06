@@ -100,10 +100,11 @@ Each example should prove a real operating property:
 
 ## S3 Storage
 
-The shared dev S3 service is Garage. Start it through `docker-compose.yml`,
+The shared dev S3 service is Garage. Start it through the `s3` Compose profile,
 then bootstrap once:
 
 ```bash
+docker compose -f e2e/docker-compose.yml --profile s3 up -d --wait
 ./e2e/setup-garage.sh
 ```
 
