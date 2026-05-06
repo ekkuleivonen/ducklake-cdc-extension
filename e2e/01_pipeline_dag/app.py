@@ -238,6 +238,15 @@ class _PurchaseIdSpace:
     A counter is enough -- IDs are dense from 0, and "refund a random
     earlier purchase" is the right semantic for the demo without
     needing a per-ID set.
+
+    On a ``--keep-state`` restart, the previous run's purchases are
+    still in ``raw_purchases`` and the new producer picks up at
+    ``MAX(id) + 1``. Initialise this id-space with that high-water
+    mark so the refunds producer can immediately reference any of
+    them, including the ones from the previous run -- otherwise it
+    would only refund what the new producer has emitted in this
+    process and the kill+restart test would lose its cross-run
+    refund coverage.
     """
 
     _max: int = 0
@@ -246,6 +255,11 @@ class _PurchaseIdSpace:
     def record_emission(self, count: int) -> None:
         with self._lock:
             self._max += count
+
+    def seed_from(self, count: int) -> None:
+        """Set the initial id-space size (e.g. from existing lake rows)."""
+        with self._lock:
+            self._max = count
 
     def max_emitted(self) -> int:
         with self._lock:
@@ -258,12 +272,30 @@ def producer_purchases(
     stop: threading.Event,
     id_space: _PurchaseIdSpace,
 ) -> None:
-    """Synthetic source: write batches of JSON-payload rows into raw_purchases."""
+    """Synthetic source: write batches of JSON-payload rows into raw_purchases.
+
+    ``stop`` here is the *producer* stop signal (``producers_stop`` in
+    main); it's distinct from the runner's panic ``stop`` so that when
+    the demo's duration elapses or Ctrl-C lands gracefully, producers
+    can be told "stop emitting new data" without the stage runner
+    seeing the panic signal -- letting stages drain whatever is still
+    in flight before the pipeline shuts down. The signal handler
+    still sets *both* events in the panic case.
+    """
     conn = lake.connection.cursor()
-    next_id = 0
+    # Resume from the existing high-water mark so a ``--keep-state``
+    # restart doesn't re-emit purchase IDs that already exist in
+    # ``raw_purchases`` (which would silently no-op the INSERT under
+    # the table's PK and break exactly-once accounting downstream).
+    # ``COALESCE(MAX(id), -1) + 1`` collapses to 0 on a fresh table.
+    next_id = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id), -1) + 1 FROM lake.raw_purchases"
+        ).fetchone()[0]
+    )
     rng = random.Random(42)
 
-    log("\\[producer:purchases] started")
+    log(f"\\[producer:purchases] started (next_id={next_id})")
     while not stop.is_set():
         rows = [_synth_purchase(next_id + i, rng) for i in range(PURCHASES_BATCH_ROWS)]
         next_id += PURCHASES_BATCH_ROWS
@@ -297,12 +329,21 @@ def producer_refunds(
     stop: threading.Event,
     id_space: _PurchaseIdSpace,
 ) -> None:
-    """Synthetic source: write refunds that reference random emitted purchase IDs."""
+    """Synthetic source: write refunds that reference random emitted purchase IDs.
+
+    See ``producer_purchases`` for ``stop`` semantics (it's the
+    *producer* stop signal, not the panic signal).
+    """
     conn = lake.connection.cursor()
-    next_id = 0
+    # Resume from the existing high-water mark (see ``producer_purchases``).
+    next_id = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id), -1) + 1 FROM lake.raw_refunds"
+        ).fetchone()[0]
+    )
     rng = random.Random(7)
 
-    log("\\[producer:refunds] started")
+    log(f"\\[producer:refunds] started (next_id={next_id})")
     # Wait for the purchases producer to populate enough IDs so the
     # first refund batch has something legitimate to reference.
     while not stop.is_set() and id_space.max_emitted() < REFUND_WARMUP_PURCHASES:
@@ -430,20 +471,35 @@ def normalize_refunds(batch: DMLBatch, tx: BatchTransaction) -> int:
 def join_orders(batch: DMLBatch, tx: BatchTransaction) -> int:
     """clean_purchases (driver) -> joined_orders, looking up clean_refunds.
 
-    For each purchase in this batch, LEFT JOIN against the current
-    snapshot of ``clean_refunds``. The lookup runs on the consumer's
-    connection inside ``batch.transaction()`` -- snapshot-isolated
-    reads come for free, and ``cdc_commit`` + ``COMMIT`` are atomic
-    with the INSERT.
+    For each purchase in this batch, look up matching refunds in
+    ``clean_refunds`` and emit *one* ``joined_orders`` row per driver
+    row. The lookup runs on the consumer's connection inside
+    ``batch.transaction()`` -- snapshot-isolated reads come for free,
+    and ``cdc_commit`` + ``COMMIT`` are atomic with the INSERT.
 
     The driver's columns come from the batch itself (the consumer is
     pinned to ``clean_purchases``, so ``Change.values`` already has
     ``id`` / ``kind`` / ``amount`` projected). We don't re-read
     ``clean_purchases`` -- the batch *is* our driver.
 
-    Refund-after-join produces NULL ``refund_amount`` here forever.
-    See the module docstring for why that's the right semantic.
-    Subscribed via ``INSERTS_ONLY``.
+    *User-owned semantic*: the refunds producer picks random purchase
+    IDs, so a single purchase can have N matching refunds in
+    ``clean_refunds`` (think partial refunds, rebill cycles, currency
+    re-conversion). Picking how to fold N refunds into one
+    ``joined_orders.refund_amount`` is a domain choice -- this demo
+    uses ``MAX`` ("the largest refund observed for this purchase") so
+    every driver row produces exactly one output row and the example
+    has a clean 1:1 invariant. Real pipelines might pick ``SUM``,
+    ``MIN``, the most-recent, or fan out to one row per refund. The
+    point of the demo is the surrounding plumbing, not the
+    aggregation choice.
+
+    Refund-after-join leaves ``refund_amount`` as NULL forever (the
+    snapshot lookup ran *before* the late refund landed). That's the
+    contract of the snapshot-lookup join model. Whether to repair it
+    with a periodic UPDATE sweep, an UPSERT-driven repair stage, or
+    not at all is also a user choice -- not something this example
+    pretends to solve. Subscribed via ``INSERTS_ONLY``.
     """
     if not batch.changes:
         return 0
@@ -459,6 +515,12 @@ def join_orders(batch: DMLBatch, tx: BatchTransaction) -> int:
             ]
         )
 
+    # Scalar subquery in the SELECT keeps it strictly one output row
+    # per driver row. MAX() collapses N refunds for the same purchase
+    # into one number; switch to MIN / SUM / etc to demonstrate the
+    # user-owned semantic above. The subquery scope is the consumer's
+    # snapshot-isolated transaction, so it sees a consistent view of
+    # ``clean_refunds`` for the whole batch.
     tx.execute(
         f"""
         INSERT INTO lake.joined_orders
@@ -466,11 +528,14 @@ def join_orders(batch: DMLBatch, tx: BatchTransaction) -> int:
             d.purchase_id,
             d.kind,
             d.amount,
-            r.refund_amount,
+            (
+                SELECT MAX(refund_amount)
+                FROM lake.clean_refunds r
+                WHERE r.purchase_id = d.purchase_id
+            )               AS refund_amount,
             ?               AS source_snapshot,
             now()           AS joined_at
         FROM (VALUES {driver_placeholders}) AS d(purchase_id, kind, amount)
-        LEFT JOIN lake.clean_refunds r ON r.purchase_id = d.purchase_id
         """,
         params,
     )
@@ -632,23 +697,41 @@ def headless_summary(recorder: MetricsRecorder) -> Callable[[], str]:
 def main(argv: list[str] | None = None) -> int:
     parser = make_parser(
         description="In-process pipeline DAG: 2 producers, 3 stages, 5 tables.",
-        # v2 still validates against postgres only -- the catalog matrix
-        # for embedded backends opens up in the multi-process examples.
+        # v2/v3 still validate against postgres only -- the catalog
+        # matrix for embedded backends is v3b.
         supported_catalogs=("postgres",),
         supported_storages=("disk",),
     )
+    parser.add_argument(
+        "--keep-state",
+        action="store_true",
+        help=(
+            "Skip the pre-run catalog reset and the post-run cleanup. The "
+            "catalog and storage persist across runs, so the next process "
+            "start picks up consumer cursors and lake contents from where "
+            "the previous run left off. Used by the kill+restart correctness "
+            "test (test_restart.sh) to verify exactly-once semantics across "
+            "process boundaries."
+        ),
+    )
     args = parser.parse_args(argv)
     common = parse_common(args)
+    keep_state: bool = bool(args.keep_state)
 
     log(
         f"starting {EXAMPLE} mode={'headless' if common.headless else 'demo'} "
-        f"catalog={common.catalog} storage={common.storage}"
+        f"catalog={common.catalog} storage={common.storage} "
+        f"keep_state={keep_state}"
     )
 
     # Hermetic startup: every run begins from an empty catalog and storage
     # so the demo never inherits stale state from a previous attempt that
     # exited dirty (process killed, pgbouncer pool poisoned, etc).
-    reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
+    # ``--keep-state`` opts out so kill+restart tests can verify
+    # exactly-once semantics by replaying durable cursors against an
+    # already-populated catalog.
+    if not keep_state:
+        reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
 
     lake = open_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
     load_cdc_extension(lake)
@@ -660,37 +743,65 @@ def main(argv: list[str] | None = None) -> int:
         catalog=common.catalog,
         storage=common.storage,
     )
+    # Two distinct signals so shutdown can be polite:
+    #
+    # - ``stop`` is the panic signal. ``StageRunner`` honours it
+    #   instantly (no drain) and the signal handler sets it on the
+    #   2nd Ctrl-C. Producers and stages both check it.
+    # - ``producers_stop`` is the graceful signal: "no new upstream
+    #   writes". Producers exit on it; stages do *not*. After
+    #   producers join, exiting the ``with StageRunner(...)`` block
+    #   triggers a drain pass that picks up any final commits the
+    #   consumers hadn't processed yet -- closes v2's "200-row tail".
     stop = threading.Event()
+    producers_stop = threading.Event()
 
     # Two-stage signal handling so an impatient operator can always escape:
-    #   1st SIGINT (or SIGTERM): request graceful stop. Threads finish their
-    #     current batch, lake closes, metrics get written.
-    #   2nd SIGINT (within ~5s): hard exit via os._exit(130). Skips finalisers
-    #     entirely so a hung lake.close() or sticky DuckDB pipeline can't
-    #     trap the operator. 130 is the conventional "interrupted" exit code.
+    #   1st SIGINT (or SIGTERM): request graceful stop. Producers exit
+    #     immediately, stages drain, lake closes, metrics get written.
+    #   2nd SIGINT (within ~5s): hard exit via os._exit(130). Skips
+    #     finalisers entirely so a hung lake.close() or sticky DuckDB
+    #     pipeline can't trap the operator. 130 is the conventional
+    #     "interrupted" exit code.
     def _request_stop(signum: int, _frame: object) -> None:
         if stop.is_set():
             log(f"signal {signum} (again) -> hard exit", level="warn")
             os._exit(130)
         log(f"signal {signum} -> stop")
+        # Signal-path: panic AND producers-stop both fire so the
+        # whole pipeline tears down promptly. The drain pass in
+        # ``StageRunner.__exit__`` is skipped (stop is set) -- this
+        # is the right call for "operator hit Ctrl-C", you want
+        # immediate response, not a 5s drain wait.
+        producers_stop.set()
         stop.set()
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
+    # Seed the in-memory id-space from existing lake rows so the
+    # refunds producer can immediately reference purchases from a
+    # previous ``--keep-state`` run, not just the new ones the
+    # purchases producer is about to emit. On a fresh lake this is 0.
+    existing_purchases = int(
+        lake.connection.execute(
+            "SELECT count(*) FROM lake.raw_purchases"
+        ).fetchone()[0]
+    )
     id_space = _PurchaseIdSpace()
+    id_space.seed_from(existing_purchases)
     summary_fn = headless_summary(recorder)
     wait_seconds = effective_duration_s(common)
 
     producers = [
         threading.Thread(
             target=producer_purchases,
-            args=(lake, recorder, stop, id_space),
+            args=(lake, recorder, producers_stop, id_space),
             name="producer:purchases",
             daemon=True,
         ),
         threading.Thread(
             target=producer_refunds,
-            args=(lake, recorder, stop, id_space),
+            args=(lake, recorder, producers_stop, id_space),
             name="producer:refunds",
             daemon=True,
         ),
@@ -713,19 +824,26 @@ def main(argv: list[str] | None = None) -> int:
                 renderable_factory=lambda: build_layout(recorder, stop),
                 headless_summary=summary_fn,
             ):
-                # ``Event.wait(None)`` blocks indefinitely (demo without --duration),
-                # ``Event.wait(N)`` blocks up to N seconds. Either path returns
-                # early when the signal handler sets stop.
+                # Block until either the duration elapses or a signal
+                # fires. ``stop`` covers both -- the signal handler
+                # sets it; ``--duration N`` falls through naturally.
                 stop.wait(wait_seconds)
 
-            stop.set()
+            # Graceful shutdown: tell producers to stop, wait for
+            # them to finish their current batch, then exit the
+            # StageRunner block. ``__exit__`` runs the drain pass IFF
+            # ``stop`` is still unset (i.e. we got here via duration
+            # timeout, not Ctrl-C).
+            producers_stop.set()
             for producer in producers:
                 producer.join(timeout=2.0)
-        # StageRunner.__exit__ joined the stage threads.
+        # StageRunner.__exit__ ran drain (or was skipped on panic).
     except KeyboardInterrupt:
         stop.set()
+        producers_stop.set()
     finally:
         stop.set()
+        producers_stop.set()
         try:
             lake.close()
         except Exception as exc:  # noqa: BLE001
@@ -740,11 +858,16 @@ def main(argv: list[str] | None = None) -> int:
         # ``git status`` to show. Symmetric with the hermetic startup
         # reset above. Failures here are warnings, not errors -- the
         # workload already succeeded; cleanup is best-effort.
-        try:
-            reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
-            log("cleaned up catalog + storage")
-        except Exception as exc:  # noqa: BLE001
-            log(f"cleanup failed (workload result still valid): {exc!r}", level="warn")
+        # ``--keep-state`` opts out (paired with the startup-reset
+        # opt-out) so kill+restart tests can chain runs.
+        if not keep_state:
+            try:
+                reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
+                log("cleaned up catalog + storage")
+            except Exception as exc:  # noqa: BLE001
+                log(f"cleanup failed (workload result still valid): {exc!r}", level="warn")
+        else:
+            log("--keep-state: skipped catalog + storage cleanup")
 
     return 1 if (snap is None or snap["errors"] > 0) else 0
 

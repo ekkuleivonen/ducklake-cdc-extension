@@ -137,8 +137,33 @@ def resolve_cdc_extension_path() -> Path:
 
 
 def load_cdc_extension(lake: DuckLake) -> None:
-    """Load the locally built ducklake_cdc artifact into ``lake``'s connection."""
+    """Load the locally built ducklake_cdc artifact into ``lake``'s connection.
+
+    Also issues a single ``SELECT cdc_version()`` against ``lake.connection``
+    as an H-022 pre-warm. Empirically, the first cdc_* call on a fresh
+    process against a *non-empty* postgres catalog (i.e. one that already
+    has the ``__ducklake_cdc.*`` metadata schema from a previous run) can
+    surface the H-022 ``thread::join failed: Invalid argument`` race --
+    same shape as the inline-DuckDB bootstrap race, just triggered by the
+    catalog-attach + first cdc_* path on a populated catalog rather than
+    by the bootstrap CREATEs themselves. The lib's
+    ``retry_on_transient`` policy does not reliably recover here because
+    the failure poisons the parent connection's worker pool and
+    same-connection retries also fail.
+
+    The mitigation: drive a cheap *scalar* cdc_* call once, before any
+    cdc_dml_*/cdc_ddl_* table function or any derived cursor uses one.
+    ``cdc_version()`` does not touch the metadata catalog, takes < 1 ms,
+    and warms whatever internal connection state the H-022 race has
+    historically traced to. Tested empirically: with the pre-warm,
+    ``cdc_dml_consumer_create`` on three derived cursors all succeed
+    against a populated postgres catalog; without it, all three fail with
+    the H-022 surface.
+
+    Tracked under H-022 in ``ducklake-cdc-extension/docs/hazard-log.md``.
+    """
     lake.connection.load_extension(str(resolve_cdc_extension_path()))
+    lake.connection.execute("SELECT cdc_version()").fetchone()
 
 
 # ---------------------------------------------------------------------------

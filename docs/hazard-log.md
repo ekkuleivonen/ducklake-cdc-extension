@@ -418,6 +418,34 @@ go; this file says what can hurt users or maintainers on the way there.
   family for the benchmark's own ``retry_on_lock`` (which loops without an
   attempt cap because the bench wants to wait through arbitrarily long
   contention).
+- New finding (May 2026, postgres + populated catalog): the ``retry_on_transient``
+  recovery is **not** sufficient when the H-022 race fires against an
+  already-bootstrapped postgres catalog (e.g. a process that ATTACHes a
+  catalog containing `__ducklake_cdc.*` from a prior run, runs a few
+  `CREATE TABLE IF NOT EXISTS` calls on the lake, then issues
+  `cdc_dml_consumer_create`). On that path the same-connection retry
+  also fails with the same ``thread::join failed`` errno, presumably
+  because the parent ``ClientContext``'s catalog-machinery state is
+  poisoned by the first failed attempt and a fresh internal connection
+  on the same outer context re-enters the same mutex. Empirically reliable
+  workaround at the example/CLI layer: drive **one cheap scalar
+  `cdc_*` call** (the example uses `SELECT cdc_version()`) on
+  `lake.connection` immediately after `LOAD ducklake_cdc`, before any
+  `CREATE TABLE` / `cdc_*_consumer_create` / `cdc_consumer_stats`
+  call -- this "warms" whatever connection-side state the H-022 race
+  needs to be primed, after which `cdc_dml_consumer_create` on three
+  derived cursors (and subsequent inserts on the parent) all succeed.
+  Tracked in `e2e/_lib/config.py::load_cdc_extension`. A secondary
+  occurrence pattern -- the parent connection runs N catalog-touching
+  reads (`SELECT count(*) FROM lake.<table>`) and *then* issues a
+  `cdc_consumer_stats('lake')` table function -- still trips the
+  race even after the initial pre-warm; the workaround there is to
+  use a derived cursor (`lake.connection.cursor()`) for the cdc_*
+  call so the catalog-touched cursor and the cdc-call cursor are
+  distinct (`e2e/01_pipeline_dag/inspect_lake.py` and the
+  `DMLConsumer` lease connection both follow this pattern). Both
+  workarounds are example-side; closing the hazard at source still
+  needs the upstream lock-ordering fix the original notes describe.
 - Next action: If we see this hit by a real user outside the
   regression-test pattern, capture an MSVC debug-build stack trace at
   the `std::system_error(resource_deadlock_would_occur)` throw site to

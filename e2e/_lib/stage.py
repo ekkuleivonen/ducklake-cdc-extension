@@ -34,6 +34,7 @@ from types import TracebackType
 from typing import Any, Self
 
 from ducklake_cdc_client import BatchTransaction, DMLBatch, DMLConsumer
+from ducklake_cdc_client.consumers.base import LeasePolicy
 
 from _lib.metrics import MetricsRecorder
 from _lib.tui import log
@@ -51,10 +52,26 @@ DEFAULT_LISTEN_MAX_SNAPSHOTS = 1000
 # in ``__ducklake_cdc.consumers`` and finish promptly.
 STAGE_READY_TIMEOUT_S = 10.0
 
-# Per-thread join budget on shutdown. A batch transaction (INSERT +
-# cdc_commit + COMMIT) is bounded sub-second on the postgres catalog;
-# anything longer means the daemon thread will be killed at interpreter
-# exit.
+# Drain budget on ``__exit__``. The runner sets ``_drain_event`` and
+# gives every stage up to this long to drain its consumer's backlog
+# (producers are stopped by the time we're here). 5s is generous --
+# typical drain finishes in 1-2 ``LISTEN_TIMEOUT_MS`` cycles plus the
+# drain idle wait. Tune up if a perf-tuned producer commits batches
+# right at the shutdown edge faster than the consumer can process
+# them.
+DRAIN_TIMEOUT_S = 5.0
+
+# How long a stage's listen has to be empty before the drain pass
+# considers the consumer "caught up" and exits. Bigger value =
+# safer (less chance of exiting before a late commit lands), smaller
+# = faster shutdown. 2s matches the lib default and is the right
+# tradeoff for the v3 example.
+DRAIN_IDLE_TIMEOUT_S = 2.0
+
+# Per-thread force-stop budget after drain has run. A batch
+# transaction (INSERT + cdc_commit + COMMIT) is bounded sub-second on
+# the postgres catalog; anything longer means the daemon thread will
+# be killed at interpreter exit.
 STAGE_JOIN_TIMEOUT_S = 2.0
 
 
@@ -97,23 +114,59 @@ class Stage:
     change types" (insert + update_preimage + update_postimage +
     delete); pass e.g. :data:`INSERTS_ONLY` to make the cursor itself
     skip non-insert change rows.
+
+    ``lease_policy`` controls what happens when the consumer name
+    already exists in the catalog with a live lease. The lib's
+    ``DMLConsumer`` default is ``"wait"`` (block up to
+    ``lease_wait_timeout`` seconds for the lease to expire), which is
+    correct in *multi-process* scenarios where two processes might
+    race for the same consumer. For an *in-process* pipeline DAG --
+    where the only thing that holds a lease for the name is the same
+    pipeline's previous incarnation -- ``"takeover"`` is the right
+    default: the previous process is gone, this one is the rightful
+    owner, no need to wait. ``StageRunner`` defaults to ``"takeover"``
+    accordingly. Switch to ``"wait"`` (or ``"error"``) only if you're
+    intentionally running multiple instances against the same lake
+    and want them to coordinate.
     """
 
     name: str
     source: str
     transform: StageTransform
     change_types: tuple[str, ...] | None = None
+    lease_policy: LeasePolicy = "takeover"
 
 
 @dataclass
 class StageRunner:
     """Owns one OS thread per stage and the H-022-safe sequenced startup.
 
-    Acts as a context manager: ``__enter__`` starts each stage's thread
-    serially (so per-stage ``cdc_dml_consumer_create`` doesn't race
-    with a previous stage's first INSERTs on a fresh catalog -- H-022),
-    waiting for each to signal ready before starting the next.
-    ``__exit__`` joins the stage threads with a bounded timeout.
+    Acts as a context manager:
+
+    - ``__enter__`` starts each stage's thread serially (so per-stage
+      ``cdc_dml_consumer_create`` doesn't race with a previous stage's
+      first INSERTs on a fresh catalog -- H-022), waiting for each to
+      signal ready before starting the next.
+    - ``__exit__`` is a two-phase shutdown:
+
+      1. *Drain phase*: set the internal ``_drain_event``, which makes
+         every stage's ``DMLConsumer.batches()`` switch from "block on
+         listen forever" to "exit when listen has been idle for
+         ``drain_idle_timeout`` seconds." Wait up to
+         ``drain_timeout_s`` for the threads to finish naturally. This
+         is what closes the v2 "200-row tail" gap: producers have
+         already stopped by the time ``__exit__`` runs (caller's
+         responsibility), so the drain pass picks up any commits the
+         consumer hadn't processed yet and advances cursors past
+         them.
+      2. *Force-stop phase*: any thread that didn't finish during
+         drain gets ``stop`` set on it, then ``join(timeout=
+         STAGE_JOIN_TIMEOUT_S)``. Daemons die on interpreter exit if
+         even that times out.
+
+    Caller's contract is unchanged from v2: stop the producers (so no
+    new upstream writes arrive), then exit the ``with`` block. The
+    runner handles the rest.
     """
 
     lake: Any
@@ -122,7 +175,10 @@ class StageRunner:
     recorder: MetricsRecorder
     timeout_ms: int = DEFAULT_LISTEN_TIMEOUT_MS
     max_snapshots: int = DEFAULT_LISTEN_MAX_SNAPSHOTS
+    drain_timeout_s: float = DRAIN_TIMEOUT_S
+    drain_idle_timeout_s: float = DRAIN_IDLE_TIMEOUT_S
     _threads: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
+    _drain_event: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
 
     def __enter__(self) -> Self:
         for stage in self.stages:
@@ -149,13 +205,27 @@ class StageRunner:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        # Caller is expected to set ``stop`` before exiting the ``with``
-        # block (or to pass an already-set ``stop`` if startup raised).
-        # Threads are daemons so a missed join still terminates with
-        # the interpreter -- the join is just to keep ``finally``-based
-        # cleanup ordered.
+        # Phase 1: drain. Stages finish their listen loops naturally
+        # once the upstream is idle for ``drain_idle_timeout_s``
+        # seconds. Skip the drain phase entirely if the caller already
+        # set ``stop`` (panic shutdown) -- the drain wait would just
+        # eat shutdown latency for no benefit, and the lib's
+        # ``stop_event`` check inside ``batches()`` would short-
+        # circuit it anyway.
+        if not self.stop.is_set():
+            self._drain_event.set()
+            drain_deadline = time.monotonic() + self.drain_timeout_s
+            for thread in self._threads:
+                remaining = max(0.0, drain_deadline - time.monotonic())
+                thread.join(timeout=remaining)
+
+        # Phase 2: force-stop. Anything still alive gets the panic
+        # signal and a small join window; daemons die on interpreter
+        # exit if they're still stuck after that.
+        self.stop.set()
         for thread in self._threads:
-            thread.join(timeout=STAGE_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                thread.join(timeout=STAGE_JOIN_TIMEOUT_S)
 
     def _run_stage(self, stage: Stage, ready: threading.Event) -> None:
         # Note: stage.name is wrapped with double-square-brackets so
@@ -171,6 +241,7 @@ class StageRunner:
                 table=stage.source,
                 mode="changes",
                 change_types=list(stage.change_types) if stage.change_types else None,
+                lease_policy=stage.lease_policy,
             ) as consumer:
                 # Signal "consumer is open" so ``StageRunner.__enter__``
                 # advances to the next stage. The consumer-create call
@@ -179,6 +250,8 @@ class StageRunner:
                 ready.set()
                 for batch in consumer.batches(
                     stop_event=self.stop,
+                    drain_event=self._drain_event,
+                    drain_idle_timeout=self.drain_idle_timeout_s,
                     timeout_ms=self.timeout_ms,
                     max_snapshots=self.max_snapshots,
                 ):

@@ -138,9 +138,9 @@ the live rendering differs.
 
 ## Status
 
-**v2 (current).** First multi-stage topology &mdash; two parallel
-normalize stages and one stream-stream join &mdash; with the public
-DAG-author surface lifted into `e2e/_lib/stage.py`.
+**v3 (current).** v2's multi-stage topology, now with graceful
+shutdown drain, kill+restart correctness coverage, and a refined
+join semantic that surfaces the user-owned multi-match choice.
 
 Topology (5 tables, 3 stages, 2 producers, all in one process):
 
@@ -225,18 +225,92 @@ Join semantics (driver + snapshot lookup)
   the driver columns (`id`, `kind`, `amount` projected onto
   `Change.values`), so we don't re-read `clean_purchases` &mdash;
   the batch *is* the driver.
-- The LEFT JOIN against `clean_refunds` runs on the consumer's
+- The lookup against `clean_refunds` runs on the consumer's
   connection inside `batch.transaction()`. DuckLake gives us
   snapshot-isolated reads inside the transaction, so the lookup sees
-  a consistent point-in-time view of `clean_refunds`. (This is the
-  honest answer to "where do you put the join state?": you don't.
-  The other table *is* the state.)
-- `joined_orders` is **append-only** by design. A refund that arrives
-  after its purchase has already been joined produces NULL
-  `refund_amount` *forever*. The trade-off (no re-emit on refund
-  arrival) keeps the model simple enough to read in one screenful;
-  upgrading to "repair on refund" is one more stage subscribing to
-  `clean_refunds` and UPSERTing `joined_orders`, but that's v3.
+  a consistent point-in-time view of `clean_refunds`. (The honest
+  answer to "where do you put the join state?": you don't. The
+  other table *is* the state.)
+- *Multi-match folding (user-owned).* The refunds producer
+  intentionally targets random purchase IDs, so a single purchase
+  can have N matching refunds in `clean_refunds`. How to fold
+  N refunds into one `joined_orders.refund_amount` is a domain
+  decision, not a CDC one. The example uses
+  `MAX(refund_amount)` in a scalar subquery so every driver row
+  produces exactly one output row and the example has a clean 1:1
+  invariant (`joined_orders.count == clean_purchases.count`,
+  `count(DISTINCT purchase_id) == count(*)`). Real pipelines might
+  pick `SUM`, `MIN`, the most-recent, or fan out to one row per
+  refund &mdash; the surrounding plumbing doesn't change.
+- *Append-only by contract.* A refund that arrives **after** its
+  purchase has already been joined leaves `refund_amount` as NULL
+  in `joined_orders` *forever*. This is not a bug to repair, it
+  is the contract of the snapshot-lookup join model: at the
+  moment the join ran, that refund did not exist. Whether to
+  repair it &mdash; with a periodic UPDATE sweep, an UPSERT-driven
+  repair stage, or not at all &mdash; is also a domain decision the
+  example deliberately doesn't make for you. The CDC layer gives
+  you the durable cursor and the atomic write boundary; what you
+  do with late-arriving lookup data is yours.
+
+Graceful shutdown (drain) and kill+restart
+------------------------------------------
+
+The example demonstrates two distinct shutdown shapes that real
+pipelines need:
+
+- *Polite shutdown* (timeout elapses, or operator hits Ctrl-C
+  once). Producers are told to stop emitting; `StageRunner.__exit__`
+  then triggers a *drain pass* on every stage's `DMLConsumer`.
+  Each consumer keeps long-polling `cdc_dml_changes_listen` until
+  it's been idle for `drain_idle_timeout` seconds (default 2 s),
+  then exits. After drain, headless metrics show
+  `producer_total == clean_total == joined_total` exactly &mdash;
+  no "single-batch shutdown tail" left over.
+- *Panic shutdown* (operator hits Ctrl-C twice in quick succession).
+  Drain is skipped; consumers exit on their next listen check;
+  daemons die on interpreter exit if even that hangs.
+
+Drain is wired through two new pieces:
+
+- `DMLConsumer.batches(drain_event=..., drain_idle_timeout=...)`
+  in the lib: a polite "finish what's in flight, then exit" knob
+  separate from the panic `stop_event`.
+- `StageRunner` owns a `_drain_event` internally and sets it on
+  `__exit__` *unless* `stop` is already set; the runner then waits
+  up to `drain_timeout_s` (default 5 s) for stages to finish
+  naturally before force-stopping anything still alive.
+
+Restart correctness is exercised by `test_restart.sh`. Two
+back-to-back runs against the same lake (`--keep-state` skips the
+hermetic catalog reset between them) should:
+
+- Continue producer ID space from the existing high-water mark in
+  `raw_purchases` / `raw_refunds`, so run 2 doesn't collide with
+  run 1's primary keys.
+- Pick up every consumer cursor from the snapshot run 1 last
+  committed (verified via `cdc_consumer_stats`).
+- Maintain the within-run 1:1 invariants on the cumulative tables.
+- Show strict cursor monotonicity across the boundary
+  (`run2.cursor > run1.cursor` for every consumer).
+
+The script asserts all of the above and refuses to clean up on
+failure so the dirty lake is available for inspection. Run it
+manually with `bash 01_pipeline_dag/test_restart.sh`.
+
+H-022 mitigation in the example. Empirically the lib's
+`retry_on_transient` policy doesn't reliably recover the H-022
+race when it fires against a *populated* postgres catalog (the
+canonical "kill+restart" shape). The example pre-warms by issuing
+one `SELECT cdc_version()` on `lake.connection` immediately after
+`LOAD ducklake_cdc` (see `_lib/config.py::load_cdc_extension`),
+which avoids the race entirely on the first cdc_dml_*/cdc_*-stats
+table-function call. Out-of-band stats reads (e.g.
+`inspect_lake.py`) additionally use a derived cursor for the
+cdc_* call so a parent connection that's already touched lake
+metadata doesn't re-arm the race. Both workarounds are
+documented under H-022 in
+`ducklake-cdc-extension/docs/hazard-log.md`.
 
 Why this shape and not some others
 ----------------------------------
@@ -277,27 +351,41 @@ The boring-but-important stuff (carried over from v1)
 Measured locally
 ----------------
 
-Apple M-series, postgres catalog via pgbouncer, disk storage, 30 s
-headless run:
+Apple M-series, postgres catalog via pgbouncer, disk storage,
+single 10 s headless run with drain enabled:
 
 | signal | value |
 |---|---|
-| `producer_purchases_total` | 16,600 |
-| `stage_normalize_purchases_rows` | 16,400 |
-| `producer_refunds_total` | 4,800 |
-| `stage_normalize_refunds_rows` | 4,800 |
-| `stage_join_orders_rows` | 16,400 |
+| `producer_purchases_total` | 5,800 |
+| `stage_normalize_purchases_rows` | 5,800 |
+| `producer_refunds_total` | 1,600 |
+| `stage_normalize_refunds_rows` | 1,600 |
+| `stage_join_orders_rows` | 5,800 |
 | `errors` | 0 |
-| apply p99 | ~470 ms |
-| aggregate throughput | ~1,250 rows/s (sum across stages) |
+| apply p99 | ~320 ms |
+| aggregate throughput | ~1,030 rows/s (sum across stages) |
 
-`producer_purchases_total - stage_normalize_purchases_rows = 200` is
-the same single-batch shutdown tail as v1: the producer commits one
-extra batch after the consumer has issued its final listen. Resolving
-that (graceful drain on stop) is on the v3 acceptance list. For now,
-`stage_join_orders_rows == stage_normalize_purchases_rows` which is
-the actually-meaningful invariant: every cleaned purchase makes it
-into `joined_orders` 1:1.
+Strict 1:1 across every edge &mdash; no "single-batch shutdown
+tail" anymore (v2's `producer_total - clean_total = 200` is gone).
+Drain on shutdown is what closes the gap.
+
+Cumulative across a kill+restart pair (`bash test_restart.sh`,
+two 8 s runs back-to-back):
+
+| signal | run 1 | run 2 (cumulative) |
+|---|---|---|
+| `raw_purchases` rows | 4,800 | 9,200 |
+| `clean_purchases` rows | 4,800 | 9,200 |
+| `joined_orders` rows | 4,800 | 9,200 |
+| `joined_orders` distinct purchase IDs | 4,800 | 9,200 |
+| `cursor_join_orders` (snapshot id) | 126 | 239 |
+
+`joined_orders.count == count(DISTINCT purchase_id)` across both
+runs is the exactly-once-across-restart invariant: no consumer
+replayed a batch after restart, no inserts duplicated under the
+producer's primary key. Cursor monotonicity (run 2 > run 1) shows
+the durable cursor genuinely picked up where the previous process
+left off rather than rewinding to "now."
 
 Known noise: `CDC_WAIT_SHARED_CONNECTION` fires once per stage on
 startup. The advisory is unconditional in the extension and is a
@@ -307,43 +395,13 @@ dedicated connection. Tracked as a follow-up under H-006 in
 output with `2>&1 | grep -v CDC_WAIT_SHARED_CONNECTION` until the
 extension-side suppression lands.
 
-**v3 -- next, planned in slices.**
+**v4 -- next, planned in slices.**
 
-The original v3 list grew to ~8 items. Breaking it into four
-themed slices so we can land each one cleanly without a giant
-in-flight branch. Slices are ordered by what most improves the
-example's *story* before what extends its surface; pick whichever
-one fits the next session's budget.
+What's left after v3 lands. Slices ordered by what most improves
+the example's *story* before what extends its surface; pick
+whichever one fits the next session's budget.
 
-*v3a -- correctness completion (the example feels finished)*
-
-- **Graceful drain on shutdown** so the headless metrics show
-  `producer_total == clean_total` exactly. Lib change: extend
-  `DMLConsumer.batches()` (or add a sibling) with a "drain to
-  current head, then exit" mode that StageRunner calls during
-  shutdown. Producer threads stop first, consumers drain to the
-  producers' final snapshot, then exit. Removes the 200-row tail
-  caveat and lets CI assert strict 1:1 instead of "within one
-  batch."
-- **Kill+restart correctness pass** demonstrating exactly-once at
-  every stage edge. New script `01_pipeline_dag/test_restart.sh`
-  (or pytest): run the app in headless for 5 s, `kill -9`, restart
-  for 10 s, assert `joined_orders` row counts and content are
-  consistent with one continuous run. No lib changes -- the
-  durable-cursor guarantee is already live, this just makes it
-  visible and CI-checkable.
-- **Repair-on-refund stage** that subscribes to `clean_refunds`
-  and UPDATEs `joined_orders.refund_amount` for purchases already
-  joined. Removes the "refund-after-join is permanent NULL"
-  trade-off from the v2 narrative. Open design point: needs a
-  primary key on `joined_orders.purchase_id` and a story for the
-  insert/update race between `join_orders` and `repair_orders`
-  (probably a periodic batch sweep over `joined_orders WHERE
-  refund_amount IS NULL`, not pure CDC -- the snapshot-isolated
-  cursor model can't see "was joined while my batch was open").
-  Document the trade-off honestly.
-
-*v3b -- catalog / storage portability*
+*v4a -- catalog / storage portability*
 
 - **`--catalog sqlite` and `--catalog duckdb`** so the example
   matches `e2e/catalog_matrix/` parity. Most of the work is in
@@ -354,7 +412,7 @@ one fits the next session's budget.
   S3 creds from `e2e/.env`; storage helper picks `s3` over `disk`
   based on the flag.
 
-*v3c -- schema evolution*
+*v4b -- schema evolution*
 
 - **DDL consumer + automated schema-boundary handler.** New
   fourth stage that subscribes to schema events on `raw_*` tables;
@@ -363,7 +421,7 @@ one fits the next session's budget.
   pipeline self-heals. The talk-story payoff is "inject `ALTER
   TABLE` mid-stream and watch nothing break."
 
-*v3d -- perf + published numbers*
+*v4c -- perf + published numbers*
 
 - **Perf tuning** to hit &ge; 5,000 raw rows/s with joined-stage
   lag p99 &le; 1 s on the postgres catalog. Likely candidates:
