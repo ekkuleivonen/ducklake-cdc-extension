@@ -124,7 +124,6 @@ jobs:
           uv run --locked python e2e/smoke/compat_warning_smoke.py
           uv run --locked python e2e/smoke/lease_multiconn_smoke.py
           uv run --locked python e2e/smoke/cdc_wait_interrupt_smoke.py
-          uv run --locked python e2e/smoke/toctou_expire_smoke.py
 
       # Republish the built ducklake_cdc.duckdb_extension under the same
       # name the full distribution matrix used to produce, so any workflow
@@ -159,7 +158,7 @@ jobs:
 
       - name: Check DuckLake changes-map reference
         run: |
-          uv run --locked python e2e/upstream/enumerate_changes_map.py --check
+          uv run --locked python e2e/smoke/enumerate_changes_map.py --check
 
   ci-pass:
     name: CI Pass

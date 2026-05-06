@@ -1,0 +1,74 @@
+# name: test/schema_diff.test
+# description: table schema diff contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/schema_diff.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/schema_diff_data');
+
+statement ok
+CREATE TABLE lake.items(id INTEGER, payload VARCHAR);
+
+statement ok
+SET VARIABLE before_alter = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+ALTER TABLE lake.items ADD COLUMN extra VARCHAR;
+
+statement ok
+SET VARIABLE after_alter = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+query TT
+SELECT column_name, column_type
+FROM (
+  DESCRIBE SELECT * FROM cdc_schema_diff(
+    'lake',
+    'items',
+    getvariable('before_alter'),
+    getvariable('after_alter')
+  )
+);
+----
+snapshot_id	BIGINT
+snapshot_time	TIMESTAMP WITH TIME ZONE
+change_kind	VARCHAR
+column_id	BIGINT
+old_name	VARCHAR
+new_name	VARCHAR
+old_type	VARCHAR
+new_type	VARCHAR
+old_default	VARCHAR
+new_default	VARCHAR
+old_nullable	BOOLEAN
+new_nullable	BOOLEAN
+parent_column_id	BIGINT
+
+query I
+SELECT count(*) >= 1
+FROM cdc_schema_diff(
+  'lake',
+  'items',
+  getvariable('before_alter'),
+  getvariable('after_alter')
+)
+WHERE change_kind = 'added'
+  AND new_name = 'extra'
+  AND lower(new_type) = 'varchar';
+----
+true

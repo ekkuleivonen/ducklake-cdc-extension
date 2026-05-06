@@ -1,0 +1,86 @@
+# name: test/dml_changes.test
+# description: typed DML change read/listen/query contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/dml_changes.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/dml_changes_data');
+
+statement ok
+CREATE TABLE lake.orders(id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO lake.orders VALUES (1, 'new'), (2, 'paid');
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'orders_sink',
+  table_name := 'orders',
+  start_at := 'beginning'
+);
+
+query TT
+SELECT column_name, column_type
+FROM (
+  DESCRIBE SELECT * FROM cdc_dml_changes_read(
+    'lake',
+    'orders_sink',
+    max_snapshots := 1000
+  )
+);
+----
+consumer_name	VARCHAR
+start_snapshot	BIGINT
+end_snapshot	BIGINT
+snapshot_id	BIGINT
+rowid	BIGINT
+change_type	VARCHAR
+table_id	BIGINT
+table_name	VARCHAR
+id	INTEGER
+status	VARCHAR
+snapshot_time	TIMESTAMP WITH TIME ZONE
+author	VARCHAR
+commit_message	VARCHAR
+commit_extra_info	VARCHAR
+
+query I
+SELECT count(*) >= 2
+FROM cdc_dml_changes_read('lake', 'orders_sink', max_snapshots := 1000)
+WHERE table_name = 'main.orders'
+  AND change_type = 'insert';
+----
+true
+
+query I
+SELECT count(*) >= 2
+FROM cdc_dml_changes_query('lake', 0, table_name := 'orders')
+WHERE change_type = 'insert';
+----
+true
+
+query I
+SELECT count(*) >= 2
+FROM cdc_dml_changes_listen(
+  'lake',
+  'orders_sink',
+  timeout_ms := 0,
+  max_snapshots := 1000,
+  "coalesce" := false
+)
+WHERE change_type = 'insert';
+----
+true

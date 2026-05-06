@@ -48,7 +48,7 @@ version `XX`:
    DuckLake catalog and run the CDC smoke path.
 6. Run the Python smoke probes in `e2e/smoke/` for behaviours SQLLogicTest
    cannot express, especially notices, leases, waits, and backend-specific
-   catalog behaviour. Run the upstream probes in `e2e/upstream/` when the
+   catalog behaviour. Run `e2e/smoke/enumerate_changes_map.py --check` when the
    DuckLake dependency changes.
 7. Add a CI matrix leg for `XX` and require full CI to pass on the branch.
 8. Update the compatibility docs and release notes with the exact tuple:
@@ -102,7 +102,7 @@ release target.
 Run a single SQLLogicTest file:
 
 ```bash
-build/release/test/unittest --test-dir . "test/ducklake_cdc.test"
+build/release/test/unittest --test-dir . "test/version_and_load.test"
 ```
 
 Swap the path for any file under `test/`.
@@ -135,18 +135,17 @@ the ignored `.cache/pre-commit/` directory. That venv provides
 `clang_format==11.0.1`, `black==24.10.0`, and `cmake-format`, so the check does
 not depend on the developer's system `clang-format` version.
 
-## Python smoke and upstream probes
+## Python smoke probes
 
 Some behaviours are easier to smoke-test from Python (stderr notices,
 multi-connection leases, explicit interrupts, etc.). Dependencies live in the root `pyproject.toml` (Python **3.14+**, for `ducklake-client`); run from the repository root:
 
 ```bash
 uv run python e2e/smoke/lease_multiconn_smoke.py
-uv run python e2e/upstream/enumerate_changes_map.py --check
+uv run python e2e/smoke/enumerate_changes_map.py --check
 ```
 
-See [`e2e/smoke/README.md`](../e2e/smoke/README.md) and
-[`e2e/upstream/README.md`](../e2e/upstream/README.md) for the full lists.
+See [`e2e/smoke/README.md`](../e2e/smoke/README.md) for the full lists (extension smoke scripts plus the DuckLake MAP-key contract probe).
 
 ## Branch and CI flow
 
@@ -183,13 +182,20 @@ feature_* -> main -> manual release
   queries).
 - `src/include/stats.hpp` + `src/stats.cpp` own the observability surface
   (`cdc_consumer_stats`, `cdc_audit_events`, `cdc_doctor`).
-- `test/ducklake_cdc.test` is the smallest extension smoke test.
-- `test/consumer_state.test` and `test/sugar.test` are the best
-  behavioural specs for the cursor and sugar surfaces.
+- `test/version_and_load.test` is the smallest extension smoke test.
+- `test/consumer_lifecycle.test` covers create/list/reset/lease/drop primitives.
+- `test/dml_ticks.test` and `test/dml_changes.test` cover the DML metadata and
+  row payload surfaces.
+- `test/dml_schema_shape_pinning.test` is the best behavioural spec for the
+  DML cursor and schema-boundary contract.
+- `test/ddl_ticks.test`, `test/ddl_changes.test`, and `test/schema_diff.test`
+  cover the DDL metadata, parsed change, and column diff surfaces.
+- `test/observability.test` covers stats, audit log, and doctor surfaces.
+- `test/retention_gap.test` covers `CDC_GAP` and reset recovery after DuckLake
+  snapshot expiry.
 - `e2e/smoke/README.md` documents Python smoke tools that do not fit
-  SQLLogicTest well.
-- `e2e/upstream/README.md` documents DuckLake compatibility probes that pin
-  upstream behaviour this extension depends on.
+  SQLLogicTest well, including the DuckLake `snapshots().changes` MAP contract
+  probe (`enumerate_changes_map.py`).
 
 For a minimal SQL walk-through of primitives, use the quickstart block in the
 root [`README.md`](../README.md).

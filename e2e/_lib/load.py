@@ -82,6 +82,7 @@ from threading import Lock
 from typing import Any
 
 import duckdb
+from ducklake_cdc_client import prewarm
 
 from _lib.metrics import MetricsRecorder
 from _lib.tui import log
@@ -413,7 +414,7 @@ def prime(
     rows_per_file = corpus.rows_per_file
     conn = lake.connection.cursor()
     # H-022 pre-warm on the derived cursor (see config.load_cdc_extension).
-    conn.execute("SELECT cdc_version()").fetchone()
+    prewarm(conn)
 
     t_start = time.monotonic()
     conn.execute("BEGIN")
@@ -512,7 +513,7 @@ def replay(
         raise RuntimeError(f"corpus {corpus.shape.name!r} has no files; call prebuild() first")
 
     conn = lake.connection.cursor()
-    conn.execute("SELECT cdc_version()").fetchone()
+    prewarm(conn)
     next_id = int(
         conn.execute(
             f"SELECT COALESCE(MAX(id), -1) + 1 FROM {corpus.shape.table}"

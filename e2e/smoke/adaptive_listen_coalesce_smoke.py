@@ -6,7 +6,8 @@ returned window. After the first couple of quick, small windows, the extension
 should reactively wait a few milliseconds after work is visible so it can claim
 a larger visible window without taxing the first event after idle.
 
-Uses :mod:`ducklake_client` for attach, matching the e2e demos.
+Uses :mod:`ducklake_client` for attach + ``lake.table.create``, and
+:class:`ducklake_cdc_client.CDCClient` for CDC calls.
 
 Usage:
 
@@ -21,8 +22,8 @@ import threading
 import time
 from pathlib import Path
 
-import duckdb
-from ducklake_client import DiskStorage, DuckDBCatalog, DuckDBConfig, DuckLake
+from ducklake_cdc_client import CDCClient
+from ducklake_client import ColumnDef, DiskStorage, DuckDBCatalog, DuckDBConfig, DuckLake
 
 REPO = Path(__file__).resolve().parents[2]
 BUILD = os.environ.get("DUCKLAKE_CDC_BUILD", "release")
@@ -38,24 +39,19 @@ def open_lake(lake_path: Path, data_path: Path) -> DuckLake:
     )
 
 
-def listen_window(conn: duckdb.DuckDBPyConnection) -> tuple[int, int, int]:
-    rows = conn.execute(
-        """
-        SELECT start_snapshot, end_snapshot, count(*)::BIGINT AS rows
-        FROM cdc_dml_changes_listen(
-          'lake',
-          'adaptive',
-          timeout_ms := 1000,
-          max_snapshots := 100
-        )
-        GROUP BY start_snapshot, end_snapshot
-        """
-    ).fetchall()
+def listen_window(client: CDCClient, consumer_name: str = "adaptive") -> tuple[int, int, int]:
+    rows = client.cdc_dml_changes_listen(
+        consumer_name,
+        timeout_ms=1000,
+        max_snapshots=100,
+    )
     if not rows:
         return (-1, -1, 0)
-    start, end, row_count = rows[0]
-    conn.execute("SELECT * FROM cdc_commit('lake', 'adaptive', ?)", [end])
-    return (int(start), int(end), int(row_count))
+    r0 = rows[0]
+    start = int(r0.start_snapshot if r0.start_snapshot is not None else r0.snapshot_id)
+    end = int(r0.end_snapshot if r0.end_snapshot is not None else r0.snapshot_id)
+    client.cdc_commit(consumer_name, end)
+    return (start, end, len(rows))
 
 
 def main() -> int:
@@ -70,17 +66,20 @@ def main() -> int:
         lake = open_lake(lake_path, data_path)
         try:
             lake.connection.load_extension(str(CDC_EXTENSION))
-            setup = lake.connection
-            setup.execute("CREATE TABLE lake.events(id INTEGER, payload VARCHAR)")
-            setup.execute("SELECT * FROM cdc_dml_consumer_create('lake', 'adaptive', table_name := 'events')")
-            setup.execute("INSERT INTO lake.events VALUES (0, 'seed')")
+            lake.table.create(
+                "events",
+                id=ColumnDef("INTEGER"),
+                payload=ColumnDef("VARCHAR"),
+            )
+            client = CDCClient(lake, install_extension=False)
+            client.cdc_dml_consumer_create("adaptive", table_name="events")
+            lake.connection.execute("INSERT INTO lake.events VALUES (0, 'seed')")
 
-            consumer = setup.cursor()
-            first = listen_window(consumer)
+            first = listen_window(client)
             if first[2] != 1:
                 raise AssertionError(f"expected one seed row in first listen, got {first}")
 
-            producer = setup.cursor()
+            producer = lake.connection.cursor()
             done = threading.Event()
 
             def produce() -> None:
@@ -95,7 +94,7 @@ def main() -> int:
             windows: list[tuple[int, int, int]] = []
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
-                window = listen_window(consumer)
+                window = listen_window(client)
                 if window[2] > 0:
                     windows.append(window)
                 if done.is_set() and sum(row_count for _, _, row_count in windows) >= 39:

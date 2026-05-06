@@ -791,6 +791,58 @@ bool ResolveTableByIdAt(duckdb::Connection &conn, const std::string &catalog_nam
 	return true;
 }
 
+bool StartAtMeansBeginning(const std::string &start_at) {
+	const auto lower = duckdb::StringUtil::Lower(start_at);
+	return lower == "beginning" || lower == "oldest" || lower == "oldest_available";
+}
+
+bool ResolveFirstLiveTableById(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
+                               int64_t &snapshot_id, int64_t &schema_id, std::string &qualified_name) {
+	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, s.schema_name || '.' || t.table_name FROM " +
+	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) +
+	                         " AND s.begin_snapshot <= t.begin_snapshot "
+	                         "AND (s.end_snapshot IS NULL OR s.end_snapshot > t.begin_snapshot) "
+	                         "ORDER BY t.begin_snapshot ASC LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
+	    result->GetValue(1, 0).IsNull() || result->GetValue(2, 0).IsNull()) {
+		return false;
+	}
+	snapshot_id = result->GetValue(0, 0).GetValue<int64_t>();
+	schema_id = result->GetValue(1, 0).GetValue<int64_t>();
+	qualified_name = result->GetValue(2, 0).ToString();
+	return true;
+}
+
+bool ResolveFirstLiveTableByName(duckdb::Connection &conn, const std::string &catalog_name,
+                                 const std::string &qualified_name, int64_t &snapshot_id, int64_t &schema_id,
+                                 int64_t &table_id) {
+	const auto dot = qualified_name.find('.');
+	if (dot == std::string::npos) {
+		return ResolveFirstLiveTableByName(conn, catalog_name, std::string("main.") + qualified_name, snapshot_id,
+		                                   schema_id, table_id);
+	}
+	const auto schema_name = qualified_name.substr(0, dot);
+	const auto table_name = qualified_name.substr(dot + 1);
+	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, t.table_id FROM " +
+	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) +
+	                         " AND t.table_name = " + QuoteLiteral(table_name) +
+	                         " AND s.begin_snapshot <= t.begin_snapshot "
+	                         "AND (s.end_snapshot IS NULL OR s.end_snapshot > t.begin_snapshot) "
+	                         "ORDER BY t.begin_snapshot ASC LIMIT 1");
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
+	    result->GetValue(1, 0).IsNull() || result->GetValue(2, 0).IsNull()) {
+		return false;
+	}
+	snapshot_id = result->GetValue(0, 0).GetValue<int64_t>();
+	schema_id = result->GetValue(1, 0).GetValue<int64_t>();
+	table_id = result->GetValue(2, 0).GetValue<int64_t>();
+	return true;
+}
+
 std::string SubscriptionJsonArray(const std::vector<ResolvedSubscriptionInput> &subscriptions) {
 	std::ostringstream out;
 	out << "[";
@@ -896,13 +948,22 @@ std::vector<ResolvedSubscriptionInput> ResolveDmlCreateSubscriptions(duckdb::Con
 	if (!data.table_id.IsNull()) {
 		table_id = data.table_id.GetValue<int64_t>();
 		if (!ResolveTableByIdAt(conn, catalog_name, table_id, snapshot_id, schema_id, qualified)) {
-			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
-			                                    static_cast<long long>(table_id));
+			int64_t first_live_snapshot = -1;
+			if (!StartAtMeansBeginning(data.start_at) ||
+			    !ResolveFirstLiveTableById(conn, catalog_name, table_id, first_live_snapshot, schema_id, qualified)) {
+				throw duckdb::InvalidInputException("cdc_dml_consumer_create: table_id %lld is not live",
+				                                    static_cast<long long>(table_id));
+			}
 		}
 	} else {
 		qualified = QualifyTableInput(data.table_name.GetValue<std::string>(), duckdb::Value());
 		if (!ResolveCurrentTableName(conn, catalog_name, qualified, snapshot_id, schema_id, table_id)) {
-			throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live", qualified);
+			int64_t first_live_snapshot = -1;
+			if (!StartAtMeansBeginning(data.start_at) ||
+			    !ResolveFirstLiveTableByName(conn, catalog_name, qualified, first_live_snapshot, schema_id, table_id)) {
+				throw duckdb::InvalidInputException("cdc_dml_consumer_create: table identity '%s' is not live",
+				                                    qualified);
+			}
 		}
 	}
 	std::vector<ResolvedSubscriptionInput> out;

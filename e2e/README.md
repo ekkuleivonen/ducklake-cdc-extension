@@ -96,7 +96,7 @@ Each example should prove a real operating property:
 
 - `_lib/`: shared config, load generation, metrics, stage runner, and TUI glue.
 - `smoke/`: narrow extension probes that need Python/C++ harnesses.
-- `upstream/`: DuckDB/DuckLake contract probes that do not load this extension.
+- `smoke/enumerate_changes_map.py`: DuckDB/DuckLake contract probe for `snapshots().changes` MAP keys across catalog backends (does not load this extension).
 
 ## S3 Storage
 

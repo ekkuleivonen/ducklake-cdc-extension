@@ -11,10 +11,9 @@ test/python/__pycache__/
 .Rhistory
 
 # Python runtime artifacts. The committed outputs under
-# e2e/upstream/output/ are reference data and should stay tracked.
+# e2e/smoke/output/ are reference data and should stay tracked.
 .venv/
 e2e/smoke/__pycache__/
-e2e/upstream/__pycache__/
 __pycache__/
 *.py[cod]
 *$py.class

@@ -20,13 +20,14 @@ if str(_E2E_ROOT) not in sys.path:
 from ducklake_cdc_client import DMLConsumer  # noqa: E402
 from ducklake_cdc_client.client import CDCClient, ChangeRow, SchemaChangeRow  # noqa: E402
 from ducklake_cdc_client.enums import ChangeType  # noqa: E402
+from ducklake_client import ColumnDef  # noqa: E402
 from rich.layout import Layout  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 from _lib.cli import emit_json_summary, make_parser, parse_common  # noqa: E402
-from _lib.config import load_cdc_extension, open_lake, reset_lake  # noqa: E402
+from _lib.config import catalog_head_snapshot, load_cdc_extension, open_lake, reset_lake  # noqa: E402
 from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
 
@@ -132,38 +133,34 @@ class DemoState:
 
 
 def setup_schema(lake: Any) -> None:
-    conn = lake.connection
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lake.orders (
-            id         BIGINT,
-            status     VARCHAR,
-            amount     DOUBLE,
-            updated_at TIMESTAMP
-        )
-        """
+    lake.table.create(
+        "orders",
+        id=ColumnDef("BIGINT"),
+        status=ColumnDef("VARCHAR"),
+        amount=ColumnDef("DOUBLE"),
+        updated_at=ColumnDef("TIMESTAMP"),
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lake.derived_orders (
-            id         BIGINT,
-            status     VARCHAR,
-            amount     DOUBLE,
-            updated_at TIMESTAMP
-        )
-        """
+    lake.table.create(
+        "derived_orders",
+        id=ColumnDef("BIGINT"),
+        status=ColumnDef("VARCHAR"),
+        amount=ColumnDef("DOUBLE"),
+        updated_at=ColumnDef("TIMESTAMP"),
     )
 
 
-def describe_table(lake: Any, table: str) -> tuple[SchemaColumn, ...]:
-    rows = lake.connection.execute(f"DESCRIBE SELECT * FROM {table}").fetchall()
-    return tuple(SchemaColumn(str(row[0]), str(row[1]), str(row[2])) for row in rows)
+def describe_table(lake: Any, logical_name: str) -> tuple[SchemaColumn, ...]:
+    info = lake.table.info(logical_name, include_snapshots=False, include_row_count=False)
+    return tuple(
+        SchemaColumn(col.name, col.data_type, "YES" if col.nullable else "NO")
+        for col in info.columns
+    )
 
 
 def refresh_schemas(lake: Any, state: DemoState) -> None:
     state.update(
-        source_schema=describe_table(lake, SOURCE_TABLE),
-        sink_schema=describe_table(lake, SINK_TABLE),
+        source_schema=describe_table(lake, "orders"),
+        sink_schema=describe_table(lake, "derived_orders"),
     )
 
 
@@ -283,21 +280,12 @@ def listen_and_apply(
 
     end_snapshot = max(row.end_snapshot or row.snapshot_id for row in rows)
     applied = 0
-    conn = lake.connection
-    conn.execute("BEGIN")
-    try:
+    with lake.transaction():
         for row in rows:
-            if apply_change(conn, row):
+            if apply_change(lake, row):
                 applied += 1
                 state.add_dml(format_change(row, epoch))
         client.cdc_commit(consumer_name, end_snapshot)
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
     recorder.record_rows(applied)
     view = state.snapshot()
@@ -311,7 +299,8 @@ def listen_and_apply(
     return applied
 
 
-def apply_change(conn: Any, row: ChangeRow) -> bool:
+def apply_change(lake: Any, row: ChangeRow) -> bool:
+    conn = lake.connection
     values = dict(row.values)
     order_id = values.get("id")
     if order_id is None:
@@ -324,7 +313,14 @@ def apply_change(conn: Any, row: ChangeRow) -> bool:
     if row.change_type not in (ChangeType.INSERT, ChangeType.UPDATE_POSTIMAGE):
         return False
 
-    sink_columns = [str(col[0]) for col in conn.execute(f"DESCRIBE SELECT * FROM {SINK_TABLE}").fetchall()]
+    sink_columns = [
+        col.name
+        for col in lake.table.info(
+            "derived_orders",
+            include_snapshots=False,
+            include_row_count=False,
+        ).columns
+    ]
     conn.execute(f"DELETE FROM {SINK_TABLE} WHERE id = ?", [order_id])
     insert_values = [value_for_sink_column(column, values) for column in sink_columns]
     placeholders = ", ".join("?" for _ in sink_columns)
@@ -376,16 +372,9 @@ def trigger_schema_change(lake: Any, state: DemoState, mutation: SchemaMutation)
     else:
         raise AssertionError(f"unknown schema mutation op: {mutation.op}")
     refresh_schemas(lake, state)
-    snapshot_id = current_snapshot(lake)
+    snapshot_id = catalog_head_snapshot(lake)
     state.update(boundary_snapshot=snapshot_id)
     return snapshot_id
-
-
-def current_snapshot(lake: Any) -> int:
-    value = lake.connection.execute(
-        "SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot"
-    ).fetchone()[0]
-    return int(value)
 
 
 def inspect_boundary(consumer: DMLConsumer, state: DemoState) -> int:

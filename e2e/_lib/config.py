@@ -25,6 +25,7 @@ from os import environ
 from pathlib import Path
 from typing import Literal
 
+from ducklake_cdc_client import prewarm
 from ducklake_client import (
     DiskStorage,
     DuckDBCatalog,
@@ -133,8 +134,8 @@ def resolve_cdc_extension_path() -> Path:
 def load_cdc_extension(lake: DuckLake) -> None:
     """Load the locally built ducklake_cdc artifact into ``lake``'s connection.
 
-    Also issues a single ``SELECT cdc_version()`` against ``lake.connection``
-    as an H-022 pre-warm. Empirically, the first cdc_* call on a fresh
+    Also drives :func:`ducklake_cdc_client.prewarm` once against
+    ``lake.connection`` as an H-022 pre-warm. Empirically, the first cdc_* call on a fresh
     process against a *non-empty* postgres catalog (i.e. one that already
     has the ``__ducklake_cdc.*`` metadata schema from a previous run) can
     surface the H-022 ``thread::join failed: Invalid argument`` race --
@@ -147,7 +148,8 @@ def load_cdc_extension(lake: DuckLake) -> None:
 
     The mitigation: drive a cheap *scalar* cdc_* call once, before any
     cdc_dml_*/cdc_ddl_* table function or any derived cursor uses one.
-    ``cdc_version()`` does not touch the metadata catalog, takes < 1 ms,
+    ``prewarm()`` maps to ``SELECT cdc_version()`` — it does not touch the
+    metadata catalog, takes < 1 ms,
     and warms whatever internal connection state the H-022 race has
     historically traced to. Tested empirically: with the pre-warm,
     ``cdc_dml_consumer_create`` on three derived cursors all succeed
@@ -157,7 +159,16 @@ def load_cdc_extension(lake: DuckLake) -> None:
     Tracked under H-022 in ``ducklake-cdc-extension/docs/hazard-log.md``.
     """
     lake.connection.load_extension(str(resolve_cdc_extension_path()))
-    lake.connection.execute("SELECT cdc_version()").fetchone()
+    prewarm(lake.connection)
+
+
+def catalog_head_snapshot(lake: DuckLake) -> int:
+    """Latest catalog snapshot id via :meth:`ducklake_client.DuckLake.snapshots`."""
+
+    latest = lake.snapshots.latest()
+    if latest is None:
+        raise RuntimeError("catalog returned no snapshot rows from snapshots()")
+    return latest
 
 
 # ---------------------------------------------------------------------------

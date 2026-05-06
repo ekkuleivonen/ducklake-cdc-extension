@@ -26,6 +26,7 @@ if str(_E2E_ROOT) not in sys.path:
     sys.path.insert(0, str(_E2E_ROOT))
 
 from ducklake_cdc_client import DMLConsumer  # noqa: E402
+from ducklake_client import ColumnDef, DuckLake  # noqa: E402
 from rich.layout import Layout  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
@@ -76,15 +77,12 @@ HIST_LABELS: tuple[str, ...] = ("<5ms", "5-10ms", "10-25ms", "25-100ms", ">100ms
 # ---------------------------------------------------------------------------
 
 
-def setup_schema(conn: Any) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lake.raw_ticks (
-            id           BIGINT,
-            payload      VARCHAR,
-            created_at   TIMESTAMP
-        )
-        """
+def setup_schema(lake: DuckLake) -> None:
+    lake.table.create(
+        "raw_ticks",
+        id=ColumnDef("BIGINT"),
+        payload=ColumnDef("VARCHAR"),
+        created_at=ColumnDef("TIMESTAMP"),
     )
 
 
@@ -481,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
 
     lake = open_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
     load_cdc_extension(lake)
-    setup_schema(lake.connection)
+    setup_schema(lake)
     log("schema ready")
 
     recorder = MetricsRecorder(

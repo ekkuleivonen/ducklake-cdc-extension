@@ -295,10 +295,13 @@ DML consumers do not dynamically subscribe to future tables through schema or
 catalog filters. That policy belongs in application code, usually driven by a
 separate DDL consumer.
 
-Name input is resolved at `start_at` and persisted as `table_id`. The
-table subscription follows the same `table_id` across renames. Drop +
-recreate with the same name is a new identity and requires a new
-subscription/consumer.
+Name input is resolved at `start_at` and persisted as `table_id`. For
+`start_at := 'beginning'`, `'oldest'`, or `'oldest_available'`, DML creation
+resolves `table_name` / `table_id` at the table's first live snapshot while
+leaving the consumer cursor at the requested beginning snapshot, so a consumer
+can be created directly over existing physical history. The table subscription
+follows the same `table_id` across renames. Drop + recreate with the same name
+is a new identity and requires a new subscription/consumer.
 
 DML consumers are pinned to the schema shape of their subscribed table at
 creation time. The shape is implicit: it is whatever shape applies at

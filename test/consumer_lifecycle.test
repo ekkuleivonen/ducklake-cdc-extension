@@ -1,0 +1,84 @@
+# name: test/consumer_lifecycle.test
+# description: consumer create/list/reset/lease/drop lifecycle contract
+# group: [test]
+
+require ducklake_cdc
+
+require icu
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/consumer_lifecycle.ducklake' AS lake
+  (DATA_PATH '__TEST_DIR__/consumer_lifecycle_data');
+
+statement ok
+CREATE TABLE lake.items(id INTEGER, payload VARCHAR);
+
+statement ok
+INSERT INTO lake.items VALUES (1, 'one'), (2, 'two');
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'items_sink',
+  table_name := 'items',
+  start_at := 'beginning'
+);
+
+statement ok
+SELECT * FROM cdc_ddl_consumer_create(
+  'lake',
+  'ddl_sink',
+  schemas := ['main'],
+  start_at := 'beginning'
+);
+
+query III
+SELECT count(*),
+       count(*) FILTER (WHERE consumer_kind = 'dml'),
+       count(*) FILTER (WHERE consumer_kind = 'ddl')
+FROM cdc_list_consumers('lake');
+----
+2	1	1
+
+query I
+SELECT count(*) >= 2
+FROM cdc_list_subscriptions('lake');
+----
+true
+
+statement ok
+SELECT * FROM cdc_window('lake', 'items_sink');
+
+query I
+SELECT heartbeat_extended
+FROM cdc_consumer_heartbeat('lake', 'items_sink');
+----
+true
+
+query I
+SELECT previous_token IS NOT NULL
+FROM cdc_consumer_force_release('lake', 'items_sink');
+----
+true
+
+query II
+SELECT consumer_name = 'items_sink',
+       last_committed_snapshot >= 0
+FROM cdc_consumer_drop('lake', 'items_sink');
+----
+true	true
+
+query I
+SELECT count(*)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'items_sink';
+----
+0

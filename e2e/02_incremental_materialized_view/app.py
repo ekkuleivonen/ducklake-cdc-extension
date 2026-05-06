@@ -7,7 +7,7 @@ import signal
 import sys
 import threading
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +20,7 @@ from ducklake_cdc_client import DMLConsumer  # noqa: E402
 from ducklake_cdc_client.client import CDCClient  # noqa: E402
 from ducklake_cdc_client.enums import ChangeType  # noqa: E402
 from ducklake_cdc_client.types import Change, DMLBatch  # noqa: E402
+from ducklake_client import ColumnDef  # noqa: E402
 from rich.layout import Layout  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
@@ -177,27 +178,20 @@ EVENTS: tuple[SourceEvent, ...] = (
 
 
 def setup_schema(lake: Any) -> None:
-    conn = lake.connection
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lake.orders (
-            order_id    BIGINT,
-            customer_id BIGINT,
-            order_date  DATE,
-            status      VARCHAR,
-            amount      DOUBLE,
-            updated_at  TIMESTAMP
-        )
-        """
+    lake.table.create(
+        "orders",
+        order_id=ColumnDef("BIGINT"),
+        customer_id=ColumnDef("BIGINT"),
+        order_date=ColumnDef("DATE"),
+        status=ColumnDef("VARCHAR"),
+        amount=ColumnDef("DOUBLE"),
+        updated_at=ColumnDef("TIMESTAMP"),
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS lake.daily_revenue (
-            order_date  DATE,
-            paid_orders BIGINT,
-            revenue     DOUBLE
-        )
-        """
+    lake.table.create(
+        "daily_revenue",
+        order_date=ColumnDef("DATE"),
+        paid_orders=ColumnDef("BIGINT"),
+        revenue=ColumnDef("DOUBLE"),
     )
 
 

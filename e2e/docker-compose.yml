@@ -10,7 +10,7 @@
 #   ./e2e/setup-garage.sh                         # one-time, writes credentials
 #   uv run --project e2e python e2e/04_cache_refresh/app.py
 #   uv run --project e2e python e2e/ci_demo_assertions.py
-#   uv run python e2e/upstream/enumerate_changes_map.py --check
+#   uv run python e2e/smoke/enumerate_changes_map.py --check
 #   docker compose -f e2e/docker-compose.yml down -v
 #
 # Ports:

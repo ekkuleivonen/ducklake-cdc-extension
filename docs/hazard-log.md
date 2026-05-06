@@ -32,7 +32,8 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Two readers could process or commit the same consumer window if the
   owner-token lease is wrong.
 - Status: partially handled.
-- Handling: `e2e/smoke/lease_multiconn_smoke.py` and `test/consumer_state.test`
+- Handling: `e2e/smoke/lease_multiconn_smoke.py`,
+  `test/consumer_lifecycle.test`, and `test/dml_schema_shape_pinning.test`
   cover same-connection idempotence, second-reader rejection, force release,
   and stolen-lease commit failure.
 - Notes: `cdc_consumer_force_release` is only for a holder that is
@@ -72,8 +73,8 @@ go; this file says what can hurt users or maintainers on the way there.
   maintenance and silently miss changes.
 - Status: handled for the main gap path.
 - Handling: `cdc_window` raises `CDC_GAP`, `cdc_consumer_reset` supports
-  recovery, and `e2e/smoke/toctou_expire_smoke.py` covers the compaction gap
-  path. Planned stateless range helpers must apply the same explicit gap
+  recovery, and `test/retention_gap.test` covers the compaction gap path.
+  Planned stateless range helpers must apply the same explicit gap
   handling when `from_snapshot` is older than the oldest available snapshot.
 - Next action: Keep operator docs clear that retention must exceed expected
   consumer lag.
@@ -162,7 +163,7 @@ go; this file says what can hurt users or maintainers on the way there.
   skip small batches.
 - Status: handled for the extension surface.
 - Handling: The extension's discovery logic checks the inlined keys, and
-  `e2e/upstream/enumerate_changes_map.py` tracks the observed DuckLake key
+  `e2e/smoke/enumerate_changes_map.py` tracks the observed DuckLake key
   set.
 - Next action: Keep any new discovery/filtering code covered by the upstream
   key probe or a focused SQL test.
@@ -186,7 +187,7 @@ go; this file says what can hurt users or maintainers on the way there.
   `DATA_INLINING_ROW_LIMIT = 100`, but DuckLake's default is 10. That can make
   tests miss the inlined-data path entirely.
 - Status: handled in upstream probes.
-- Handling: `e2e/upstream/enumerate_changes_map.py` sets
+- Handling: `e2e/smoke/enumerate_changes_map.py` sets
   `DATA_INLINING_ROW_LIMIT = 10` explicitly.
 - Next action: Set `DATA_INLINING_ROW_LIMIT` explicitly in any test that cares
   about inlined-vs-materialized behavior.
@@ -355,9 +356,7 @@ go; this file says what can hurt users or maintainers on the way there.
     indicate a different bug. Reproduces on inline-DuckDB catalogs by
     making `cdc_consumer_force_release(<fresh catalog>, <missing
     consumer>)` the very first cdc_* call against the lake; ~1-in-5
-    attempts on darwin 25.3 / Python 3.14. See
-    `e2e/smoke/_repro_force_release_empty.py` if we want a regression
-    harness later.
+    attempts on darwin 25.3 / Python 3.14.
   The most plausible shared mutex is inside the auto-loaded DuckLake
   extension's catalog (it owns the attached metadata database and
   sees both the outer read and the inner bootstrap write against it);
@@ -422,14 +421,16 @@ go; this file says what can hurt users or maintainers on the way there.
   because the parent ``ClientContext``'s catalog-machinery state is
   poisoned by the first failed attempt and a fresh internal connection
   on the same outer context re-enters the same mutex. Empirically reliable
-  workaround at the example/CLI layer: drive **one cheap scalar
-  `cdc_*` call** (the example uses `SELECT cdc_version()`) on
-  `lake.connection` immediately after `LOAD ducklake_cdc`, before any
-  `CREATE TABLE` / `cdc_*_consumer_create` / `cdc_consumer_stats`
-  call -- this "warms" whatever connection-side state the H-022 race
-  needs to be primed, after which `cdc_dml_consumer_create` on three
-  derived cursors (and subsequent inserts on the parent) all succeed.
-  Tracked in `e2e/_lib/config.py::load_cdc_extension`. A secondary
+  workaround: call :func:`ducklake_cdc_client.prewarm` (or construct
+  :class:`ducklake_cdc_client.CDCClient` with default ``prewarm_connection=True``,
+  which runs the same cheap ``cdc_version()`` scalar) on **each** DuckDB
+  handle that will run ``cdc_*`` table functions, **immediately after**
+  ``LOAD ducklake_cdc`` and before any ``CREATE TABLE`` /
+  ``cdc_*_consumer_create`` / ``cdc_consumer_stats`` on that handle. This
+  warms connection-side state; derived cursors that reach CDC first should
+  run :func:`~ducklake_cdc_client.prewarm` on the cursor as well (see
+  ``e2e/_lib/load.py``). ``e2e/_lib/config.py::load_cdc_extension`` uses
+  prewarm on ``lake.connection``. A secondary
   occurrence pattern -- the parent connection runs N catalog-touching
   reads (`SELECT count(*) FROM lake.<table>`) and *then* issues a
   `cdc_consumer_stats('lake')` table function -- still trips the

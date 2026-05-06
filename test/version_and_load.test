@@ -1,14 +1,14 @@
-# name: test/ducklake_cdc.test
-# description: smoke test for the ducklake_cdc extension scaffold
+# name: test/version_and_load.test
+# description: load smoke for the ducklake_cdc extension
 # group: [test]
 
-# Before we load the extension, this will fail
+# Before we load the extension, this will fail.
 statement error
 SELECT cdc_version();
 ----
 Catalog Error: Scalar Function with name cdc_version does not exist!
 
-# Require statement will ensure this test is run with this extension loaded
+# Require statement will ensure this test is run with this extension loaded.
 require ducklake_cdc
 
 # Confirm the extension's smoke-test function returns a build-stamp string.

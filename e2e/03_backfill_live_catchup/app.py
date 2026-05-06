@@ -21,13 +21,14 @@ from ducklake_cdc_client import DMLConsumer  # noqa: E402
 from ducklake_cdc_client.client import CDCClient  # noqa: E402
 from ducklake_cdc_client.enums import ChangeType  # noqa: E402
 from ducklake_cdc_client.types import Change, DMLBatch  # noqa: E402
+from ducklake_client import ColumnDef  # noqa: E402
 from rich.layout import Layout  # noqa: E402
 from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
 from _lib.cli import emit_json_summary, make_parser, parse_common  # noqa: E402
-from _lib.config import load_cdc_extension, open_lake, reset_lake  # noqa: E402
+from _lib.config import catalog_head_snapshot, load_cdc_extension, open_lake, reset_lake  # noqa: E402
 from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
 
@@ -130,32 +131,22 @@ class DemoState:
 
 
 def setup_schema(lake: Any) -> None:
-    conn = lake.connection
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SOURCE_TABLE} (
-            id BIGINT,
-            amount DOUBLE,
-            updated_at TIMESTAMP
-        )
-        """
+    lake.table.create(
+        "orders",
+        id=ColumnDef("BIGINT"),
+        amount=ColumnDef("DOUBLE"),
+        updated_at=ColumnDef("TIMESTAMP"),
     )
-    conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SINK_TABLE} (
-            id BIGINT,
-            amount DOUBLE,
-            updated_at TIMESTAMP
-        )
-        """
+    lake.table.create(
+        "orders_mirror",
+        id=ColumnDef("BIGINT"),
+        amount=ColumnDef("DOUBLE"),
+        updated_at=ColumnDef("TIMESTAMP"),
     )
 
 
 def head_snapshot(lake: Any) -> int:
-    row = lake.connection.execute(
-        "SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot"
-    ).fetchone()
-    return int(row[0])
+    return catalog_head_snapshot(lake)
 
 
 def refresh_counts(lake: Any, state: DemoState) -> None:
@@ -322,27 +313,17 @@ def verify_invariant(lake: Any) -> str:
 
 
 def open_consumer(*, lake: Any, start_at: str, on_exists: str) -> DMLConsumer:
-    # Logically we want start_at='beginning' for the first consumer, but binding
-    # that at create time resolves the table at min(snapshot_id) — before the
-    # table row exists in DuckLake metadata. Always bind at 'now' for create;
-    # fresh consumers rewind with cdc_consumer_reset. Re-open with on_exists='use'
-    # skips create after a duplicate error, so it never resets and keeps cursor.
-    bind_start_at = "now" if start_at == "beginning" else start_at
-    rewind_to_beginning = start_at == "beginning" and on_exists == "error"
-
     consumer = DMLConsumer(
         lake,
         CONSUMER_NAME,
         table="orders",
-        start_at=bind_start_at,
+        start_at=start_at,
         mode="changes",
         on_exists=on_exists,
         connection=lake.connection,
         lease_policy="takeover" if on_exists == "use" else "wait",
     )
     consumer.__enter__()
-    if rewind_to_beginning:
-        consumer.client.cdc_consumer_reset(CONSUMER_NAME, to_snapshot="beginning")
     consumer.listen(timeout_ms=1, max_snapshots=1, poll_min_ms=POLL_MIN_MS)
     return consumer
 
