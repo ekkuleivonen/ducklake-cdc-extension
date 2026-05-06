@@ -406,16 +406,31 @@ jobs:
             fi
             update_branch="automation/${BRANCH//\//-}-$VERSION"
             git push --force-with-lease origin "HEAD:refs/heads/$update_branch"
-            if gh pr list --base "$BRANCH" --head "$update_branch" --state open --json number --jq '.[0].number // empty' | grep -q .; then
+            existing_pr="$(gh pr list --base "$BRANCH" --head "$update_branch" --state open --json url --jq '.[0].url // empty')"
+            if [[ -n "$existing_pr" ]]; then
               echo "Maintenance branch update PR already exists for $update_branch -> $BRANCH."
+              echo "$existing_pr"
             else
-              gh pr create \
+              pr_body="Release $VERSION was cut from \`$GITHUB_SHA\`. This PR fast-forwards \`$BRANCH\` to the released commit because the branch is protected and must be updated through a pull request."
+              if pr_url="$(gh pr create \
                 --base "$BRANCH" \
                 --head "$update_branch" \
                 --title "Fast-forward $BRANCH to $VERSION" \
-                --body "Release $VERSION was cut from \`$GITHUB_SHA\`. This PR fast-forwards \`$BRANCH\` to the released commit because the branch is protected and must be updated through a pull request."
+                --body "$pr_body")"; then
+                echo "$pr_url"
+              else
+                manual_url="https://github.com/${{ github.repository }}/pull/new/$update_branch"
+                echo "::warning::Could not create maintenance branch PR with GITHUB_TOKEN. Open it manually: $manual_url"
+                {
+                  echo "## Maintenance branch PR needed"
+                  echo ""
+                  echo "GitHub rejected PR creation from Actions for \`$update_branch\` -> \`$BRANCH\`."
+                  echo ""
+                  echo "Open manually: $manual_url"
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
             fi
-            echo "Opened or reused maintenance branch PR for $BRANCH -> $GITHUB_SHA."
+            echo "Proposed maintenance branch update for $BRANCH -> $GITHUB_SHA."
           else
             git push origin "HEAD:refs/heads/$BRANCH"
             echo "Created maintenance branch $BRANCH at $GITHUB_SHA."
