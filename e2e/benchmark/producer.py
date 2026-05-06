@@ -24,7 +24,10 @@ from common import (
 )
 
 RANDOM_SEED = 42
-PROGRESS_INTERVAL_S = 5.0
+# Producer status cadence. Keep tight (2 s) so the live dashboard's
+# producer panel feels alive and so CI logs get a steady heartbeat
+# without per-commit noise.
+PROGRESS_INTERVAL_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -127,7 +130,8 @@ def main() -> None:
         print(
             "producer demo: "
             f"{len(tables)} tables, {len(actions)} actions, {len(batches)} commits, "
-            f"{args.duration:g}s {args.profile}, {args.workers} worker(s)"
+            f"{args.duration:g}s {args.profile}, {args.workers} worker(s)",
+            flush=True,
         )
         if args.insert_rate is not None:
             print(
@@ -328,15 +332,26 @@ def run_batches(lake: DuckLake, batches: list[list[Action]], args: Args) -> None
         run_batches_concurrent(batches, args)
         return
 
+    # Mirror the multi-worker path: drive a single phase through
+    # ``ProgressCounter`` so the cadence (one tick every
+    # ``PROGRESS_INTERVAL_S``) is identical regardless of worker count.
+    # The per-commit chatter that used to live here was the source of
+    # the dashboard flicker when stdout is shared with the consumer.
+    progress = ProgressCounter(
+        label="run",
+        total_commits=len(batches),
+        total_actions=sum(len(batch) for batch in batches),
+    )
     gaps = schedule_gaps(len(batches), args)
     start = time.monotonic()
     for idx, batch in enumerate(batches):
         apply_batch(lake, batch, args)
-        print(f"commit {idx + 1}/{len(batches)}: {len(batch)} actions")
+        progress.record(commits=1, actions=len(batch))
         if idx < len(gaps):
             time.sleep(gaps[idx])
+    progress.record(commits=0, actions=0, force=True)
     elapsed = time.monotonic() - start
-    print(f"producer demo: completed in {elapsed:.2f}s")
+    print(f"producer demo: completed in {elapsed:.2f}s", flush=True)
 
 
 def run_batches_concurrent(batches: list[list[Action]], args: Args) -> None:
@@ -357,7 +372,10 @@ def run_batches_concurrent(batches: list[list[Action]], args: Args) -> None:
         )
         run_phase_concurrent(phase, phase_batches, args, duration=phase_duration)
     elapsed = time.monotonic() - start
-    print(f"producer demo: completed {total_commits} commits in {elapsed:.2f}s")
+    print(
+        f"producer demo: completed {total_commits} commits in {elapsed:.2f}s",
+        flush=True,
+    )
 
 
 def run_phase_concurrent(
@@ -372,7 +390,8 @@ def run_phase_concurrent(
     )
     print(
         f"producer demo: {phase} phase, {len(batches)} commits, "
-        f"{worker_count} worker(s), {duration:.2f}s target"
+        f"{worker_count} worker(s), {duration:.2f}s target",
+        flush=True,
     )
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [

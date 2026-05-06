@@ -1,0 +1,20 @@
+# Consumer fan-out — same change replayed N times to N consumers on one
+# table. Pressure-tests catalog read amplification and per-snapshot
+# listen overhead under multi-listener load. Total `changes total` in
+# the dashboard should be ~`consumers_per_table` × the producer's
+# emitted-row count; if `ext` in the stage bar grows worse than
+# linearly with consumer count, there's contention to investigate.
+name: fanout
+duration_seconds: 30
+schemas: 1
+tables_per_schema: 1
+target_snapshots_per_second: 1
+target_rows_per_snapshot: 200    # 200 rows/s × 8 consumers = 1,600 deliveries/s
+consumers_per_table: 8
+producer_workers: 1
+update_percent: 25
+delete_percent: 10
+batch_min: 50
+batch_max: 100
+max_snapshots: 50
+profile: flat

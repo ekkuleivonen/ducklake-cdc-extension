@@ -1,0 +1,19 @@
+# Sustained write storm — saturate producer + catalog + storage + consumer
+# bandwidth across many tables. Insert-dominated because real ingestion
+# workloads are. Watch the dashboard's `stage p95` bar to see whether
+# the bottleneck is producer commit, the CDC listen path, or Python
+# materialisation.
+name: throughput
+duration_seconds: 60
+schemas: 1
+tables_per_schema: 8
+target_snapshots_per_second: 4
+target_rows_per_snapshot: 1000
+consumers_per_table: 1
+producer_workers: 1               # keep at 1 to isolate per-commit cost
+update_percent: 5
+delete_percent: 5
+batch_min: 5000                   # ← 10× the previous
+batch_max: 5000                   # fixed so we don't average noise
+max_snapshots: 200
+profile: flat

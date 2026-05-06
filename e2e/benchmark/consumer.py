@@ -277,6 +277,7 @@ def main() -> None:
         dashboard = DemoDashboard(
             log_path=WORK_DIR / "demo-dashboard.log",
             stats=stats,
+            producer_log_path=args.producer_log,
         )
 
     try:
@@ -637,6 +638,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "bypass the Python DML adaptive window and request --max-snapshots "
             "on every DML listen call"
+        ),
+    )
+    parser.add_argument(
+        "--producer-log",
+        type=Path,
+        default=None,
+        help=(
+            "path to a file the producer subprocess streams its stdout/stderr "
+            "into. When set and stdout is a TTY, the dashboard renders a "
+            "`producer` panel that tails this file so producer output and "
+            "consumer dashboard share one screen without flicker. Used by "
+            "runner.py; safe to omit when running consumer.py standalone."
         ),
     )
     return parser.parse_args(argv)

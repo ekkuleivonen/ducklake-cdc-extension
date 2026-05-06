@@ -18,6 +18,10 @@ BENCHMARK_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCHMARK_DIR.parents[1]
 DEFAULT_WORKLOAD = BENCHMARK_DIR / "light.yaml"
 DEFAULT_RESULTS_DIR = BENCHMARK_DIR / "results"
+# Mirrors ``common.WORK_DIR``; redefined locally so the runner has no
+# transitive import surface from the benchmark workers.
+WORK_DIR = BENCHMARK_DIR / ".work"
+PRODUCER_LOG_PATH = WORK_DIR / "producer.log"
 DEFAULT_EXTENSION = (
     REPO_ROOT
     / "build"
@@ -26,6 +30,9 @@ DEFAULT_EXTENSION = (
     / "ducklake_cdc"
     / "ducklake_cdc.duckdb_extension"
 )
+
+
+_PROFILE_CHOICES = ("flat", "ramp", "variate")
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,10 @@ class Workload:
     batch_min: int
     batch_max: int
     max_snapshots: int
+    # Inter-commit gap shape: ``flat`` (uniform), ``ramp`` (front-loaded
+    # then thinning), ``variate`` (random jitter for bursty traffic).
+    # Defaults to ``flat`` so existing workload yamls stay unaffected.
+    profile: str = "flat"
 
     @property
     def table_count(self) -> int:
@@ -59,6 +70,15 @@ class Workload:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load shared ``e2e/.env`` (the same file ``e2e/docker-compose.yml``
+    # picks up) before we copy ``os.environ`` into the subprocess env,
+    # so a single ``.env`` covers the postgres stack, the runner, and
+    # both children. Idempotent with the auto-call at ``common`` import
+    # time inside the children.
+    from common import load_dotenv
+
+    load_dotenv()
+
     args = parse_args(argv)
     workload = load_workload(args.workload)
     extension = args.cdc_extension or DEFAULT_EXTENSION
@@ -74,8 +94,20 @@ def main(argv: list[str] | None = None) -> int:
     env = os.environ.copy()
     env["DUCKLAKE_CDC_EXTENSION"] = str(extension)
 
+    # Live mode: when our own stdout is a TTY the consumer activates its
+    # alt-screen dashboard. We then need to keep the producer subprocess
+    # off the screen and route its chatter into the dashboard's
+    # ``producer`` panel via a shared log file. In CI / non-TTY callers
+    # we want both children to stream straight to stdout so logs capture
+    # everything interleaved.
+    live_dashboard = sys.stdout.isatty()
+
+    # ``python -u`` so subprocess prints aren't buffered for ages when
+    # stdout is a pipe/file — critical for the producer-log tail in
+    # live mode and for prompt CI logs.
     consumer_cmd = [
         sys.executable,
+        "-u",
         str(BENCHMARK_DIR / "consumer.py"),
         "--summary-output",
         str(result_path),
@@ -88,9 +120,12 @@ def main(argv: list[str] | None = None) -> int:
         consumer_cmd.extend(["--catalog-backend", args.catalog_backend])
     if args.fixed_max_snapshots:
         consumer_cmd.append("--fixed-max-snapshots")
+    if live_dashboard:
+        consumer_cmd.extend(["--producer-log", str(PRODUCER_LOG_PATH)])
 
     producer_cmd = [
         sys.executable,
+        "-u",
         str(BENCHMARK_DIR / "producer.py"),
         "--schemas",
         str(workload.schemas),
@@ -110,15 +145,36 @@ def main(argv: list[str] | None = None) -> int:
         str(workload.batch_max),
         "--workers",
         str(workload.producer_workers),
+        "--profile",
+        workload.profile,
     ]
     if args.catalog_backend:
         producer_cmd.extend(["--catalog-backend", args.catalog_backend])
 
+    producer_log_fh = None
+    if live_dashboard:
+        PRODUCER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate so the dashboard panel starts each run with a clean
+        # tail rather than reflecting whatever the previous run left
+        # behind. ``_ProducerLogTail`` also handles truncation, but
+        # truncating here avoids a brief one-frame flash of stale text.
+        PRODUCER_LOG_PATH.write_bytes(b"")
+        producer_log_fh = PRODUCER_LOG_PATH.open("ab", buffering=0)
+
     consumer = subprocess.Popen(consumer_cmd, cwd=REPO_ROOT, env=env)
     try:
         time.sleep(args.consumer_startup_seconds)
-        subprocess.run(producer_cmd, cwd=REPO_ROOT, env=env, check=True)
+        subprocess.run(
+            producer_cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+            stdout=producer_log_fh if producer_log_fh is not None else None,
+            stderr=subprocess.STDOUT if producer_log_fh is not None else None,
+        )
     finally:
+        if producer_log_fh is not None:
+            producer_log_fh.close()
         stop_process(consumer, timeout=args.consumer_shutdown_seconds)
 
     if not result_path.exists():
@@ -148,6 +204,11 @@ def load_workload(path: Path) -> Workload:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"workload must be a mapping: {path}")
+    profile = str(data.get("profile", "flat"))
+    if profile not in _PROFILE_CHOICES:
+        raise ValueError(
+            f"workload profile must be one of {_PROFILE_CHOICES}, got {profile!r}"
+        )
     return Workload(
         name=str(data.get("name") or path.stem),
         duration_seconds=float(required(data, "duration_seconds")),
@@ -162,6 +223,7 @@ def load_workload(path: Path) -> Workload:
         batch_min=int(data.get("batch_min", 1)),
         batch_max=int(data.get("batch_max", data.get("batch_min", 1))),
         max_snapshots=int(data.get("max_snapshots", 100)),
+        profile=profile,
     )
 
 

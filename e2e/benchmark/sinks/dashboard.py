@@ -102,17 +102,39 @@ CLEAR_SCREEN = "\x1b[2J"
 # ---------------------------------------------------------------------------
 
 DEFAULT_FPS = 24
+# Floors for the producer/stream panels when the terminal is short. The
+# render loop grows past these, capped by ``MAX_*``, when the terminal
+# has vertical room — see ``_compute_heights``.
 DEFAULT_TAIL_SIZE = 10
-DEFAULT_MAX_TABLES = 4
+DEFAULT_PRODUCER_TAIL_SIZE = 5
+# Per-table panel height. Sized to the largest workload in the shipped
+# library (``throughput.yaml`` runs 8 tables) so every table is visible
+# without rotating off-screen. Smaller workloads pad the unused rows.
+DEFAULT_MAX_TABLES = 8
+# Hard ceilings on actually-rendered panel heights so very tall
+# terminals don't render an absurdly long stream tail (where the eye
+# can't follow the motion anyway).
+MAX_TAIL_SIZE = 60
+MAX_PRODUCER_TAIL_SIZE = 20
+# In-memory history per panel. Sized comfortably above the render caps
+# so the adaptive layout always has lines available even when the
+# terminal is at maximum height.
+STREAM_TAIL_HISTORY = 80
+PRODUCER_TAIL_HISTORY = 40
+# Strip this prefix from producer chatter before rendering — every
+# producer line already starts with it (see ``producer.py``), so dropping
+# it claws back ~16 columns for the actual content.
+_PRODUCER_LINE_PREFIX = "producer demo: "
 # The bar in the per-table panel and the payload column in the tail are
 # both sized adaptively on each frame — see ``_compute_layout`` — so the
 # two panels share the same right edge regardless of terminal width. The
-# bounds keep narrow terminals readable and prevent absurdly long bars on
-# very wide ones (where extra width adds no information).
+# bounds keep narrow terminals readable; the upper bounds are generous
+# enough that the dashboard fills wide terminals (~140+ cols) instead of
+# leaving a large dead zone on the right.
 MIN_BAR_WIDTH = 12
-MAX_BAR_WIDTH = 50
+MAX_BAR_WIDTH = 100
 MIN_PAYLOAD_WIDTH = 18
-MAX_PAYLOAD_WIDTH = 60
+MAX_PAYLOAD_WIDTH = 120
 DEFAULT_RATE_WINDOW_S = 1.0
 DEFAULT_LATENCY_RESERVOIR = 2048
 FLASH_DURATION_S = 0.18
@@ -280,6 +302,62 @@ def _stage_segment(label: str, ms: float, width: int, color: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Producer-log tail
+# ---------------------------------------------------------------------------
+
+
+class _ProducerLogTail:
+    """Incremental tail reader for the producer subprocess log.
+
+    Tracks the file position so each refresh only reads bytes appended
+    since the last call. Handles file-not-yet-created (producer hasn't
+    started) and file-truncated (a fresh runner invocation) cleanly.
+    All errors are swallowed: the dashboard treats this panel as
+    observability-only, never gate-of-delivery.
+    """
+
+    def __init__(self, path: Path, *, max_lines: int) -> None:
+        self._path = path
+        self._lines: deque[str] = deque(maxlen=max(1, max_lines))
+        self._offset = 0
+        self._partial = ""
+
+    def lines(self) -> list[str]:
+        return list(self._lines)
+
+    def refresh(self) -> None:
+        try:
+            stat = self._path.stat()
+        except OSError:
+            return
+        size = stat.st_size
+        if size < self._offset:
+            # File was truncated (new runner invocation) — restart.
+            self._offset = 0
+            self._partial = ""
+            self._lines.clear()
+        if size == self._offset:
+            return
+        try:
+            with self._path.open("rb") as fh:
+                fh.seek(self._offset)
+                chunk = fh.read(size - self._offset)
+        except OSError:
+            return
+        self._offset = size
+        text = self._partial + chunk.decode("utf-8", errors="replace")
+        parts = text.split("\n")
+        self._partial = parts.pop()
+        for line in parts:
+            stripped = line.rstrip("\r")
+            if not stripped:
+                continue
+            if stripped.startswith(_PRODUCER_LINE_PREFIX):
+                stripped = stripped[len(_PRODUCER_LINE_PREFIX):]
+            self._lines.append(stripped)
+
+
+# ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
 
@@ -311,6 +389,8 @@ class DemoDashboard:
         max_bar_width: int = MAX_BAR_WIDTH,
         log_path: Path | None = None,
         stats: DemoStats | None = None,
+        producer_log_path: Path | None = None,
+        producer_tail_size: int = DEFAULT_PRODUCER_TAIL_SIZE,
     ) -> None:
         self._stream = stream if stream is not None else sys.stdout
         self._fps = max(1, fps)
@@ -319,6 +399,22 @@ class DemoDashboard:
         self._min_bar_width = max(4, min_bar_width)
         self._max_bar_width = max(self._min_bar_width, max_bar_width)
         self._tty = bool(getattr(self._stream, "isatty", lambda: False)())
+        # Optional producer-log panel. The runner pipes the producer
+        # subprocess's stdout/stderr to this file so we can surface its
+        # ``ProgressCounter`` heartbeat alongside the per-table panel
+        # without two processes fighting for the same screen. ``None``
+        # disables the panel entirely (e.g. when consumer.py is run
+        # standalone in two-terminal mode). The reader keeps a generous
+        # history so adaptive layout can grow the panel on tall terminals.
+        self._producer_tail_size = max(1, producer_tail_size)
+        self._producer_tail: _ProducerLogTail | None = (
+            _ProducerLogTail(
+                producer_log_path,
+                max_lines=max(PRODUCER_TAIL_HISTORY, self._producer_tail_size),
+            )
+            if producer_log_path is not None
+            else None
+        )
         # Optional stats reference. When set, the stage-breakdown line shows
         # producer/extension/client p95 attribution by reading directly from
         # the same :class:`DemoStats` the consumer's stats sink writes into,
@@ -338,7 +434,12 @@ class DemoDashboard:
         self._lock = threading.Lock()
         self._tables: dict[str, _TableState] = {}
         self._consumers: set[str] = set()
-        self._tail: deque[_TailEvent] = deque(maxlen=self._tail_size)
+        # Tail buffer cap is decoupled from the render count: keep enough
+        # history that adaptive layout (`_compute_heights`) can grow up
+        # to ``MAX_TAIL_SIZE`` lines on tall terminals.
+        self._tail: deque[_TailEvent] = deque(
+            maxlen=max(STREAM_TAIL_HISTORY, self._tail_size)
+        )
         self._latencies: deque[float] = deque(maxlen=DEFAULT_LATENCY_RESERVOIR)
         self._total_changes = 0
         self._started_ns: int | None = None
@@ -631,10 +732,45 @@ class DemoDashboard:
         payload_w = max(MIN_PAYLOAD_WIDTH, min(MAX_PAYLOAD_WIDTH, payload_w))
         return bar_w, payload_w
 
+    def _compute_heights(self, rows: int) -> tuple[int, int]:
+        """Allocate ``(producer_h, stream_h)`` for the bottom two panels.
+
+        The render loop uses fixed line counts above the bottom panels
+        (title + rule + stats + stage + blank + per-table block + the
+        panel separators), so the producer and stream tails get
+        whatever vertical space is left — clamped between sensible
+        floors and ceilings. Recomputing every frame means the layout
+        adapts to terminal resizes mid-run; recordings on a stable
+        terminal still get a deterministic fixed-height frame.
+        """
+        has_producer = self._producer_tail is not None
+        # Top fixed: title(1) + rule(1) + stats(1) + stage(1) + blank(1) = 5
+        # + per-table block = ``self._max_tables`` lines.
+        # Bottom fixed: blank(1) + producer_sep(1) + (producer rows) +
+        # blank(1) + stream_sep(1) + (stream rows) when the producer
+        # panel is present, otherwise blank(1) + stream_sep(1) + (stream
+        # rows). +1 safety so the cursor row never pushes the bottom
+        # panel off-screen on shells that reserve the last line.
+        bottom_fixed = 5 if has_producer else 2
+        fixed = 5 + self._max_tables + bottom_fixed + 1
+        available = max(0, rows - fixed)
+        if not has_producer:
+            stream_h = min(MAX_TAIL_SIZE, max(self._tail_size, available))
+            return 0, max(self._tail_size, stream_h)
+        # Roughly a 1:2 split: producer panel is ambient context, stream
+        # tail is the headline view. Floors win when the terminal is
+        # short, ceilings win when it's huge.
+        producer_target = max(self._producer_tail_size, available // 3)
+        producer_h = min(MAX_PRODUCER_TAIL_SIZE, producer_target)
+        stream_h = min(MAX_TAIL_SIZE, max(self._tail_size, available - producer_h))
+        return producer_h, stream_h
+
     def _render_frame(self) -> None:
-        cols, _ = shutil.get_terminal_size((100, 30))
+        cols, rows = shutil.get_terminal_size((100, 30))
         cols = max(60, cols)
+        rows = max(20, rows)
         bar_w, payload_w = self._compute_layout(cols)
+        producer_h, stream_h = self._compute_heights(rows)
         # Rules span the same content width as the data lines so the
         # dashboard feels cohesive when bar/payload hit their caps on
         # very wide terminals (otherwise the rules would extend past
@@ -660,6 +796,11 @@ class DemoDashboard:
         max_rate = max((rate for _, _, rate in visible), default=0.0)
         overall_rate = sum(rate for _, _, rate in scored)
 
+        producer_lines: list[str] = []
+        if self._producer_tail is not None:
+            self._producer_tail.refresh()
+            producer_lines = self._producer_tail.lines()
+
         lines: list[str] = []
         lines.append(self._title_line(rule_w, elapsed_s, table_count, consumer_count))
         lines.append(self._top_rule(rule_w))
@@ -675,11 +816,23 @@ class DemoDashboard:
             lines.append(self._table_line(state, rate, max_rate, bar_w))
         for _ in range(self._max_tables - len(visible)):
             lines.append("")
+        # Optional producer panel — height adapts to terminal rows but
+        # stays deterministic for any given ``(cols, rows)`` pair so
+        # screen recordings on a stable terminal still get fixed frames.
+        if self._producer_tail is not None and producer_h > 0:
+            lines.append("")
+            lines.append(self._producer_separator(rule_w))
+            visible_producer = producer_lines[-producer_h:]
+            for entry in visible_producer:
+                lines.append(self._producer_line(entry, rule_w))
+            for _ in range(producer_h - len(visible_producer)):
+                lines.append("")
         lines.append("")
         lines.append(self._stream_separator(rule_w))
-        for ev in tail_snapshot:
+        visible_tail = tail_snapshot[-stream_h:]
+        for ev in visible_tail:
             lines.append(self._tail_line(ev, now_ns, payload_w))
-        for _ in range(self._tail_size - len(tail_snapshot)):
+        for _ in range(stream_h - len(visible_tail)):
             lines.append("")
 
         chunks = [CURSOR_HOME]
@@ -803,6 +956,17 @@ class DemoDashboard:
         label = " stream "
         rule = "─" * max(0, content_w - len(label) - 3)
         return f"  {DIM}───{label}{rule}{RESET}"
+
+    def _producer_separator(self, content_w: int) -> str:
+        label = " producer "
+        rule = "─" * max(0, content_w - len(label) - 3)
+        return f"  {DIM}───{label}{rule}{RESET}"
+
+    def _producer_line(self, text: str, content_w: int) -> str:
+        # Producer chatter is rendered DIM so it reads as an ambient
+        # log strip rather than a peer to the per-table metrics. The
+        # leading 2-space margin matches every other panel line.
+        return f"  {DIM}{_truncate(text, max(1, content_w))}{RESET}"
 
     def _tail_line(self, ev: _TailEvent, now_ns: int, payload_w: int) -> str:
         flashing = (now_ns - ev.arrived_ns) / 1e9 < FLASH_DURATION_S

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from os import environ
 from pathlib import Path
 from typing import TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 from ducklake_client import (
     DiskStorage,
@@ -28,11 +28,65 @@ LOCK_RETRY_SECONDS = 0.2
 CATALOG_ENV = "DUCKLAKE_BENCHMARK_CATALOG"
 CATALOG_ADMIN_ENV = "DUCKLAKE_BENCHMARK_CATALOG_ADMIN"
 STORAGE_ENV = "DUCKLAKE_BENCHMARK_STORAGE"
+# Object-storage knobs for ``s3://`` storage URLs. Sourced from the env
+# (so secrets never need to live on the command line) with optional
+# query-string overrides on the URL itself for non-secret tunables.
+S3_ENDPOINT_ENV = "DUCKLAKE_BENCHMARK_S3_ENDPOINT"
+S3_REGION_ENV = "DUCKLAKE_BENCHMARK_S3_REGION"
+S3_KEY_ID_ENV = "DUCKLAKE_BENCHMARK_S3_KEY_ID"
+S3_SECRET_ENV = "DUCKLAKE_BENCHMARK_S3_SECRET"
+S3_URL_STYLE_ENV = "DUCKLAKE_BENCHMARK_S3_URL_STYLE"
+S3_USE_SSL_ENV = "DUCKLAKE_BENCHMARK_S3_USE_SSL"
 DEFAULT_POSTGRES_CATALOG = "postgresql://ducklake:ducklake@localhost:5435/ducklake"
 DEFAULT_POSTGRES_ADMIN_CATALOG = "postgresql://ducklake:ducklake@localhost:5436/ducklake"
 BENCHMARK_PG_POOL_MAX_CONNECTIONS = 64
 CDC_EXTENSION_ENV = "DUCKLAKE_CDC_EXTENSION"
+# ``e2e/.env`` lives one directory above this file. Sharing the file
+# with ``e2e/docker-compose.yml`` (which auto-loads it) means a single
+# secret store covers the postgres stack and the benchmark.
+DOTENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 T = TypeVar("T")
+
+
+def load_dotenv(path: Path = DOTENV_PATH) -> None:
+    """Populate ``os.environ`` from ``path`` without overwriting existing keys.
+
+    Mirrors docker compose's precedence rules: variables already present
+    in the parent environment win over file values, so CI-injected
+    secrets and ad-hoc shell exports always override the committed
+    template. Uses a tiny built-in parser instead of ``python-dotenv``
+    to keep the benchmark's runtime dependency surface minimal — the
+    grammar we accept is the strict subset compose itself documents
+    (``KEY=value``, ``#`` line comments, optional surrounding quotes).
+    """
+
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in environ:
+            continue
+        value = value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in ('"', "'")
+        ):
+            value = value[1:-1]
+        environ[key] = value
+
+
+# Auto-load on import so any module pulling ``common`` into its
+# subprocess (consumer.py, producer.py) sees the same env the runner
+# does. Idempotent: a second call from runner.py is a no-op for keys
+# already present.
+load_dotenv()
 
 
 def load_benchmark_cdc_extension(lake: DuckLake) -> None:
@@ -203,12 +257,44 @@ def _catalog_from_string(value: str) -> DuckDBCatalog | PostgresCatalog | Sqlite
 def _storage_from_string(value: str) -> DiskStorage | S3Storage:
     parsed = urlsplit(value)
     if parsed.scheme == "s3":
-        return S3Storage(bucket=parsed.netloc, prefix=parsed.path.lstrip("/"))
+        return _s3_storage_from_url(parsed)
     if parsed.scheme == "file":
         return DiskStorage(path=parsed.path)
     if parsed.scheme:
         raise ValueError(f"unsupported DuckLake benchmark storage URL: {value}")
     return DiskStorage(path=value)
+
+
+def _s3_storage_from_url(parsed: SplitResult) -> S3Storage:
+    """Build :class:`S3Storage` from ``s3://bucket/prefix`` plus env/query knobs.
+
+    Bucket and prefix come from the URL itself. Endpoint, region,
+    URL-style and ``use_ssl`` come from ``DUCKLAKE_BENCHMARK_S3_*`` env
+    vars (recommended for shared config) with optional URL query-string
+    overrides for ad-hoc per-invocation tweaks. Credentials only ever
+    come from env vars so they don't leak into shell history or yaml
+    workload files.
+    """
+
+    query = dict(parse_qsl(parsed.query, keep_blank_values=False))
+    return S3Storage(
+        bucket=parsed.netloc,
+        prefix=parsed.path.lstrip("/"),
+        endpoint=environ.get(S3_ENDPOINT_ENV) or query.get("endpoint"),
+        region=environ.get(S3_REGION_ENV) or query.get("region"),
+        url_style=environ.get(S3_URL_STYLE_ENV) or query.get("url_style"),
+        use_ssl=_parse_optional_bool(
+            environ.get(S3_USE_SSL_ENV) or query.get("use_ssl")
+        ),
+        key_id=environ.get(S3_KEY_ID_ENV),
+        secret_access_key=environ.get(S3_SECRET_ENV),
+    )
+
+
+def _parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def retry_on_lock(operation: Callable[[], T]) -> T:

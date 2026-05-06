@@ -37,3 +37,10 @@ demo_*_data/
 
 # Local path-dev symlinks (e.g. `ducklake_client` -> ../ducklake-python-client); not used by CI.
 .deps/
+
+# Local secrets shared by `e2e/docker-compose.yml` and the benchmark
+# (DUCKLAKE_BENCHMARK_S3_*, etc). Never commit. Use `e2e/.env.example`
+# for the template if you want one tracked.
+.env
+*.env
+!*.env.example
