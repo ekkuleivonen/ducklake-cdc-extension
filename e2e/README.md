@@ -52,7 +52,7 @@ DuckLake's catalog backend matters more than these demos should hide.
 
 | example | duckdb | sqlite | postgres | notes |
 |---------|--------|--------|----------|-------|
-| 01 schema-safe consumer | yes | yes | yes | Sequential correctness story; all catalogs should apply. |
+| 01 schema-safe consumer | yes | no | yes | Demonstrates sink-write + `cdc_commit` transaction; SQLite lock behavior distracts from the schema story. |
 | 02 incremental materialized view | yes | yes | yes | Single-process first; Postgres for concurrent writers. |
 | 03 backfill/live catchup | yes | yes | yes | Backfill is bounded reads; listen mode follows catalog limits. |
 | 04 cache refresh | yes | yes | yes | Postgres gets `LISTEN`/`NOTIFY`; others poll. |
