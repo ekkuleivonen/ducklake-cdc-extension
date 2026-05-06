@@ -1,4 +1,4 @@
-"""02_ticks: low-latency change-tap that never reads the row payload.
+"""04_cache_refresh: lightweight table-change ticks for cache/index refresh.
 
 A tick consumer wakes on every new commit to ``lake.raw_ticks`` via
 ``cdc_dml_ticks_listen`` (metadata only -- no row materialisation),
@@ -40,7 +40,7 @@ from _lib.load import LoadCorpus, LoadShape, replay  # noqa: E402
 from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
 
-EXAMPLE = "02_ticks"
+EXAMPLE = "04_cache_refresh"
 
 # 1 row per commit, 100ms apart -> producer offers ~10 ticks/sec.
 # Catalog ceiling caps the actual rate; consumer reports one tick per
@@ -276,14 +276,16 @@ def _stats_panel(snap: dict[str, Any]) -> Panel:
     ticks_per_s = ticks_total / elapsed
     last_snap = details.get("last_snapshot", "—")
 
-    producer_total = int(details.get("producer_ticks_total", 0))
-    producer_per_s = producer_total / elapsed
+    producer_rows = int(details.get("producer_ticks_total", 0))
+    producer_commits = producer_rows // TICKS_BATCH_ROWS
+    producer_per_s = producer_commits / elapsed
 
     table = Table.grid(padding=(0, 2))
     table.add_column(justify="left")
     table.add_column(justify="right")
-    table.add_row("producer commits", _fmt_int(producer_total))
-    table.add_row("producer rate", f"{producer_per_s:,.1f}/s")
+    table.add_row("producer rows", _fmt_int(producer_rows))
+    table.add_row("producer commits", _fmt_int(producer_commits))
+    table.add_row("commit rate", f"{producer_per_s:,.1f}/s")
     table.add_row("", "")
     table.add_row("ticks delivered", _fmt_int(ticks_total))
     table.add_row("tick rate", f"{ticks_per_s:,.1f}/s")
@@ -316,10 +318,12 @@ def headless_summary(
         details = snap["details"]
         elapsed = max(snap["elapsed_s"], 1e-9)
         ticks = int(details.get("ticks_total", 0))
-        producer = int(details.get("producer_ticks_total", 0))
+        producer_rows = int(details.get("producer_ticks_total", 0))
+        producer_commits = producer_rows // TICKS_BATCH_ROWS
         lat = snap["latency_ms"]
         return (
-            f"producer={_fmt_int(producer)} ticks={_fmt_int(ticks)} "
+            f"producer_rows={_fmt_int(producer_rows)} "
+            f"producer_commits={_fmt_int(producer_commits)} ticks={_fmt_int(ticks)} "
             f"rate={ticks / elapsed:,.1f}/s "
             f"p50={_fmt_ms(lat.get('p50'))} p95={_fmt_ms(lat.get('p95'))} "
             f"p99={_fmt_ms(lat.get('p99'))} hist={histogram.snapshot()} "

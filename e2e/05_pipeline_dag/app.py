@@ -1,4 +1,4 @@
-"""01_pipeline_dag: in-process multi-stage CDC pipeline against one DuckLake.
+"""05_pipeline_dag: in-process multi-stage CDC pipeline against one DuckLake.
 
 Two parallel normalize stages feed a snapshot-lookup join, all in one
 Python process, exactly-once via ``cdc_commit`` / ``COMMIT`` atomicity::
@@ -46,7 +46,7 @@ from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.stage import INSERTS_ONLY, Stage, StageRunner  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
 
-EXAMPLE = "01_pipeline_dag"
+EXAMPLE = "05_pipeline_dag"
 
 # Producer cadence balances throughput vs the strict 1:1 drain
 # invariant on shutdown. ~1k rows/s offered keeps consumers ahead so

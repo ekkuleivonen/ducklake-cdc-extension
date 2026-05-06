@@ -12,9 +12,9 @@ dependencies = [
     # (use a library, do not hand-roll). `rich` is small, no event loop required,
     # renders cleanly to non-TTY under --headless.
     "rich>=13.7",
-    # 03_publish_redis: redis>=5.0 supports Streams natively
+    # Reserved for future sink examples that publish into Redis Streams.
     "redis>=5.0",
-    # 02_ticks: tiny embedded HTTP/SSE server for the browser-tab demo
+    # Lightweight HTTP probes/helpers for examples that need them.
     "httpx>=0.27",
     # ``--storage s3`` hermetic resets. DuckDB's httpfs handles read/write
     # but not delete-by-prefix, so the per-example reset path uses boto3

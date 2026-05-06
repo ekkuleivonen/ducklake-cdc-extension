@@ -148,7 +148,7 @@ echo "  bucket:  $BUCKET"
 echo
 echo "Next step: paste the block below into e2e/.env (one-time)."
 echo "Examples auto-load e2e/.env, then --storage s3 just works:"
-echo "  uv run --project e2e python e2e/01_pipeline_dag/app.py --storage s3"
+echo "  uv run --project e2e python e2e/05_pipeline_dag/app.py --storage s3"
 echo
 echo "================================================================"
 cat "$CREDS_FILE" | grep -v '^#' | grep -v '^$'

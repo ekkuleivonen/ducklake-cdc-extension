@@ -1,8 +1,9 @@
 # E2E Benchmark
 
 > **Being replaced.** This synthetic benchmark harness is being superseded by
-> the use-case examples at `e2e/01_pipeline_dag/`, `e2e/03_publish_redis/`,
-> etc. Each example will carry its own `--mode bench` so perf characterization
+> the use-case examples at `e2e/02_incremental_materialized_view/`,
+> `e2e/04_cache_refresh/`, `e2e/05_pipeline_dag/`, etc. Each example will
+> carry its own headless workload so perf characterization
 > happens through the real use cases, not a synthetic shape.
 >
 > This directory stays runnable until the examples carry equivalent bench

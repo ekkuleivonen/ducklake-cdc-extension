@@ -3,13 +3,12 @@
 #   - Garage for an S3-compatible object store backing examples that opt in
 #     with --storage s3. Garage is bootstrapped once via e2e/garage/setup-garage.sh.
 #
-# Examples will add more services as they are built (Redis for 03_publish_redis,
-# a serving Postgres for 05_reverse_etl).
+# Future sink demos may add more services (Redis, serving Postgres, etc.).
 #
 # Usage:
 #   docker compose -f e2e/docker-compose.yml up -d --wait
 #   ./e2e/setup-garage.sh                         # one-time, writes credentials
-#   uv run --project e2e python e2e/01_pipeline_dag/app.py
+#   uv run --project e2e python e2e/04_cache_refresh/app.py
 #   uv run python e2e/catalog_matrix/catalog_matrix_smoke.py --backends duckdb sqlite postgres
 #   uv run python e2e/upstream/enumerate_changes_map.py --check
 #   docker compose -f e2e/docker-compose.yml down -v

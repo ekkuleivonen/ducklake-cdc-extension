@@ -8,7 +8,7 @@ test**. Its only job is to put rows into the source table. Every
 catalog commit a producer does is a catalog commit a consumer
 (the actual subject of measurement) doesn't get -- and the postgres
 catalog has a hard ceiling on commits/s that all writers contend for
-(see the tuning notes in ``01_pipeline_dag/app.py``).
+(see the tuning notes in ``05_pipeline_dag/app.py``).
 
 So we want producers that:
 

@@ -1,247 +1,92 @@
-# DuckLake CDC end-to-end
+# DuckLake CDC End-to-End
 
-End-to-end surface area for the `ducklake_cdc` extension. The directory is
-intentionally flat &mdash; the **five use-case examples are the headline** and
-sit at the top level. A handful of supporting subdirectories live alongside
-them for jobs the examples can't do.
+These examples now tell one product story:
 
-## What's here
+> DuckLake gives you snapshots. `ducklake_cdc` gives you durable,
+> schema-aware consumers over those snapshots.
 
-```
-e2e/
-├── README.md                  this file
-├── docker-compose.yml         Postgres + PgBouncer + Garage S3 (+ Redis,
-│                              + serving Postgres as examples 03 / 05 land)
-├── pgbouncer/                 PgBouncer config for the catalog connection pool
-├── garage.toml                Garage S3 single-tier dev config
-├── setup-garage.sh            one-time Garage bootstrap (idempotent)
-├── .env / .env.example        shared secrets; paste S3 creds here after setup
-├── pyproject.toml             single uv project for examples + shared lib
-│
-├── 01_pipeline_dag/           in-process multi-stage transforms (flagship)
-├── 02_ticks/                  sub-50 ms snapshot-only notifications
-├── 03_publish_redis/          CDC -> Redis Streams (generalizes to Kafka)
-├── 04_audit_log/              durable change history; DDL consumer too
-├── 05_reverse_etl/            DuckLake -> Postgres serving with upsert+delete
-│
-├── _lib/                      reusable bits across examples (load generator,
-│                              sink contract types, TUI helpers)
-│
-├── catalog_matrix/            extension portability gate: same flow against
-│                              duckdb / sqlite / postgres backends
-├── smoke/                     extension white-box probes (warning text, lease
-│                              multiconn, interrupt propagation, TOCTOU,
-│                              minimal repros for known bugs)
-└── upstream/                  DuckLake upstream-CDC surveillance: tracks how
-                               upstream's change shape moves across versions
-```
+This is not a Kafka/Flink replacement suite. The useful surface is
+incremental maintenance, safe cursoring, backfill, schema-boundary handling,
+and lightweight wakeups for systems that re-read from DuckLake.
 
-The examples replace the synthetic `benchmark/` harness that lived here
-previously. While that migration is underway, `benchmark/` may still be
-present and runnable; it will be removed once the examples can produce
-equivalent perf numbers from their headless runs.
+## The Five Examples
 
-## The five examples
+| # | folder | story | status |
+|---|--------|-------|--------|
+| 01 | `01_schema_safe_consumer/` | Stop DML at schema boundaries, process DDL, migrate, then resume safely. | Spec only |
+| 02 | `02_incremental_materialized_view/` | Maintain derived DuckLake tables incrementally instead of rescanning. | Spec only |
+| 03 | `03_backfill_live_catchup/` | Start at snapshot 0, process history, then switch into live listen mode. | Spec only |
+| 04 | `04_cache_refresh/` | Use metadata-only ticks to refresh caches, search indexes, or vector indexes. | Runnable |
+| 05 | `05_pipeline_dag/` | Run a multi-stage lakehouse DAG with durable CDC cursors. | Runnable |
 
-| #  | folder                | one-line                                                            | status |
-|----|-----------------------|---------------------------------------------------------------------|--------|
-| 01 | `01_pipeline_dag/`    | In-process multi-stage transforms with exactly-once via the cursor. | TODO   |
-| 02 | `02_ticks/`           | Snapshot-only notification &mdash; sub-50&nbsp;ms tap, no payload move. | TODO (blocked on extension long-poll primitive) |
-| 03 | `03_publish_redis/`   | CDC &rarr; Redis Streams. Generalizes to Kafka, Pulsar, files.      | TODO   |
-| 04 | `04_audit_log/`       | Every change to every row, queryable forever; DDL consumer too.     | TODO   |
-| 05 | `05_reverse_etl/`     | DuckLake &rarr; Postgres serving layer with upsert + delete.        | TODO   |
+That order is intentional. The first three are the strongest alignment with
+DuckLake's roadmap and current user pain. The last two are supporting demos:
+ticks show the cheap wakeup primitive, and the DAG shows what a larger
+application built on the primitives looks like.
 
-Build order is **01 &rarr; 02 &rarr; 03 &rarr; 04 &rarr; 05**, picked to
-front-load the architecturally novel work. If 01 and 02 don't feel beautiful
-when finished, *that's the readiness signal* &mdash; pause and improve the
-system before continuing the suite.
-
-The suite has a dual job:
-
-1. **Internal readiness gauge** &mdash; "is this product good enough to talk
-   about publicly yet?" When all five examples meet their acceptance criteria,
-   the answer is yes.
-2. **Talk demos** &mdash; each example is shaped to be the live portion of a
-   short technical talk.
-
-## How to run an example
-
-Every example exposes one entrypoint, `app.py`, with **one workload**.
-Locally you get the live TUI; CI runs the same workload headless. There are
-no scale modes &mdash; the workload is sized to be both meaningful as a
-benchmark and tractable as a CI gate.
+## Run
 
 ```bash
 docker compose -f e2e/docker-compose.yml up -d --wait
-make release   # build the extension
+make release
 
-# local development / talk demo (default; live TUI, runs until Ctrl-C)
-uv run --project e2e python e2e/01_pipeline_dag/app.py
+# Runnable today: cache/search refresh ticks
+uv run --project e2e python e2e/04_cache_refresh/app.py --headless --duration 30
 
-# CI invocation (no TUI; runs to completion, asserts, writes metrics JSON)
-uv run --project e2e python e2e/01_pipeline_dag/app.py --headless --catalog postgres
-
-# Same workload, S3 storage instead of local disk
-uv run --project e2e python e2e/01_pipeline_dag/app.py --storage s3
+# Runnable today: multi-stage CDC DAG
+uv run --project e2e python e2e/05_pipeline_dag/app.py --headless --duration 30
 ```
 
-The flag set is deliberately tiny:
+Most examples support the shared flags:
 
-| flag | what it does | when to use |
-|------|--------------|-------------|
-| (none) | live TUI, runs until Ctrl-C, summary printed on clean shutdown | local dev, talks |
-| `--headless` | no TUI; periodic stderr summary; runs for `--duration` seconds | CI |
-| `--catalog {duckdb,sqlite,postgres}` | catalog backend (per-example matrix below) | any |
-| `--storage {disk,s3}` | local disk (default) vs S3 via the Garage service | any |
+| flag | meaning |
+|------|---------|
+| `--headless` | No TUI; periodic stderr summary; exits after `--duration`. |
+| `--duration N` | Headless run length in seconds. |
+| `--catalog {duckdb,sqlite,postgres}` | Catalog backend. Multi-writer demos should use Postgres. |
+| `--storage {disk,s3}` | Local disk or the Garage S3 service. |
 
-CI fans the headless invocation across each example's supported `--catalog`
-values (and, where useful, both `--storage` values). Same code path as the
-demo &mdash; if it passes locally with the TUI, it passes in CI.
+## Catalog Reality
 
-## Catalog backend matrix per example
+DuckLake's catalog backend matters more than these demos should hide.
 
-| example | duckdb | sqlite | postgres | rationale |
-|---------|--------|--------|----------|-----------|
-| 01 pipeline_dag    | yes      | yes      | yes | single-process by design; all backends apply |
-| 02 ticks           | yes      | yes      | yes | single-process tick consumer; all backends apply |
-| 03 publish_redis   | optional | yes (WAL)| yes | publisher can be in-process (any) or out-of-process (postgres/sqlite) |
-| 04 audit_log       | yes      | yes      | yes | single-process; all backends apply |
-| 05 reverse_etl     | optional | yes (WAL)| yes | typical deployment is multi-process; postgres is the realistic case |
+| example | duckdb | sqlite | postgres | notes |
+|---------|--------|--------|----------|-------|
+| 01 schema-safe consumer | yes | yes | yes | Sequential correctness story; all catalogs should apply. |
+| 02 incremental materialized view | yes | yes | yes | Single-process first; Postgres for concurrent writers. |
+| 03 backfill/live catchup | yes | yes | yes | Backfill is bounded reads; listen mode follows catalog limits. |
+| 04 cache refresh | yes | yes | yes | Postgres gets `LISTEN`/`NOTIFY`; others poll. |
+| 05 pipeline DAG | no | no | yes | Five concurrent writers; embedded/file catalogs contend too hard. |
 
-CI runs each example's smoke against every backend it claims support for,
-mirroring the `catalog_matrix/` fan-out pattern.
+## What Counts As A Good Demo
 
-## What each example must clear to count as "done"
+Each example should prove a real operating property:
 
-These are the suite-wide acceptance criteria. Per-example READMEs add specifics
-(numbers, pattern shape) on top.
+1. **Cursor correctness**: a committed consumer does not replay; an
+   uncommitted consumer can replay safely.
+2. **Schema awareness**: DDL is not an accidental footgun hidden inside DML.
+3. **Backfill path**: historical snapshots and live snapshots use the same
+   primitives.
+4. **Honest numbers**: report the observed p50/p95/p99 or throughput from the
+   demo, not aspirational streaming numbers.
+5. **Cleanup**: reset catalog, storage, and generated load inputs before and
+   after runs so examples do not contaminate each other.
 
-1. **Single-command bootstrap** &mdash; from a fresh clone:
-   `docker compose -f e2e/docker-compose.yml up -d --wait` then
-   `uv run --project e2e python e2e/NN_xxx/app.py` works.
-   No env-var hunting, no missing services. Anything an example needs beyond
-   Postgres + PgBouncer goes into the shared `e2e/docker-compose.yml`.
-2. **Visible result** &mdash; the example produces something a viewer can
-   *see* moving (a TUI, a downstream table updating live, a browser tab,
-   a Redis `XREAD` tail). Not just a return code.
-3. **Honest numbers in the README** &mdash; p50/p99 latency and sustained
-   throughput, measured *from this very example* on a known machine class.
-   No vendor-pitch numbers.
-4. **Headless run passes against every catalog the example claims to
-   support** (see matrix above).
-5. **Survives the obvious follow-ups** &mdash; schema change mid-flight,
-   consumer restart, producer crash. README states explicitly which it
-   survives and which it does not yet.
-6. **Reads as docs** &mdash; someone unfamiliar with the system can read
-   `app.py` end-to-end in &le;5 minutes and understand the pattern.
+## Supporting Directories
 
-## Visual style: bespoke per example, library-backed
+- `_lib/`: shared config, load generation, metrics, stage runner, and TUI glue.
+- `benchmark/`: legacy synthetic harness kept only while useful for comparison.
+- `catalog_matrix/`, `smoke/`, `upstream/`: narrow compatibility/probe suites
+  that test extension invariants rather than end-user stories.
 
-Examples deliberately *don't* share a dashboard helper. Each one renders what
-is most natural for it:
+## S3 Storage
 
-- 01 pipeline DAG &mdash; live DAG diagram, stage-by-stage row counts, end-to-end lag per branch.
-- 02 ticks &mdash; latency histogram + a tiny browser tab that flashes on every tick.
-- 03 publish-Redis &mdash; split-pane: producer commits left, `XREAD` tail right.
-- 04 audit log &mdash; "rewind" UI: pick a row, see its full history and the DDL events around it.
-- 05 reverse-ETL &mdash; OLAP table on the left, OLTP table on the right; show divergence-and-recovery on consumer restart.
-
-**Use a TUI library, don't hand-roll.** The previous benchmark dashboard
-hand-rolled ANSI escape codes, alt-screen handling, and panel layout. As the
-TUI becomes more prominent (one per example, demo-quality), maintaining that
-by hand will be a tax we don't want to pay. The intended choice is
-[`rich`](https://rich.readthedocs.io/) (`Live` + `Layout` + `Panel`) for
-declarative dashboards without an event loop, escalating to
-[`textual`](https://textual.textualize.io/) only if an example needs
-interactive widgets. The library lives in `e2e/pyproject.toml` so every
-example shares the same version. See `_lib/README.md` for the rationale and
-the planned helpers.
-
-## Extension prerequisites
-
-| example | extension changes required | notes |
-|---------|---------------------------|-------|
-| 01 pipeline DAG | none | uses `cdc_window`, `cdc_dml_changes_read`, `cdc_commit`, `cdc_dml_consumer_create`, `cdc_ddl_consumer_create` |
-| 02 ticks | **YES &mdash; long-poll/blocking-wait variant of `cdc_window`** | see `02_ticks/README.md` for the proposed API and rationale; the example is blocked on this landing |
-| 03 publish-Redis | none | |
-| 04 audit log | none | |
-| 05 reverse-ETL | none | |
-
-The long-poll primitive for ticks is the only new extension surface the suite
-demands. Everything else exercises today's API.
-
-## CI integration
-
-CI invokes each example with `--headless`, fanned across the supported
-`--catalog` (and where useful, `--storage`) values. The same headless run
-both gates merges (correctness assertions) and produces the perf numbers
-release tooling collects.
-
-Each headless run prints a final summary line to stderr on clean
-shutdown; that's the result. Examples that need machine-readable
-output for release tooling can build it from `MetricsRecorder.snapshot()`
-themselves.
-
-Examples should size their workload so a single headless run completes in
-**&lt;3 min**. That keeps the per-PR matrix sweep inside a normal CI budget
-while still giving stable enough p50/p99 numbers to track regression.
-
-## Storage backends
-
-Examples default to local-disk storage. Add `--storage s3` to drive the
-example against an S3-compatible object store. Storage matters here not
-just for production realism &mdash; commit cost decomposes very differently
-between disk and S3 (object PUT latency dominates the fixed overhead) and
-the same workload produces different perf shapes on each.
-
-The shared dev S3 is provided by [Garage](https://garagehq.deuxfleurs.fr/)
-running as a service in `docker-compose.yml`. Single-tier, single-node,
-local-only &mdash; this is a development convenience, not a production
-deployment.
-
-**One-time bootstrap** (after `docker compose up`):
+The shared dev S3 service is Garage. Start it through `docker-compose.yml`,
+then bootstrap once:
 
 ```bash
 ./e2e/setup-garage.sh
 ```
 
-The script is idempotent (safe to re-run). It waits for Garage to be
-reachable, bootstraps the layout, creates a bucket (`e2e` by default) and
-an access key (`e2e-app` by default), grants the key read+write+owner on
-the bucket, and prints an env block at the end.
-
-**Paste the printed block into `e2e/.env` once.** From then on the e2e
-config layer auto-loads it and `--storage s3` just works on every example.
-The same block is also saved to `e2e/.garage-bootstrap.env` (gitignored)
-as a re-paste fallback.
-
-The variables exposed by the bootstrap:
-
-| variable | example value | meaning |
-|----------|--------------|---------|
-| `S3_ENDPOINT` | `http://localhost:3900` | Garage S3 API endpoint |
-| `S3_REGION` | `garage` | DuckLake/AWS-compat region label |
-| `S3_ACCESS_KEY` | `GK0000...` | access key generated by Garage |
-| `S3_SECRET_KEY` | (32-byte secret) | secret key generated by Garage |
-| `S3_BUCKET` | `e2e` | bucket the examples write into |
-| `S3_USE_PATH_STYLE` | `true` | Garage requires path-style addressing |
-
-Override container, bucket, key names via env vars at the top of
-`setup-garage.sh`.
-
-## Other directories
-
-- **`_lib/`** &mdash; reusable code across examples: synthetic load
-  generator (lifted from the old `benchmark/producer.py`), sink contract
-  types, TUI helpers. See `_lib/README.md`.
-- **`catalog_matrix/`** &mdash; portability gate: proves the same DDL+DML
-  flow holds against duckdb / sqlite / postgres backends. Different job
-  from examples (it tests *extension invariants* across catalogs;
-  examples test *use cases*).
-- **`smoke/`** &mdash; white-box probes for narrow extension behaviors:
-  warning text, multi-process lease semantics, DuckDB interrupt
-  propagation, TOCTOU avoidance, minimal repros for known bugs.
-- **`upstream/`** &mdash; tracks DuckLake's upstream CDC-shape across
-  versions; surveillance for compatibility regressions.
-
-These three are kept because they do jobs the use-case examples cannot.
+Paste the printed credentials into `e2e/.env`; after that `--storage s3`
+works for examples that support it.
