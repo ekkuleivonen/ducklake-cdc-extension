@@ -138,49 +138,125 @@ the live rendering differs.
 
 ## Status
 
-**v1 (current).** Smallest possible end-to-end pipeline, validating the
-plumbing before stage count grows.
+**v2 (current).** First multi-stage topology &mdash; two parallel
+normalize stages and one stream-stream join &mdash; with the public
+DAG-author surface lifted into `e2e/_lib/stage.py`.
 
-- `lake.raw_events` &rarr; `normalize` consumer &rarr; `lake.clean_events`.
-- The consumer goes through the headline Python API, not raw SQL:
-  ```python
-  with DMLConsumer(lake, name, table="raw_events", mode="changes") as consumer:
-      for batch in consumer.batches(stop_event=stop, timeout_ms=1000):
-          with batch.transaction() as tx:
-              tx.executemany(
-                  "INSERT INTO sink VALUES (...)",
-                  [transform(c) for c in batch],
-              )
-  ```
-  `DMLConsumer` owns *every* connection-management concern: it derives
-  and pins a dedicated DuckDB connection (so the CDC lease and the
-  cursor advance always agree on which connection holds the lease),
-  creates the consumer with the H-022 first-bootstrap retry, drives
-  `cdc_dml_changes_listen` (one server roundtrip per batch, no
-  ticks-then-read dance), adapts the snapshot window, manages the
-  lease, and bounds shutdown via `stop_event`. The example owns the
-  business-logic transform (plain Python on `change.values["..."]`)
-  and the transactional sink write inside `batch.transaction()`.
-- Exactly-once is preserved by `batch.transaction()`: it `BEGIN`s on
-  enter, runs `cdc_commit` + `COMMIT` atomically on success, and
-  `ROLLBACK`s on exception. With `auto_commit := false` on the listen
-  call, the consumer cursor stays parked until `cdc_commit` runs
-  inside the transaction. ROLLBACK undoes both the INSERT and the
-  cursor advance, so a crash before COMMIT replays the same batch
-  &rarr; exactly-once at the consumer's view of the clean stream is
-  already in place at this size.
-- The consumer thread signals "ready" before the main thread starts
-  the producer, so `cdc_dml_consumer_create`'s catalog bootstrap (a
-  one-time per fresh database operation) doesn't race with concurrent
-  INSERTs on other connections (H-022).
-- Why long-poll vs `cdc_window` + `time.sleep`: a 50 ms busy-poll cycles
-  roughly 100 postgres-scanner connection acquisitions/second on the
-  catalog, which (combined with producer INSERT churn) exhausts the
-  duckdb postgres-scanner pool under sustained load and surfaces as
-  `Connection pool timeout: all 64 connections in use`. Long-polling
-  holds one connection idle server-side for the wait window instead.
-- TUI two-pane layout (producer / consumer) under demo mode; periodic
-  stderr summary under `--headless`.
+Topology (5 tables, 3 stages, 2 producers, all in one process):
+
+```
+  raw_purchases  ─►  normalize_purchases  ─►  clean_purchases  ─┐
+                                                                 ├─►  join_orders  ─►  joined_orders
+  raw_refunds    ─►  normalize_refunds    ─►  clean_refunds   ──┘   (driver: clean_purchases,
+                                                                     lookup: clean_refunds inside tx)
+```
+
+What a DAG author writes
+------------------------
+
+A stage is just a function `transform(batch, tx) -> rows_written`:
+
+```python
+def normalize_purchases(batch, tx) -> int:
+    """Subscribed via INSERTS_ONLY -- every change is already an insert."""
+    cleaned = [...]                                            # transform Python-side
+    tx.executemany("INSERT INTO lake.clean_purchases VALUES ...", cleaned)
+    return len(cleaned)
+
+def join_orders(batch, tx) -> int:
+    """Driver: clean_purchases. Lookup: clean_refunds inside the tx."""
+    if not batch.changes:
+        return 0
+    tx.execute("""
+        INSERT INTO lake.joined_orders
+        SELECT d.purchase_id, d.kind, d.amount, r.refund_amount,
+               ?, now()
+        FROM (VALUES ...) AS d(purchase_id, kind, amount)
+        LEFT JOIN lake.clean_refunds r ON r.purchase_id = d.purchase_id
+    """, [batch.end_snapshot, *driver_params])
+    return len(batch.changes)
+```
+
+The DAG topology is one declaration in one place. `change_types`
+forwards to `cdc_dml_consumer_create` so the *cursor itself* skips
+update / delete events -- updates and deletes never even cross the
+listen boundary, so the transform doesn't filter and the listen call
+doesn't ship rows the sink would drop:
+
+```python
+STAGES = (
+    Stage("normalize_purchases", source="raw_purchases",   transform=normalize_purchases, change_types=INSERTS_ONLY),
+    Stage("normalize_refunds",   source="raw_refunds",     transform=normalize_refunds,   change_types=INSERTS_ONLY),
+    Stage("join_orders",         source="clean_purchases", transform=join_orders,         change_types=INSERTS_ONLY),
+)
+
+with StageRunner(lake, STAGES, stop=stop, recorder=recorder):
+    ...                  # producers run here, TUI renders, Ctrl-C, etc.
+```
+
+`StageRunner` is the only piece of glue that wasn't already in
+`ducklake-cdc-client`: it gives each stage one OS thread + one
+`DMLConsumer` (which derives a dedicated, lease-pinned DuckDB
+connection and forwards `change_types` for extension-level
+subscription filtering), runs every batch's transform inside
+`batch.transaction()` so the sink write and `cdc_commit` land
+atomically, and starts the stages serially so each per-stage
+`cdc_dml_consumer_create` finishes its catalog bootstrap before the
+next stage begins (H-022 race avoidance).
+
+Exactly-once + replay
+---------------------
+
+- Each stage's cursor advances inside the same BEGIN as its sink
+  write. ROLLBACK on a transform exception undoes both, the next
+  listen replays the same batch &rarr; exactly-once at every stage
+  edge.
+- The cursor is durable in `__ducklake_cdc.consumer_state`. A killed
+  process restarts every stage at the snapshot it last committed.
+- Exactly-once is *per stage*, not pipeline-wide. A row that's been
+  normalized into `clean_purchases` but not yet joined is durable in
+  the catalog &mdash; the join stage's own cursor will pick it up
+  next time it runs.
+
+Join semantics (driver + snapshot lookup)
+-----------------------------------------
+
+- `clean_purchases` drives, one batch at a time. The batch carries
+  the driver columns (`id`, `kind`, `amount` projected onto
+  `Change.values`), so we don't re-read `clean_purchases` &mdash;
+  the batch *is* the driver.
+- The LEFT JOIN against `clean_refunds` runs on the consumer's
+  connection inside `batch.transaction()`. DuckLake gives us
+  snapshot-isolated reads inside the transaction, so the lookup sees
+  a consistent point-in-time view of `clean_refunds`. (This is the
+  honest answer to "where do you put the join state?": you don't.
+  The other table *is* the state.)
+- `joined_orders` is **append-only** by design. A refund that arrives
+  after its purchase has already been joined produces NULL
+  `refund_amount` *forever*. The trade-off (no re-emit on refund
+  arrival) keeps the model simple enough to read in one screenful;
+  upgrading to "repair on refund" is one more stage subscribing to
+  `clean_refunds` and UPSERTing `joined_orders`, but that's v3.
+
+Why this shape and not some others
+----------------------------------
+
+- *Decorator-based DAG DSL* &mdash; cute, but hides where the threads
+  / connections / cursors come from. Debugging would mean reading
+  framework internals; we want users to see plain Python stack
+  traces.
+- *Symmetric stream-stream join with watermarks* &mdash; powerful,
+  but you'd be re-implementing Flink. The driver+lookup model
+  covers the common case ("for each fact in this batch, look up
+  its dimension") and stays in one screen of code.
+- *One DuckDB connection shared across all stages* &mdash; would
+  serialize every stage's writes through one mutex. Each stage's
+  `DMLConsumer` derives its own connection so they truly run in
+  parallel.
+
+The boring-but-important stuff (carried over from v1)
+-----------------------------------------------------
+
 - Two-stage signal handling: 1st SIGINT requests graceful stop
   (writes metrics, runs cleanup); 2nd SIGINT hard-exits via
   `os._exit(130)`. The escape hatch matters because `uv run` 0.7.3
@@ -190,36 +266,110 @@ plumbing before stage count grows.
   per-example storage at startup *and* at clean exit, so back-to-back
   runs never inherit dirty state and `git status` stays clean after a
   run.
-- Metrics JSON shape matches `e2e/_lib/README.md`.
+- TUI: producers panel + per-stage stages panel under demo mode;
+  periodic stderr summary under `--headless`. Re-rendered at 4 Hz so
+  per-stage rows / batches / last snapshot reflect live state.
+- Metrics JSON shape matches `e2e/_lib/README.md`. Per-stage detail
+  keys: `stage_<name>_rows`, `stage_<name>_batches`,
+  `stage_<name>_last_snapshot`. Per-producer detail keys:
+  `producer_purchases_total`, `producer_refunds_total`.
 
-Measured locally (Apple M-series, postgres catalog via pgbouncer, disk
-storage), 30 s headless run: 18,800 rows produced and 18,800 rows
-consumed (1:1, no drain gap), ~619 rows/s sustained, apply p99 ~274 ms,
-zero errors. Short runs (e.g. `--duration 8`) sometimes show a 200-row
-tail because the producer's last batch lands after the consumer's last
-listen returns; addressing that is a v2 acceptance item (graceful
-drain on shutdown). v1 is plumbing-correct, not perf-tuned; the
-throughput target lives in v3.
+Measured locally
+----------------
 
-**v2 (next).**
+Apple M-series, postgres catalog via pgbouncer, disk storage, 30 s
+headless run:
 
-- Add a second stage: `clean_events` &rarr; `enrich` consumer &rarr;
-  `enriched_events` (or jump straight to a join). This is where the
-  decorator-based DAG declaration earns its keep.
-- Validate against `--catalog sqlite` and `--catalog duckdb`.
-- Wire the DDL consumer + automated schema-boundary handler.
-- Graceful drain on shutdown so the headless metrics show
-  `producer_rows_total == consumer_rows_total` exactly.
-- Headless correctness assertion: assert raw count == clean count
-  post-drain, exit non-zero on mismatch.
+| signal | value |
+|---|---|
+| `producer_purchases_total` | 16,600 |
+| `stage_normalize_purchases_rows` | 16,400 |
+| `producer_refunds_total` | 4,800 |
+| `stage_normalize_refunds_rows` | 4,800 |
+| `stage_join_orders_rows` | 16,400 |
+| `errors` | 0 |
+| apply p99 | ~470 ms |
+| aggregate throughput | ~1,250 rows/s (sum across stages) |
 
-**v3 (acceptance).**
+`producer_purchases_total - stage_normalize_purchases_rows = 200` is
+the same single-batch shutdown tail as v1: the producer commits one
+extra batch after the consumer has issued its final listen. Resolving
+that (graceful drain on stop) is on the v3 acceptance list. For now,
+`stage_join_orders_rows == stage_normalize_purchases_rows` which is
+the actually-meaningful invariant: every cleaned purchase makes it
+into `joined_orders` 1:1.
 
-- Full DAG shape from "The pipeline shape" above (or a reduced form
-  that hits the same shape patterns).
-- `--storage s3` against Garage.
-- Perf tuning to hit &ge; 5,000 raw rows/s with joined-stage lag p99
-  &le; 1 s on the postgres catalog.
-- Kill+restart correctness pass demonstrating exactly-once.
-- README numbers updated from real measurements on Apple M-series + a
-  small Linux VM.
+Known noise: `CDC_WAIT_SHARED_CONNECTION` fires once per stage on
+startup. The advisory is unconditional in the extension and is a
+false positive on this code path because `DMLConsumer` does own a
+dedicated connection. Tracked as a follow-up under H-006 in
+`ducklake-cdc-extension/docs/hazard-log.md`. Filter it out of run
+output with `2>&1 | grep -v CDC_WAIT_SHARED_CONNECTION` until the
+extension-side suppression lands.
+
+**v3 -- next, planned in slices.**
+
+The original v3 list grew to ~8 items. Breaking it into four
+themed slices so we can land each one cleanly without a giant
+in-flight branch. Slices are ordered by what most improves the
+example's *story* before what extends its surface; pick whichever
+one fits the next session's budget.
+
+*v3a -- correctness completion (the example feels finished)*
+
+- **Graceful drain on shutdown** so the headless metrics show
+  `producer_total == clean_total` exactly. Lib change: extend
+  `DMLConsumer.batches()` (or add a sibling) with a "drain to
+  current head, then exit" mode that StageRunner calls during
+  shutdown. Producer threads stop first, consumers drain to the
+  producers' final snapshot, then exit. Removes the 200-row tail
+  caveat and lets CI assert strict 1:1 instead of "within one
+  batch."
+- **Kill+restart correctness pass** demonstrating exactly-once at
+  every stage edge. New script `01_pipeline_dag/test_restart.sh`
+  (or pytest): run the app in headless for 5 s, `kill -9`, restart
+  for 10 s, assert `joined_orders` row counts and content are
+  consistent with one continuous run. No lib changes -- the
+  durable-cursor guarantee is already live, this just makes it
+  visible and CI-checkable.
+- **Repair-on-refund stage** that subscribes to `clean_refunds`
+  and UPDATEs `joined_orders.refund_amount` for purchases already
+  joined. Removes the "refund-after-join is permanent NULL"
+  trade-off from the v2 narrative. Open design point: needs a
+  primary key on `joined_orders.purchase_id` and a story for the
+  insert/update race between `join_orders` and `repair_orders`
+  (probably a periodic batch sweep over `joined_orders WHERE
+  refund_amount IS NULL`, not pure CDC -- the snapshot-isolated
+  cursor model can't see "was joined while my batch was open").
+  Document the trade-off honestly.
+
+*v3b -- catalog / storage portability*
+
+- **`--catalog sqlite` and `--catalog duckdb`** so the example
+  matches `e2e/catalog_matrix/` parity. Most of the work is in
+  the example's `_lib/config.py` wiring; the consumer/transform
+  code already runs catalog-agnostic.
+- **`--storage s3` against Garage.** New
+  `e2e/garage/docker-compose.yml` spins Garage up; example reads
+  S3 creds from `e2e/.env`; storage helper picks `s3` over `disk`
+  based on the flag.
+
+*v3c -- schema evolution*
+
+- **DDL consumer + automated schema-boundary handler.** New
+  fourth stage that subscribes to schema events on `raw_*` tables;
+  when a column is added/renamed/dropped, the DDL consumer fires
+  the appropriate "rebind affected DML consumer" handler so the
+  pipeline self-heals. The talk-story payoff is "inject `ALTER
+  TABLE` mid-stream and watch nothing break."
+
+*v3d -- perf + published numbers*
+
+- **Perf tuning** to hit &ge; 5,000 raw rows/s with joined-stage
+  lag p99 &le; 1 s on the postgres catalog. Likely candidates:
+  bigger producer batches, parallel transforms inside a stage,
+  longer `LISTEN_MAX_SNAPSHOTS` window per batch, postgres
+  catalog tuning.
+- **Published README numbers** from real measurements on Apple
+  M-series + a small Linux VM. Replace the current "measured
+  locally" table.

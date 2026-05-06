@@ -90,8 +90,28 @@ go; this file says what can hurt users or maintainers on the way there.
 - Notes: SQL users should hold a dedicated connection for listen calls. Batch
   jobs that wake up on a schedule should call `cdc_window` directly instead of
   long-polling.
+- Known false positive (high-level Python client): `DMLConsumer` and
+  `DDLConsumer` derive and own a dedicated DuckDB connection on
+  `__enter__` (via `lake.connection.cursor()`) and hold it for the
+  consumer's lifetime, so the operator-facing assumption baked into
+  the warning ("you might be sharing this connection") is already
+  false on that code path. The advisory still fires because
+  `MaybeEmitWaitSharedConnectionWarning` in `src/consumer.cpp` is
+  unconditional on first listen per connection -- the extension has
+  no way to introspect that the caller has guaranteed dedication.
+  Operators running `e2e/01_pipeline_dag` see one advisory per stage
+  on startup (3 in v2, growing with stage count); the message is
+  noise, not a problem signal.
 - Next action: Client libraries should hide this by using dedicated wait
-  connections.
+  connections (already done for the high-level Python client). To make
+  the advisory match reality, add a per-connection opt-out the high-
+  level client can set on the dedicated connection it owns -- e.g. a
+  session-local pragma `SET cdc_dedicated_listen_connection = true`
+  that suppresses `MaybeEmitWaitSharedConnectionWarning` for that
+  `connection_id`. Alternative: make the warning conditional on
+  having seen a non-CDC query on the same connection (requires
+  per-connection bookkeeping in the extension and is the heavier
+  fix).
 
 ### H-007: Sink Failure Semantics
 

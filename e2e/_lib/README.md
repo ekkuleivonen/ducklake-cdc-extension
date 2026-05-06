@@ -17,6 +17,15 @@ built; not pre-populated):
   controllable synthetic write traffic into a DuckLake table (01, 03, 04, 05).
   Exposes a small async API: drive N rows with a workload-shape profile, get
   back per-commit timing telemetry.
+- **`stage.py`** &mdash; multi-stage pipeline runner. Composes
+  `DMLConsumer` + `batch.transaction()` into a `Stage(name, source,
+  transform, change_types)` dataclass and a `StageRunner` context
+  manager that gives each stage one OS thread + one dedicated CDC
+  connection, runs every batch's transform inside
+  `batch.transaction()`, and starts stages serially to avoid the
+  H-022 first-bootstrap race. First used by `01_pipeline_dag`;
+  expected to be the substrate for any example that wires more than
+  one consumer in a single process.
 - **`sink_contract.py`** &mdash; the at-least-once + idempotency-key shape
   that examples 03 (Redis Streams) and 05 (Postgres serving) both implement.
   Defines a `Sink` protocol and a `commit_after_publish(window, sink)` driver
