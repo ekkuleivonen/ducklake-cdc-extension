@@ -5,8 +5,8 @@ description = "End-to-end use-case examples and shared lib for the ducklake-cdc 
 requires-python = ">=3.14"
 dependencies = [
     "duckdb==1.5.2",
-    "ducklake-client>=0.1.2",
-    "ducklake-cdc-client>=0.1.0",
+    "ducklake-client>=0.5.1",
+    "ducklake-cdc-client>=0.5.1",
     "psycopg[binary]>=3.3.3",
     # Live dashboards across all examples. See _lib/README.md for the rationale
     # (use a library, do not hand-roll). `rich` is small, no event loop required,
@@ -28,13 +28,6 @@ dev = [
     "pytest",
     "ruff",
 ]
-
-# Local sibling clients win over PyPI so an example demos against in-flight
-# client changes without a release dance. Comment out (and `uv lock`) to
-# re-pin to PyPI.
-[tool.uv.sources]
-ducklake-cdc-client = { path = "../../ducklake-cdc-python-client", editable = true }
-ducklake-client = { path = "../../ducklake-python-client", editable = true }
 
 [tool.ruff]
 line-length = 160

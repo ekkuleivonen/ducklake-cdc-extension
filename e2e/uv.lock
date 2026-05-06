@@ -77,23 +77,16 @@ wheels = [
 
 [[package]]
 name = "ducklake-cdc-client"
-version = "0.1.2"
-source = { editable = "../../ducklake-cdc-python-client" }
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ducklake-client" },
     { name = "pytz" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "ducklake-client", specifier = ">=0.1.2" },
-    { name = "pandas", marker = "extra == 'pandas'" },
-    { name = "polars", marker = "extra == 'polars'" },
-    { name = "pyarrow", marker = "extra == 'arrow'" },
-    { name = "pyarrow", marker = "extra == 'polars'" },
-    { name = "pytz", specifier = ">=2026.2" },
+sdist = { url = "https://files.pythonhosted.org/packages/6e/98/e903d015d728d7f05ab39f1c3165315c5427bf36601e5e31f37d8aaf3f44/ducklake_cdc_client-0.5.1.tar.gz", hash = "sha256:ce96026cdb50c8cdf2b7283d10f25e673162a9f1a2ca180de9852a80e4fdac4c", size = 40110, upload-time = "2026-05-06T16:52:43.265Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/ba/fa6ccc91a3fcdfdcc1043a5d29ef57fb494b558c48fd9fc2edc39db7b2b2/ducklake_cdc_client-0.5.1-py3-none-any.whl", hash = "sha256:fe9ecf5cd20b09cd2313c2f65785184124ab4f6b448fdb516e675231d9b444bd", size = 37495, upload-time = "2026-05-06T16:52:41.989Z" },
 ]
-provides-extras = ["arrow", "pandas", "polars"]
 
 [[package]]
 name = "ducklake-cdc-e2e"
@@ -120,8 +113,8 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.35" },
     { name = "duckdb", specifier = "==1.5.2" },
-    { name = "ducklake-cdc-client", editable = "../../ducklake-cdc-python-client" },
-    { name = "ducklake-client", editable = "../../ducklake-python-client" },
+    { name = "ducklake-cdc-client", specifier = ">=0.5.1" },
+    { name = "ducklake-client", specifier = ">=0.5.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.3" },
     { name = "redis", specifier = ">=5.0" },
@@ -136,14 +129,15 @@ dev = [
 
 [[package]]
 name = "ducklake-client"
-version = "0.1.2"
-source = { editable = "../../ducklake-python-client" }
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
 ]
-
-[package.metadata]
-requires-dist = [{ name = "duckdb" }]
+sdist = { url = "https://files.pythonhosted.org/packages/a8/5c/b3033449220d2d9971bbe3cf565bd585be6d733f0d90b70dd4c18e172b00/ducklake_client-0.5.1.tar.gz", hash = "sha256:885c0bec3169c577e3f35de38a8c750f6a26835577feaf74621c5c07746cda36", size = 15505, upload-time = "2026-05-06T16:53:07.566Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/f8/5c8e3fbcc6bcf7e834d1becd6d7c924ce98c266294be48ece101ab4906fe/ducklake_client-0.5.1-py3-none-any.whl", hash = "sha256:c76d5cc4811c3bf677e444ff5d672a20d7173b6914869fd4ae08d8d4d3048d4f", size = 27717, upload-time = "2026-05-06T16:53:06.479Z" },
+]
 
 [[package]]
 name = "h11"
@@ -211,14 +205,14 @@ wheels = [
 
 [[package]]
 name = "markdown-it-py"
-version = "4.0.0"
+version = "4.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mdurl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/f5/4ec618ed16cc4f8fb3b701563655a69816155e79e24a17b651541804721d/markdown_it_py-4.0.0.tar.gz", hash = "sha256:cb0a2b4aa34f932c007117b194e945bd74e0ec24133ceb5bac59009cda1cb9f3", size = 73070, upload-time = "2025-08-11T12:57:52.854Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/5c/f3aedc83549aae71cd52b9e9687fe896e3dc6e966ba20eba04718605d198/markdown_it_py-4.1.0.tar.gz", hash = "sha256:760e3f87b2787c044c5138a5ba107b7c2be26c03b13cc7f8fe42756b65b1df6c", size = 81613, upload-time = "2026-05-06T16:32:13.649Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/54/e7d793b573f298e1c9013b8c4dade17d481164aa517d1d7148619c2cedbf/markdown_it_py-4.0.0-py3-none-any.whl", hash = "sha256:87327c59b172c5011896038353a81343b6754500a08cd7a4973bb48c6d578147", size = 87321, upload-time = "2025-08-11T12:57:51.923Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/88/802c82060c54bc7dde21eb0033e337838b8181a1323254aa9ec41cbfc3d1/markdown_it_py-4.1.0-py3-none-any.whl", hash = "sha256:d4939a62a2dd0cd9cb80a191a711ba1d39bac8ed5ef9e9966895b0171c01c46d", size = 90955, upload-time = "2026-05-06T16:32:12.184Z" },
 ]
 
 [[package]]
