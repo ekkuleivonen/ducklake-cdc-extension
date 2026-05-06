@@ -6,7 +6,7 @@ returned window. After the first couple of quick, small windows, the extension
 should reactively wait a few milliseconds after work is visible so it can claim
 a larger visible window without taxing the first event after idle.
 
-Uses :mod:`ducklake_client` for attach (same path as the benchmark harness).
+Uses :mod:`ducklake_client` for attach, matching the e2e demos.
 
 Usage:
 

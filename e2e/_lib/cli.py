@@ -6,13 +6,17 @@ Every ``e2e/NN_xxx/app.py`` accepts the same minimal flag set:
     --catalog {duckdb,sqlite,postgres}
     --storage {disk,s3}       local disk (default) or Garage S3
     --duration <seconds>      hard stop (CI safety net for --headless)
+    --json-summary            final machine-readable summary for CI
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from _lib.config import CatalogChoice, StorageChoice
 
@@ -37,6 +41,7 @@ class CommonArgs:
     catalog: CatalogChoice
     storage: StorageChoice
     duration_s: int | None
+    json_summary: bool
 
 
 def make_parser(
@@ -44,15 +49,31 @@ def make_parser(
     description: str,
     supported_catalogs: Iterable[CatalogChoice] = ("postgres", "sqlite", "duckdb"),
     supported_storages: Iterable[StorageChoice] = ("disk", "s3"),
+    catalog_default: CatalogChoice | None = None,
 ) -> argparse.ArgumentParser:
     """Build an ``ArgumentParser`` with the suite-standard flags.
 
     ``supported_catalogs`` / ``supported_storages`` let an example
     advertise (and enforce) which backends it actually handles. Per the
-    catalog matrix in ``e2e/README.md``, not every example supports
-    every catalog -- e.g. the publisher examples can fall back to
-    ``duckdb`` only with ``--in-process``.
+    e2e suite docs, not every example supports every catalog.
+
+    ``catalog_default`` overrides the implicit default for ``--catalog``.
+    When omitted, the default remains ``postgres`` if it appears in
+    ``supported_catalogs``, otherwise the first supported backend — so
+    single-catalog demos still parse without extra flags.
     """
+    catalog_choices = tuple(supported_catalogs)
+    if catalog_default is None:
+        resolved_catalog_default: CatalogChoice = (
+            "postgres" if "postgres" in catalog_choices else catalog_choices[0]
+        )
+    else:
+        if catalog_default not in catalog_choices:
+            raise ValueError(
+                f"catalog_default {catalog_default!r} must be one of {catalog_choices}"
+            )
+        resolved_catalog_default = catalog_default
+
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--headless",
@@ -61,9 +82,9 @@ def make_parser(
     )
     parser.add_argument(
         "--catalog",
-        choices=tuple(supported_catalogs),
-        default="postgres",
-        help="Catalog backend. Default: postgres (always supported).",
+        choices=catalog_choices,
+        default=resolved_catalog_default,
+        help=f"Catalog backend. Default: {resolved_catalog_default}.",
     )
     parser.add_argument(
         "--storage",
@@ -81,6 +102,11 @@ def make_parser(
             f"headless mode runs until the {DEFAULT_HEADLESS_DURATION_S}s safety-net cap."
         ),
     )
+    parser.add_argument(
+        "--json-summary",
+        action="store_true",
+        help="Emit one final machine-readable JSON summary to stdout.",
+    )
     return parser
 
 
@@ -91,6 +117,7 @@ def parse_common(args: argparse.Namespace) -> CommonArgs:
         catalog=args.catalog,
         storage=args.storage,
         duration_s=int(args.duration) if args.duration is not None else None,
+        json_summary=bool(args.json_summary),
     )
 
 
@@ -109,3 +136,9 @@ def effective_duration_s(common: CommonArgs) -> float | None:
     if common.headless:
         return float(DEFAULT_HEADLESS_DURATION_S)
     return None
+
+
+def emit_json_summary(common: CommonArgs, payload: dict[str, Any]) -> None:
+    """Write a final machine-readable summary when requested."""
+    if common.json_summary:
+        print(json.dumps(payload, sort_keys=True), file=sys.stdout, flush=True)

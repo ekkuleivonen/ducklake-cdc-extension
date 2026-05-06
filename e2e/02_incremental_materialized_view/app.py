@@ -25,7 +25,7 @@ from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
-from _lib.cli import make_parser, parse_common  # noqa: E402
+from _lib.cli import emit_json_summary, make_parser, parse_common  # noqa: E402
 from _lib.config import load_cdc_extension, open_lake, reset_lake  # noqa: E402
 from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
@@ -42,7 +42,7 @@ POLL_MIN_MS = 1
 EVENT_INTERVAL_S = 1.0
 INTRO_HOLD_S = 2.5
 
-EXTRAPOLATE_TABLE_SIZES = (10_000, 1_000_000)
+EXTRAPOLATE_TABLE_SIZES = (1_000, 10_000)
 
 EventKind = Literal["insert", "update", "delete"]
 
@@ -70,11 +70,22 @@ class RevenueRow:
     revenue: float
 
 
+@dataclass(frozen=True)
+class OrderView:
+    order_id: int
+    order_date: str
+    status: str
+    amount: float
+
+
 @dataclass
 class DemoState:
     phase: str = "boot"
     source_events: deque[str] = field(default_factory=lambda: deque(maxlen=22))
     cdc_events: deque[str] = field(default_factory=lambda: deque(maxlen=22))
+    orders: tuple[OrderView, ...] = ()
+    incremental_scan_ids: tuple[int, ...] = ()
+    naive_scan_ids: tuple[int, ...] = ()
     daily_revenue: tuple[RevenueRow, ...] = ()
     batch_start: int | None = None
     batch_end: int | None = None
@@ -106,6 +117,9 @@ class DemoState:
                 "phase": self.phase,
                 "source_events": tuple(self.source_events),
                 "cdc_events": tuple(self.cdc_events),
+                "orders": self.orders,
+                "incremental_scan_ids": self.incremental_scan_ids,
+                "naive_scan_ids": self.naive_scan_ids,
                 "daily_revenue": self.daily_revenue,
                 "batch_start": self.batch_start,
                 "batch_end": self.batch_end,
@@ -261,8 +275,12 @@ def listen_and_apply(consumer: DMLConsumer, state: DemoState, recorder: MetricsR
         raise TypeError(f"expected DMLBatch, got {type(batch).__name__}")
 
     applied = 0
+    scanned_ids: set[int] = set()
     with batch.transaction() as tx:
         for change in batch.changes:
+            oid = dict(change.values).get("order_id")
+            if oid is not None:
+                scanned_ids.add(int(oid))
             if apply_delta(tx, change):
                 applied += 1
                 state.add_cdc(format_change(change))
@@ -274,6 +292,7 @@ def listen_and_apply(consumer: DMLConsumer, state: DemoState, recorder: MetricsR
         batch_changes=len(batch.changes),
         committed_snapshot=batch.end_snapshot,
         incremental_changes=state.snapshot()["incremental_changes"] + applied,
+        incremental_scan_ids=tuple(sorted(scanned_ids)),
     )
     recorder.set_detail("last_batch", batch.batch_id)
     recorder.set_detail("incremental_changes", state.snapshot()["incremental_changes"])
@@ -331,10 +350,13 @@ def format_change(change: Change) -> str:
 
 def update_counts_and_invariant(lake: Any, state: DemoState, *, full_scan: bool) -> str:
     source_rows = int(lake.connection.execute(f"SELECT count(*) FROM {SOURCE_TABLE}").fetchone()[0])
+    orders = read_orders(lake.connection)
     if full_scan:
         state.update(full_scan_rows=state.snapshot()["full_scan_rows"] + source_rows)
     state.update(
         source_rows=source_rows,
+        orders=orders,
+        naive_scan_ids=tuple(order.order_id for order in orders) if full_scan else (),
         daily_revenue=read_daily_revenue(lake.connection),
     )
     result = verify_invariant(lake.connection)
@@ -351,6 +373,20 @@ def read_daily_revenue(conn: Any) -> tuple[RevenueRow, ...]:
         """
     ).fetchall()
     return tuple(RevenueRow(str(row[0]), int(row[1]), float(row[2])) for row in rows)
+
+
+def read_orders(conn: Any) -> tuple[OrderView, ...]:
+    rows = conn.execute(
+        f"""
+        SELECT order_id, order_date::VARCHAR, status, amount
+        FROM {SOURCE_TABLE}
+        ORDER BY order_id
+        """
+    ).fetchall()
+    return tuple(
+        OrderView(int(row[0]), str(row[1]), str(row[2]), float(row[3]))
+        for row in rows
+    )
 
 
 def verify_invariant(conn: Any) -> str:
@@ -406,18 +442,21 @@ def build_layout(recorder: MetricsRecorder, state: DemoState) -> Layout:
     view = state.snapshot()
     layout = Layout()
     layout.split(
-        Layout(_header(snap, view), name="header", size=4),
+        Layout(_header(snap, view), name="header", size=5),
         Layout(name="body"),
         Layout(_footer(view), name="footer", size=3),
     )
     layout["body"].split_row(
-        Layout(_source_panel(view), name="source", ratio=2),
-        Layout(_mv_panel(view), name="mv", ratio=2),
-        Layout(name="right", ratio=3),
+        Layout(name="left", ratio=3),
+        Layout(name="right", ratio=2),
+    )
+    layout["left"].split(
+        Layout(_source_table_panel(view, mode="incremental"), name="incremental"),
+        Layout(_source_table_panel(view, mode="naive"), name="naive"),
     )
     layout["right"].split(
-        Layout(_cost_panel(view), name="cost", ratio=3),
-        Layout(_window_panel(view), name="window", ratio=2),
+        Layout(_result_panel(view), name="result", ratio=2),
+        Layout(_savings_panel(view), name="savings", ratio=3),
     )
     return layout
 
@@ -426,21 +465,30 @@ def _header(snap: dict[str, Any], view: dict[str, Any]) -> Panel:
     inc = view["incremental_changes"]
     fs = view["full_scan_rows"]
     pct = _observed_savings_pct(inc, fs)
-    savings_line = (
-        f"[bold green]savings vs naive full-scan: {pct:.1f}%[/bold green] "
-        f"([dim]CDC rows[/dim] {inc} [dim]vs[/dim] [dim]scan-rows[/dim] {fs})"
-        if pct is not None
-        else "[dim]savings vs naive full-scan: —[/dim]"
-    )
-    text = Text.from_markup(
-        f"[bold]ducklake-cdc[/bold] · {EXAMPLE} · "
-        f"[cyan]orders[/cyan] → [green]daily_revenue[/green]   "
-        f"[dim]phase[/dim] {view['phase']}   "
-        f"[dim]elapsed[/dim] {_fmt_duration(snap['elapsed_s'])}   "
-        f"[dim]errors[/dim] {snap['errors']}\n"
-        f"{savings_line}"
-    )
-    return Panel(text, border_style="dim")
+    pct_s = "—" if pct is None else f"{pct:.1f}%"
+
+    title = Text()
+    title.append("ducklake-cdc", style="bold")
+    title.append(" · ")
+    title.append(EXAMPLE)
+    title.append("    elapsed ", style="dim")
+    title.append(_fmt_duration(snap["elapsed_s"]))
+    title.append("    errors ", style="dim")
+    title.append(str(snap["errors"]))
+
+    story = Text()
+    story.append("Incremental scan: ", style="dim")
+    story.append(_fmt_int(inc), style="bold")
+    story.append(" row reads   Full refresh scan: ", style="dim")
+    story.append(_fmt_int(fs), style="bold")
+    story.append(" row reads   Saved ", style="dim")
+    story.append(pct_s, style="bold")
+
+    grid = Table.grid()
+    grid.add_column()
+    grid.add_row(title)
+    grid.add_row(story)
+    return Panel(grid, border_style="dim", padding=(0, 1))
 
 
 def _footer(view: dict[str, Any]) -> Panel:
@@ -448,31 +496,52 @@ def _footer(view: dict[str, Any]) -> Panel:
     fs = view["full_scan_rows"]
     pct = _observed_savings_pct(inc, fs)
     pct_part = f"savings={pct:.1f}%  " if pct is not None else ""
-    text = (
-        f"{pct_part}"
-        f"events={view['source_events_seen']}/{len(EVENTS)}  "
-        f"orders_rows={view['source_rows']}  "
-        f"committed={view['committed_snapshot'] or '—'}  "
-        f"invariant={view['invariant']}"
-    )
-    return Panel(Text.from_markup(f"[dim]{text}[/dim]"), border_style="dim")
+    text = Text(no_wrap=True, overflow="ellipsis")
+    if pct_part:
+        text.append(pct_part, style="bold")
+    text.append(f"events {view['source_events_seen']}/{len(EVENTS)}  ")
+    text.append("orders ", style="dim")
+    text.append(str(view["source_rows"]), style="bold")
+    text.append("  commit ", style="dim")
+    text.append(str(view["committed_snapshot"] or "—"), style="bold yellow")
+    text.append("  invariant=", style="dim")
+    if view["invariant"] == "ok":
+        text.append("ok", style="bold")
+    elif view["invariant"] == "pending":
+        text.append("pending", style="dim")
+    else:
+        text.append(str(view["invariant"]), style="bold")
+    return Panel(text, border_style="dim", padding=(0, 1))
 
 
-def _source_panel(view: dict[str, Any]) -> Panel:
-    table = Table.grid()
+def _source_table_panel(view: dict[str, Any], *, mode: Literal["incremental", "naive"]) -> Panel:
+    scan_ids = set(view["incremental_scan_ids"] if mode == "incremental" else view["naive_scan_ids"])
+    title = "TABLE A: incremental source" if mode == "incremental" else "TABLE B: full-refresh source"
+    caption = "only changed rows flash red" if mode == "incremental" else "every row flashes red on refresh"
+    table = Table.grid(padding=(0, 1))
+    table.add_column(justify="right")
     table.add_column()
-    for item in view["source_events"]:
-        table.add_row(item)
-    if not view["source_events"]:
-        table.add_row("[dim]waiting for source commits...[/dim]")
-    table.add_row("")
-    table.add_row("[bold]CDC delta rows[/bold]")
-    for item in view["cdc_events"]:
-        table.add_row(f"[dim]{item}[/dim]")
-    return Panel(table, title="[bold cyan]source activity[/bold cyan]", border_style="cyan")
+    table.add_column()
+    table.add_column(justify="right")
+    table.add_row("id", "date", "status", "amount")
+    for order in view["orders"]:
+        style = "bold red" if order.order_id in scan_ids else None
+        table.add_row(
+            _cell(str(order.order_id), style),
+            _cell(order.order_date, style),
+            _cell(order.status, style),
+            _cell(f"${order.amount:.2f}", style),
+        )
+    if not view["orders"]:
+        table.add_row("—", "—", "—", "—", style="dim")
+    return Panel(table, title=title, subtitle=f"[dim]{caption}[/dim]", border_style="dim")
 
 
-def _mv_panel(view: dict[str, Any]) -> Panel:
+def _cell(value: str, style: str | None = None) -> Text:
+    return Text(value, style=style or "")
+
+
+def _result_panel(view: dict[str, Any]) -> Panel:
     table = Table()
     table.add_column("date")
     table.add_column("paid", justify="right")
@@ -481,71 +550,59 @@ def _mv_panel(view: dict[str, Any]) -> Panel:
         table.add_row(row.order_date, _fmt_int(row.paid_orders), f"${row.revenue:,.2f}")
     if not view["daily_revenue"]:
         table.add_row("—", "0", "$0.00")
-    return Panel(table, title="[bold green]incremental daily_revenue[/bold green]", border_style="green")
+    return Panel(table, title="RESULT TABLE: daily_revenue", border_style="dim")
 
 
-def _window_panel(view: dict[str, Any]) -> Panel:
-    table = Table.grid(padding=(0, 1))
-    table.add_column(style="dim")
-    table.add_column()
-    table.add_row("batch", f"{view['batch_start'] or '—'} → {view['batch_end'] or '—'}")
-    table.add_row("changes", str(view["batch_changes"]))
-    table.add_row("committed", str(view["committed_snapshot"] or "—"))
-    return Panel(table, title="[bold yellow]CDC window[/bold yellow]", border_style="yellow")
-
-
-def _cost_panel(view: dict[str, Any]) -> Panel:
+def _savings_panel(view: dict[str, Any]) -> Panel:
     inc = view["incremental_changes"]
     fs = view["full_scan_rows"]
     ref = max(view["source_rows"], 1)
     pct = _observed_savings_pct(inc, fs)
 
-    table = Table.grid(padding=(0, 1))
-    table.add_column(style="bold")
-    table.add_column(justify="right")
-    table.add_row("[bold]Observed this run[/bold]", "")
-    table.add_row("CDC rows applied", _fmt_int(inc))
-    table.add_row("Naive scan-rows", _fmt_int(fs))
-    if pct is None:
-        table.add_row("% vs naive", "—")
-    elif pct >= 0:
-        table.add_row("% vs naive", f"[bold green]{pct:.1f}%[/bold green]")
-    else:
-        table.add_row("% vs naive", f"[yellow]{pct:.1f}%[/yellow]")
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column()
 
-    table.add_row("", "")
-    table.add_row(
-        "[bold]Scaled table[/bold]",
-        "[dim]same # of refreshes[/dim]",
-    )
+    pct_s = "—" if pct is None else f"{pct:.1f}%"
+    headline = Text()
+    headline.append("Saved ", style="dim")
+    headline.append(pct_s, style="bold")
+    headline.append(" scan work", style="bold")
+    grid.add_row(headline)
+    grid.add_row("")
+
+    cdc_bar = _work_bar(inc, max(fs, inc, 1))
+    scan_bar = _work_bar(fs, max(fs, inc, 1))
+    grid.add_row(f"incremental  {cdc_bar} {_fmt_int(inc)}")
+    grid.add_row(f"full scan    {scan_bar} {_fmt_int(fs)}")
+    grid.add_row("")
+    grid.add_row("same changes on bigger tables:")
     for target in EXTRAPOLATE_TABLE_SIZES:
         naive_scaled = _scaled_naive_scan_rows(fs, target, ref)
         epct = _observed_savings_pct(inc, naive_scaled)
         label = _fmt_int(target)
         if epct is None:
-            table.add_row(f"orders≈{label}", "—")
+            grid.add_row(f"orders≈{label}: —")
         else:
-            table.add_row(
-                f"orders≈{label}",
-                f"[green]{epct:.2f}%[/green] [dim](naive ~{_fmt_int(naive_scaled)})[/dim]",
+            grid.add_row(
+                f"{label} orders: [bold]{epct:.2f}% saved[/bold] "
+                f"[dim](scan ~{_fmt_int(naive_scaled)})[/dim]"
             )
-
-    table.add_row("", "")
-    table.add_row(
-        "[dim]Naive = cumulative rows scanned by GROUP BY checks; CDC = change rows.[/dim]",
-        "",
-    )
-    table.add_row(
-        "[dim]Scaled naive ≈ scan-rows × (target ÷ current orders).[/dim]",
-        "",
-    )
+    grid.add_row("")
+    grid.add_row(f"[dim]cursor batch {view['batch_start'] or '—'} -> {view['batch_end'] or '—'}; commit {view['committed_snapshot'] or '—'}[/dim]")
 
     return Panel(
-        table,
-        title="[bold magenta]correctness / cost[/bold magenta]",
-        border_style="magenta",
+        grid,
+        title="SAVINGS",
+        border_style="dim",
         subtitle=f"[dim]invariant {view['invariant']}[/dim]",
     )
+
+
+def _work_bar(value: int, maximum: int, *, width: int = 20) -> str:
+    if maximum <= 0:
+        return "[dim]" + ("░" * width) + "[/dim]"
+    filled = max(1 if value > 0 else 0, min(width, round(width * value / maximum)))
+    return f"[white]{'█' * filled}[/white][dim]{'░' * (width - filled)}[/dim]"
 
 
 def _fmt_int(value: int) -> str:
@@ -567,24 +624,45 @@ def headless_summary(recorder: MetricsRecorder, state: DemoState) -> Callable[[]
         ref = max(view["source_rows"], 1)
         pct = _observed_savings_pct(inc, fs)
         pct_s = f"{pct:.1f}%" if pct is not None else "—"
-        e10 = EXTRAPOLATE_TABLE_SIZES[0]
-        e1m = EXTRAPOLATE_TABLE_SIZES[1]
-        n10 = _scaled_naive_scan_rows(fs, e10, ref)
-        n1m = _scaled_naive_scan_rows(fs, e1m, ref)
-        p10 = _observed_savings_pct(inc, n10)
-        p1m = _observed_savings_pct(inc, n1m)
-        e10_s = f"{p10:.2f}%" if p10 is not None else "—"
-        e1m_s = f"{p1m:.2f}%" if p1m is not None else "—"
+        e1k = EXTRAPOLATE_TABLE_SIZES[0]
+        e10k = EXTRAPOLATE_TABLE_SIZES[1]
+        n1k = _scaled_naive_scan_rows(fs, e1k, ref)
+        n10k = _scaled_naive_scan_rows(fs, e10k, ref)
+        p1k = _observed_savings_pct(inc, n1k)
+        p10k = _observed_savings_pct(inc, n10k)
+        e1k_s = f"{p1k:.2f}%" if p1k is not None else "—"
+        e10k_s = f"{p10k:.2f}%" if p10k is not None else "—"
         return (
             f"phase={view['phase']} rows={snap['rows_processed']} "
             f"events={view['source_events_seen']}/{len(EVENTS)} "
             f"orders_rows={view['source_rows']} "
             f"cdc_rows={inc} naive_scan_rows={fs} savings={pct_s} "
-            f"extrap_savings_{e10//1000}k={e10_s} extrap_savings_1m={e1m_s} "
+            f"extrap_savings_1k={e1k_s} extrap_savings_10k={e10k_s} "
             f"invariant={view['invariant']} errors={snap['errors']}"
         )
 
     return summary
+
+
+def json_summary(recorder: MetricsRecorder, state: DemoState) -> dict[str, Any]:
+    snap = recorder.snapshot()
+    view = state.snapshot()
+    incremental = int(view["incremental_changes"])
+    full_scan = int(view["full_scan_rows"])
+    savings = _observed_savings_pct(incremental, full_scan)
+    return {
+        "example": EXAMPLE,
+        "errors": snap["errors"],
+        "rows_processed": snap["rows_processed"],
+        "phase": view["phase"],
+        "events_seen": view["source_events_seen"],
+        "events_total": len(EVENTS),
+        "orders_rows": view["source_rows"],
+        "incremental_changes": incremental,
+        "full_scan_rows": full_scan,
+        "savings_pct": savings,
+        "invariant": view["invariant"],
+    }
 
 
 def drain_consumer(client: CDCClient, name: str) -> None:
@@ -681,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
 
     log(headless_summary(recorder, state)())
+    emit_json_summary(common, json_summary(recorder, state))
     return 0 if recorder.snapshot()["errors"] == 0 and state.snapshot()["invariant"] == "ok" else 1
 
 

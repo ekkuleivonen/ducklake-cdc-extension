@@ -1,59 +1,37 @@
-# 04 &mdash; Cache / Search Refresh
+# 04 &mdash; Refresh Signals, Not Row Streams
 
-A metadata-only change tap for systems that should re-read from DuckLake on
-demand: caches, search indexes, vector indexes, CDN tags, or service-local
-materializations.
+Wake caches, search indexes, vector indexes, and service-local materializations
+when DuckLake changes. Tick consumers carry snapshot metadata only: enough to
+trigger a refresh, without shipping row payloads through the notification path.
 
-## Story
+![Ticks notifications UI](./demo.gif)
 
-A producer commits lightweight updates to a watched DuckLake table. The
-consumer waits in `cdc_dml_ticks_listen`, receives one tick per matching
-snapshot, records commit-to-tick latency, and advances the cursor. It never
-reads row payloads.
 
-```
-raw_ticks  ->  cdc_dml_ticks_listen  ->  refresh signal
-```
+## Python Client
 
-## Why This Is Fourth
+```python
+from ducklake_cdc_client import DMLConsumer
 
-Ticks are useful, but they are not the core product claim. This demo exists to
-show the cheap wakeup primitive that other systems can use after the first
-three demos have established durable, schema-aware consumption.
 
-## Limitations
+consumer = DMLConsumer(lake, "cache_refresh", table="orders", mode="ticks").open()
 
-This is not a microsecond event bus. Postgres catalogs use the snapshot
-`LISTEN`/`NOTIFY` fast path; DuckDB and SQLite catalogs use polling. The
-visible latency includes DuckLake commit cost and metadata work. This demo
-sets `coalesce=False` because it measures first-tick latency rather than
-throughput-oriented batching.
+for batch in consumer.batches(timeout_ms=1_000, max_snapshots=100):
+    for tick in batch:
+        refresh_cache(snapshot_id=tick.snapshot_id)
+        refresh_search_index(snapshot_id=tick.snapshot_id)
 
-## Run
-
-```bash
-docker compose -f e2e/docker-compose.yml up -d --wait
-make release
-
-uv run --project e2e python e2e/04_cache_refresh/app.py
-uv run --project e2e python e2e/04_cache_refresh/app.py --headless --duration 30
-uv run --project e2e python e2e/04_cache_refresh/app.py --headless --duration 30 --catalog duckdb
-uv run --project e2e python e2e/04_cache_refresh/app.py --headless --duration 30 --catalog sqlite
+    batch.commit()
 ```
 
-The lake is reset before and after each run.
+Use ticks when the downstream system can re-read what it needs from DuckLake.
+The consumer commits only after every external refresh for the batch has been
+scheduled or completed, so a restart resumes from the last acknowledged
+snapshot.
 
-## Reading The Numbers
+## API References
 
-```
-producer_rows=N     -> rows the producer inserted
-producer_commits=N  -> commits/snapshots the producer made
-ticks=N             -> ticks the consumer delivered
-rate=N/s            -> ticks delivered per second
-p50, p95, p99       -> commit -> tick latency percentiles
-hist=[a,b,c,d,e]    -> latency bins: <5ms, 5-10ms, 10-25ms, 25-100ms, >100ms
-errors=N            -> unhandled exceptions
-```
-
-A healthy run has `producer_commits == ticks` or is off by one tick at
-shutdown, with `errors=0`.
+- [`cdc_dml_consumer_create`](../../docs/api.md#cdc_dml_consumer_create): create the durable tick consumer with `mode='ticks'`.
+- [`cdc_dml_ticks_listen`](../../docs/api.md#cdc_dml_ticks_listen): long-poll DML snapshot ticks without row payloads.
+- [`cdc_dml_ticks_read`](../../docs/api.md#cdc_dml_ticks_read): drain pending tick windows without waiting.
+- [`cdc_commit`](../../docs/api.md#cdc_commit): acknowledge refreshed snapshots.
+- [`cdc_window`](../../docs/api.md#cdc_window): inspect pending snapshots and cursor state.

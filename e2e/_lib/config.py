@@ -10,17 +10,12 @@ This module is the single point that knows how to:
 - retry around the SQLite "database is locked" / DuckDB ``thread::join``
   H-022 transient that surfaces on first cdc_* call against a fresh catalog.
 
-Most of the heavy lifting was lifted from the previous
-``e2e/benchmark/common.py`` so we don't reimplement S3 URL parsing,
-postgres reset, etc. The differences:
-
-- The flag surface is the new minimal set (``--catalog {duckdb,sqlite,
-  postgres}``, ``--storage {disk,s3}``) rather than the benchmark's
-  ``--catalog-backend`` + URL string combo.
-- S3 credentials are read from ``S3_*`` env vars (the names
-  ``setup-garage.sh`` writes) with a fallback to the legacy
-  ``DUCKLAKE_BENCHMARK_S3_*`` names so existing local ``.env`` files keep
-  working through the migration.
+The shared helpers keep every demo on the same flag surface:
+``--catalog {duckdb,sqlite,postgres}`` and ``--storage {disk,s3}``.
+S3 credentials are read from ``S3_*`` env vars (the names
+``setup-garage.sh`` writes), with a fallback to legacy
+``DUCKLAKE_BENCHMARK_S3_*`` names so existing local ``.env`` files keep
+working.
 """
 
 from __future__ import annotations
@@ -59,9 +54,8 @@ DEFAULT_POSTGRES_ADMIN_CATALOG = "postgresql://ducklake:ducklake@localhost:5436/
 CDC_EXTENSION_ENV = "DUCKLAKE_CDC_EXTENSION"
 
 # S3 credentials and tunables. The first name is what setup-garage.sh
-# writes (canonical going forward); the second name is what the legacy
-# benchmark used and is kept for back-compat while ``e2e/benchmark/`` is
-# still around. New env vars on a fresh ``e2e/.env`` should use the first.
+# writes (canonical going forward); the second name is kept for back-compat
+# with older local ``e2e/.env`` files.
 S3_ENV_KEY_PAIRS: dict[str, tuple[str, str]] = {
     "endpoint": ("S3_ENDPOINT", "DUCKLAKE_BENCHMARK_S3_ENDPOINT"),
     "region": ("S3_REGION", "DUCKLAKE_BENCHMARK_S3_REGION"),

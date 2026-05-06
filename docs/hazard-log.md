@@ -21,9 +21,9 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: DuckDB, SQLite, and PostgreSQL DuckLake catalogs may diverge in metadata
   encoding, transaction behavior, or extension-visible semantics.
 - Status: partially handled.
-- Handling: `e2e/catalog_matrix/catalog_matrix_smoke.py` runs a DDL + DML
-  cursor flow and lease rejection flow across DuckDB, SQLite, and PostgreSQL in
-  CI.
+- Handling: SQL tests, smoke probes, and the user-facing demo CI gates exercise
+  the primary catalog paths. Targeted backend probes should be added when a
+  concrete portability bug appears.
 - Next action: Add targeted backend tests only when a concrete portability bug
   appears or a user-reported workflow depends on it.
 
@@ -32,10 +32,9 @@ go; this file says what can hurt users or maintainers on the way there.
 - Risk: Two readers could process or commit the same consumer window if the
   owner-token lease is wrong.
 - Status: partially handled.
-- Handling: `e2e/smoke/lease_multiconn_smoke.py`,
-  `test/consumer_state.test`, and the catalog matrix smoke cover
-  same-connection idempotence, second-reader rejection, force release, and
-  stolen-lease commit failure.
+- Handling: `e2e/smoke/lease_multiconn_smoke.py` and `test/consumer_state.test`
+  cover same-connection idempotence, second-reader rejection, force release,
+  and stolen-lease commit failure.
 - Notes: `cdc_consumer_force_release` is only for a holder that is
   demonstrably dead. A longer `lease_interval_seconds` gives long batches more
   room, but also makes dead holders take longer to clear.
@@ -140,9 +139,9 @@ go; this file says what can hurt users or maintainers on the way there.
 
 - Risk: Early benchmark numbers can be mistaken for production promises.
 - Status: partially handled.
-- Handling: `e2e/benchmark/runner.py`, `e2e/benchmark/light.yaml`, and
-  `e2e/benchmark/README.md`
-  provide smoke-level measurements and explain how to read them.
+- Handling: `e2e/ci_demo_assertions.py` applies conservative performance floors
+  to demos whose story depends on throughput or latency, while docs describe
+  those numbers as smoke signals rather than contracts.
 - Next action: Publish numbers as observations with commit/hardware context;
   avoid hard performance contracts until repeated runs justify them.
 
@@ -220,10 +219,9 @@ go; this file says what can hurt users or maintainers on the way there.
   a prefixed-table fallback for SQLite. Repeated string fields use portable JSON
   text because SQLite does not preserve DuckDB LIST columns through the scanner
   layer.
-- Notes: DuckDB and SQLite are covered by the catalog matrix smoke. PostgreSQL
-  still needs the same focused probe before this is treated as fully portable.
-- Next action: Extend the backend matrix probe to PostgreSQL and add explicit
-  cleanup/migration coverage for the state tables.
+- Notes: DuckDB and SQLite have focused smoke coverage. PostgreSQL still needs
+  the same focused probe before this is treated as fully portable.
+- Next action: Add explicit cleanup/migration coverage for the state tables.
 
 ### H-016: CDC State and DuckLake Snapshot Atomicity
 
@@ -414,10 +412,6 @@ go; this file says what can hurt users or maintainers on the way there.
   attempt always finds the catalog already bootstrapped, so the racy first-
   time mutex re-entry doesn't recur. Callers who explicitly want the raw
   exception can opt out with `retry=ducklake_cdc_client.no_retry`.
-  ``e2e/benchmark/common.py::is_thread_join_deadlock`` matches the same
-  family for the benchmark's own ``retry_on_lock`` (which loops without an
-  attempt cap because the bench wants to wait through arbitrarily long
-  contention).
 - New finding (May 2026, postgres + populated catalog): the ``retry_on_transient``
   recovery is **not** sufficient when the H-022 race fires against an
   already-bootstrapped postgres catalog (e.g. a process that ATTACHes a

@@ -27,9 +27,10 @@ What exists today, before the API-contract cleanup:
 - Community-extension packaging for `v0.3.2`, with SQL tests disabled in the
   community repo because this extension's DuckLake-dependent integration suite
   runs in its own CI.
-- CI smoke coverage for DuckDB, SQLite, and PostgreSQL DuckLake catalogs.
-- A lightweight benchmark harness for smoke-level performance tracking,
-  including both normal and empty-window workloads.
+- CI smoke coverage for key cursor, lease, wait, and upstream DuckLake contract
+  behaviours.
+- User-facing demo gates for smoke-level correctness and conservative
+  performance tracking.
 
 What the next API iteration is aiming at:
 

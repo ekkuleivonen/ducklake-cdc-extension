@@ -1,42 +1,53 @@
-# 03 &mdash; Backfill Then Live Catchup
+# 03 &mdash; Durable Catchup After Restarts
 
-Start a consumer from old snapshots, drain history, and then stay current with
-live listen calls.
+Keep mirrors, indexes, and serving tables alive through ordinary deploys and
+process restarts. Producers keep writing, the durable cursor remembers the last
+committed snapshot, and the consumer reopens to drain exactly the rows it missed.
 
-## Story
+![Catchup after consumer restart UI](./demo.gif)
 
-A new downstream index or derived table is introduced after the source table
-already has history. The consumer starts at snapshot 0, processes historical
-windows in bounded batches, catches up to the catalog head, then switches into
-listen mode for new commits.
+## Python Client
 
+```python
+from ducklake_cdc_client import DMLConsumer
+
+
+def apply(batch):
+    with batch.transaction() as tx:
+        mirror_orders(tx, batch.changes)
+
+
+consumer = DMLConsumer(lake, "orders_mirror", table="orders", mode="changes").open()
+
+for batch in consumer.batches(timeout_ms=1_000, max_snapshots=20, idle_timeout=1.0):
+    apply(batch)
+
+consumer.close()  # process restarts while producers keep writing
+
+consumer = DMLConsumer(
+    lake,
+    "orders_mirror",
+    table="orders",
+    mode="changes",
+    on_exists="use",
+    lease_policy="takeover",
+).open()
+
+while batch := consumer.read(max_snapshots=50):
+    apply(batch)
+
+for batch in consumer.batches(timeout_ms=1_000, max_snapshots=20):
+    apply(batch)
 ```
-snapshot 0 .. head  ->  read windows  ->  caught up
-new commits         ->  listen        ->  stays current
-```
 
-## Why This Is Third
+`batch.transaction()` applies sink writes and `cdc_commit` together. If the
+consumer dies between batches, reopening the same name resumes from the last
+committed snapshot instead of replaying the whole table.
 
-Most real consumers do not start on day zero. They are added after data exists,
-or they need to rebuild after an operator drops a sink. This is where durable
-snapshot cursors become more valuable than a one-off `table_changes` query.
+## API References
 
-## What The Viewer Should See
-
-- Historical backlog count falling to zero.
-- A clear transition from read/backfill mode to listen/live mode.
-- The same sink code used in both modes.
-- A restart during backfill that resumes from the last committed snapshot.
-- A final invariant showing no gaps and no duplicate committed windows.
-
-## API Surface
-
-- `cdc_dml_consumer_create(start_at := 'beginning')`
-- `cdc_dml_changes_read`
-- `cdc_dml_changes_listen`
-- `cdc_commit`
-
-## Status
-
-Spec only. Build after the materialized-view demo so it can reuse the same
-derived table or index sink.
+- [`cdc_dml_consumer_create`](../../docs/api.md#cdc_dml_consumer_create): create or reopen the durable row-change cursor.
+- [`cdc_dml_changes_listen`](../../docs/api.md#cdc_dml_changes_listen): long-poll new rows while the mirror is live.
+- [`cdc_dml_changes_read`](../../docs/api.md#cdc_dml_changes_read): drain bounded backlog windows after downtime.
+- [`cdc_commit`](../../docs/api.md#cdc_commit): advance the cursor after sink writes commit.
+- [`cdc_window`](../../docs/api.md#cdc_window): inspect backlog and committed snapshot state.

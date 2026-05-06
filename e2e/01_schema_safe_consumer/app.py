@@ -25,7 +25,7 @@ from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
-from _lib.cli import make_parser, parse_common  # noqa: E402
+from _lib.cli import emit_json_summary, make_parser, parse_common  # noqa: E402
 from _lib.config import load_cdc_extension, open_lake, reset_lake  # noqa: E402
 from _lib.metrics import MetricsRecorder  # noqa: E402
 from _lib.tui import LiveDisplay, log  # noqa: E402
@@ -41,13 +41,14 @@ LISTEN_MAX_SNAPSHOTS = 20
 POLL_MIN_MS = 1
 INSERT_INTERVAL_S = 0.4
 DDL_EVERY_ROWS = 10
-MAX_SCHEMA_MIGRATIONS = 3
+MAX_SCHEMA_MIGRATIONS = 4
 TOTAL_DML_EVENTS = DDL_EVERY_ROWS * (MAX_SCHEMA_MIGRATIONS + 1)
 BASE_COLUMNS = ("id", "status", "amount", "updated_at")
 
 
 @dataclass(frozen=True)
 class SchemaMutation:
+    op: str
     name: str
     sql_type: str
     default_sql: str
@@ -55,9 +56,10 @@ class SchemaMutation:
 
 
 SCHEMA_MUTATIONS: tuple[SchemaMutation, ...] = (
-    SchemaMutation("tax", "DOUBLE", "0", 0.0),
-    SchemaMutation("priority", "VARCHAR", "'standard'", "standard"),
-    SchemaMutation("region", "VARCHAR", "'global'", "global"),
+    SchemaMutation("add", "tax", "DOUBLE", "0", 0.0),
+    SchemaMutation("add", "priority", "VARCHAR", "'standard'", "standard"),
+    SchemaMutation("drop", "status", "VARCHAR", "'new'", "new"),
+    SchemaMutation("add", "region", "VARCHAR", "'global'", "global"),
 )
 
 
@@ -199,14 +201,42 @@ def consumer_name_for_epoch(epoch: int) -> str:
 
 
 def active_mutations(epoch: int) -> tuple[SchemaMutation, ...]:
-    return SCHEMA_MUTATIONS[: min(MAX_SCHEMA_MIGRATIONS, max(0, epoch - 1))]
+    active: dict[str, SchemaMutation] = {}
+    for mutation in SCHEMA_MUTATIONS[: min(MAX_SCHEMA_MIGRATIONS, max(0, epoch - 1))]:
+        if mutation.op == "add":
+            active[mutation.name] = mutation
+        elif mutation.op == "drop":
+            active.pop(mutation.name, None)
+    return tuple(active.values())
+
+
+def active_base_columns(epoch: int) -> tuple[str, ...]:
+    dropped = {
+        mutation.name
+        for mutation in SCHEMA_MUTATIONS[: min(MAX_SCHEMA_MIGRATIONS, max(0, epoch - 1))]
+        if mutation.op == "drop"
+    }
+    return tuple(column for column in BASE_COLUMNS if column not in dropped)
 
 
 def insert_order(lake: Any, order_id: int, *, epoch: int) -> None:
     mutations = active_mutations(epoch)
-    columns = ["id", "status", "amount", "updated_at", *(mutation.name for mutation in mutations)]
-    placeholders = ["?", "?", "?", "now()", *("?" for _ in mutations)]
-    values: list[Any] = [order_id, status_for_epoch(epoch), float(order_id * 10)]
+    base_columns = active_base_columns(epoch)
+    columns = [*base_columns, *(mutation.name for mutation in mutations)]
+    placeholders = [
+        "now()" if column == "updated_at" else "?"
+        for column in base_columns
+    ] + ["?" for _ in mutations]
+    base_values = {
+        "id": order_id,
+        "status": status_for_epoch(epoch),
+        "amount": float(order_id * 10),
+    }
+    values: list[Any] = [
+        base_values[column]
+        for column in base_columns
+        if column != "updated_at"
+    ]
     values.extend(value_for_mutation(mutation, order_id) for mutation in mutations)
     lake.connection.execute(
         f"""
@@ -333,12 +363,18 @@ def format_change(row: ChangeRow, epoch: int) -> str:
 
 def trigger_schema_change(lake: Any, state: DemoState, mutation: SchemaMutation) -> int:
     state.update(phase="alter_source")
-    state.add_dml(
-        f"source ALTER TABLE orders ADD COLUMN {mutation.name} {mutation.sql_type}"
-    )
-    lake.connection.execute(
-        f"ALTER TABLE lake.orders ADD COLUMN {mutation.name} {mutation.sql_type} DEFAULT {mutation.default_sql}"
-    )
+    if mutation.op == "add":
+        state.add_dml(
+            f"source ALTER TABLE orders ADD COLUMN {mutation.name} {mutation.sql_type}"
+        )
+        lake.connection.execute(
+            f"ALTER TABLE lake.orders ADD COLUMN {mutation.name} {mutation.sql_type} DEFAULT {mutation.default_sql}"
+        )
+    elif mutation.op == "drop":
+        state.add_dml(f"source ALTER TABLE orders DROP COLUMN {mutation.name}")
+        lake.connection.execute(f"ALTER TABLE lake.orders DROP COLUMN {mutation.name}")
+    else:
+        raise AssertionError(f"unknown schema mutation op: {mutation.op}")
     refresh_schemas(lake, state)
     snapshot_id = current_snapshot(lake)
     state.update(boundary_snapshot=snapshot_id)
@@ -408,12 +444,18 @@ def read_schema_diff(consumer: DMLConsumer, boundary_snapshot: int) -> tuple[Dif
 
 def apply_sink_migration(lake: Any, state: DemoState, mutation: SchemaMutation) -> None:
     state.update(phase="migrating_sink")
-    state.add_dml(
-        f"applying migration: derived_orders ADD COLUMN {mutation.name}"
-    )
-    lake.connection.execute(
-        f"ALTER TABLE {SINK_TABLE} ADD COLUMN {mutation.name} {mutation.sql_type} DEFAULT {mutation.default_sql}"
-    )
+    if mutation.op == "add":
+        state.add_dml(
+            f"applying migration: derived_orders ADD COLUMN {mutation.name}"
+        )
+        lake.connection.execute(
+            f"ALTER TABLE {SINK_TABLE} ADD COLUMN {mutation.name} {mutation.sql_type} DEFAULT {mutation.default_sql}"
+        )
+    elif mutation.op == "drop":
+        state.add_dml(f"applying migration: derived_orders DROP COLUMN {mutation.name}")
+        lake.connection.execute(f"ALTER TABLE {SINK_TABLE} DROP COLUMN {mutation.name}")
+    else:
+        raise AssertionError(f"unknown schema mutation op: {mutation.op}")
     refresh_schemas(lake, state)
     state.update(migrations_applied=state.snapshot()["migrations_applied"] + 1)
     state.add_dml("migration applied")
@@ -504,85 +546,218 @@ def build_layout(recorder: MetricsRecorder, state: DemoState) -> Layout:
     view = state.snapshot()
     layout = Layout()
     layout.split(
-        Layout(_header(snap, view), name="header", size=3),
+        Layout(_header(snap, view), name="header", size=6),
         Layout(name="body"),
         Layout(_footer(view), name="footer", size=3),
     )
     layout["body"].split_row(
-        Layout(_schema_panel(view), name="schema", ratio=2),
+        Layout(_schema_timeline_panel(view), name="schema_timeline", ratio=2),
         Layout(_tail_panel(view), name="tail", ratio=3),
-        Layout(_diff_panel(view), name="diff", ratio=2),
+        Layout(_schema_diff_panel(view), name="schema_diff", ratio=2),
     )
     return layout
 
 
 def _header(snap: dict[str, Any], view: dict[str, Any]) -> Panel:
-    text = Text.from_markup(
-        f"[bold]ducklake-cdc[/bold] · {EXAMPLE} · "
-        f"[cyan]orders[/cyan] → [green]derived_orders[/green]   "
-        f"[dim]phase[/dim] {view['phase']}   "
-        f"[dim]elapsed[/dim] {_fmt_duration(snap['elapsed_s'])}   "
-        f"[dim]errors[/dim] {snap['errors']}"
-    )
-    return Panel(text, border_style="dim")
+    title = Text()
+    title.append("ducklake-cdc", style="bold")
+    title.append(" · ")
+    title.append(EXAMPLE)
+    title.append("    elapsed ", style="dim")
+    title.append(_fmt_duration(snap["elapsed_s"]))
+    title.append("    errors ", style="dim")
+    title.append(str(snap["errors"]))
+
+    current_schema = _current_schema_label(view)
+    story_line = Text()
+    story_line.append("DATALAKE SCHEMA TIMELINE", style="bold")
+
+    status = Text()
+    status.append("current ", style="dim")
+    status.append(current_schema, style="bold")
+    status.append("   consumer ", style="dim")
+    status.append(str(view["active_consumer"]), style="bold")
+    status.append("   boundary ", style="dim")
+    status.append(str(view["boundary_snapshot"] or "—"), style="bold")
+
+    grid = Table.grid()
+    grid.add_column()
+    grid.add_row(title)
+    grid.add_row(status)
+    grid.add_row(story_line)
+    return Panel(grid, border_style="dim", padding=(0, 1))
+
+
+def _phase_story(view: dict[str, Any]) -> tuple[str, str, str]:
+    phase = str(view["phase"])
+    if phase.startswith("tail_v"):
+        return (
+            "TAILING DML",
+            "Schemas match, so row changes flow safely into the sink.",
+            "bright_green",
+        )
+    if phase == "alter_source":
+        return (
+            "SOURCE SCHEMA CHANGED",
+            "orders changed shape; the old DML consumer must not continue blindly.",
+            "yellow",
+        )
+    if phase == "schema_boundary":
+        return (
+            "DML STOPPED AT BOUNDARY",
+            "CDC shows the diff before incompatible rows are applied.",
+            "red",
+        )
+    if phase == "migrating_sink":
+        return (
+            "MIGRATING SINK",
+            "derived_orders is altered to match the new source schema.",
+            "cyan",
+        )
+    if phase == "done":
+        return ("DONE", "Source and sink schemas match; invariant is checked.", "bright_green")
+    return ("BOOT", "Preparing schema-safe source and sink consumers.", "dim")
+
+
+def _current_schema_label(view: dict[str, Any]) -> str:
+    # `diff_rows` is cumulative. Every DDL boundary (add or drop) creates
+    # the next schema version in the timeline.
+    return f"SCHEMA_{len(view['diff_rows']) + 1}"
 
 
 def _footer(view: dict[str, Any]) -> Panel:
-    text = (
-        f"consumer={view['active_consumer']}  "
-        f"boundary={view['boundary_snapshot'] or '—'}  "
-        f"migrations={view['migrations_applied']}  "
-        f"invariant={view['invariant']}"
-    )
-    return Panel(Text.from_markup(f"[dim]{text}[/dim]"), border_style="dim")
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append(_current_schema_label(view), style="bold")
+    text.append("  rows ", style="dim")
+    text.append(f"{view['source_rows']}->{view['sink_rows']}", style="bold")
+    text.append("  migrations ", style="dim")
+    text.append(str(view["migrations_applied"]), style="bold")
+    text.append("  invariant=", style="dim")
+    if view["invariant"] == "ok":
+        text.append("ok", style="bold")
+    elif view["invariant"] == "pending":
+        text.append("pending", style="dim")
+    else:
+        text.append(str(view["invariant"]), style="bold")
+    return Panel(text, border_style="dim", padding=(0, 1))
 
 
-def _schema_panel(view: dict[str, Any]) -> Panel:
-    table = Table.grid(padding=(0, 1))
-    table.add_column(style="bold")
+def _schema_timeline_panel(view: dict[str, Any]) -> Panel:
+    active_schema_number = int(_current_schema_label(view).split("_")[1])
+    rows_by_epoch = view["rows_by_epoch"]
+
+    table = Table.grid()
     table.add_column()
-    table.add_column(style="dim")
-    table.add_row("source", "column", "type")
-    for col in view["source_schema"]:
-        table.add_row("", col.name, col.type)
-    table.add_row("", "", "")
-    table.add_row("sink", "column", "type")
-    for col in view["sink_schema"]:
-        table.add_row("", col.name, col.type)
-    table.add_row("", "", "")
-    table.add_row("rows", "source", _fmt_int(view["source_rows"]))
-    table.add_row("", "sink", _fmt_int(view["sink_rows"]))
-    return Panel(table, title="[bold cyan]current schema[/bold cyan]", border_style="cyan")
+    table.add_row(Text("schema timeline", style="bold"))
+    table.add_row(Text("each dot = one DML row event", style="dim"))
+    table.add_row("")
+
+    for schema_idx in range(1, active_schema_number + 1):
+        schema_line = Text()
+        marker = "●" if schema_idx == active_schema_number else "○"
+        schema_line.append(f"{marker} SCHEMA_{schema_idx}", style="bold" if schema_idx == active_schema_number else "")
+        if schema_idx == 1:
+            schema_line.append("  original", style="dim")
+        else:
+            mutation = SCHEMA_MUTATIONS[schema_idx - 2]
+            sign = "+" if mutation.op == "add" else "-"
+            schema_line.append(f"  {sign} {mutation.name}", style="dim")
+        table.add_row(schema_line)
+
+        count = int(rows_by_epoch.get(f"v{schema_idx}", 0))
+        if schema_idx < active_schema_number or count:
+            for line in _timeline_dot_lines(count):
+                table.add_row(line)
+        if schema_idx < active_schema_number:
+            table.add_row("")
+
+    if active_schema_number == 1 and not view["source_schema"]:
+        table.add_row(Text("(waiting for schema)", style="dim"))
+
+    return Panel(table, title="PRODUCER SCHEMA HISTORY", border_style="dim")
+
+
+def _timeline_dot_lines(count: int, *, width: int = 9) -> tuple[Text, ...]:
+    if count <= 0:
+        return (Text("   .", style="dim"),)
+    shown = min(count, width)
+    dots = " ".join("." for _ in range(shown))
+    text = Text(f"   {dots}", style="dim")
+    if count > shown:
+        text.append(f"  +{count - shown}", style="dim")
+    return (text,)
 
 
 def _tail_panel(view: dict[str, Any]) -> Panel:
     table = Table.grid()
     table.add_column()
+    table.add_row(Text("live DML tail", style="bold"))
+    table.add_row("")
     for item in view["dml_tail"]:
-        table.add_row(item)
+        table.add_row(_tail_event_text(item))
     if not view["dml_tail"]:
         table.add_row("[dim]waiting for DML...[/dim]")
     table.add_row("")
-    table.add_row("[bold]DDL[/bold]")
+    table.add_row(Text("DDL events", style="bold"))
     for item in view["ddl_tail"]:
         table.add_row(f"[dim]{item}[/dim]")
-    return Panel(table, title="[bold green]live CDC tail[/bold green]", border_style="green")
+    return Panel(table, title="LIVE CDC TAIL", border_style="dim")
 
 
-def _diff_panel(view: dict[str, Any]) -> Panel:
-    table = Table.grid(padding=(0, 1))
-    table.add_column(style="dim")
+def _tail_event_text(item: str) -> Text:
+    text = Text(item)
+    if item.startswith("v") and " snap=" in item:
+        text.stylize("white")
+    else:
+        text.stylize("dim yellow")
+    return text
+
+
+def _schema_diff_panel(view: dict[str, Any]) -> Panel:
+    table = Table.grid()
     table.add_column()
-    table.add_column()
-    table.add_column()
-    table.add_row("snapshot", "kind", "old", "new")
-    for row in view["diff_rows"]:
-        old = f"{row.old_name or '—'} {row.old_type or ''}".strip()
-        new = f"{row.new_name or '—'} {row.new_type or ''}".strip()
-        table.add_row(str(row.snapshot_id), row.change_kind, old, new)
-    if not view["diff_rows"]:
-        table.add_row("—", "waiting", "—", "—")
-    return Panel(table, title="[bold yellow]schema diff[/bold yellow]", border_style="yellow")
+    table.add_row(Text("schema.diff", style="bold"))
+    table.add_row(Text("current orders schema vs original", style="dim"))
+    table.add_row("")
+    for line in _schema_diff_lines(view):
+        table.add_row(line)
+
+    table.add_row("")
+    if view["boundary_snapshot"]:
+        boundary = Text()
+        boundary.append("boundary snapshot ", style="dim")
+        boundary.append(str(view["boundary_snapshot"]), style="bold")
+        table.add_row(boundary)
+    table.add_row(Text("sink migrates, then the next DML consumer resumes", style="dim"))
+    return Panel(table, title="CURRENT SCHEMA DIFF", border_style="dim")
+
+
+def _schema_diff_lines(view: dict[str, Any]) -> tuple[Text, ...]:
+    current = {col.name: col.type for col in view["source_schema"]}
+    out: list[Text] = []
+    for name in BASE_COLUMNS:
+        line = Text()
+        if name in current:
+            line.append("  ")
+            line.append(f"{name} {current[name]}")
+        else:
+            line.append("- ", style="bold red")
+            line.append(name, style="red")
+        out.append(line)
+
+    added_columns = [name for name in current if name not in BASE_COLUMNS]
+    for mutation in SCHEMA_MUTATIONS:
+        if mutation.op == "add" and mutation.name in added_columns:
+            line = Text()
+            line.append("+ ", style="bold green")
+            line.append(f"{mutation.name} {current[mutation.name]}", style="green")
+            out.append(line)
+        elif mutation.op == "drop" and mutation.name not in current and mutation.name not in BASE_COLUMNS:
+            line = Text()
+            line.append("- ", style="bold red")
+            line.append(f"{mutation.name} {mutation.sql_type}", style="red")
+            out.append(line)
+    return tuple(out)
 
 
 def _fmt_int(value: int) -> str:
@@ -609,6 +784,23 @@ def headless_summary(recorder: MetricsRecorder, state: DemoState) -> Callable[[]
         )
 
     return summary
+
+
+def json_summary(recorder: MetricsRecorder, state: DemoState) -> dict[str, Any]:
+    snap = recorder.snapshot()
+    view = state.snapshot()
+    return {
+        "example": EXAMPLE,
+        "errors": snap["errors"],
+        "rows_processed": snap["rows_processed"],
+        "phase": view["phase"],
+        "source_rows": view["source_rows"],
+        "sink_rows": view["sink_rows"],
+        "boundary_snapshot": view["boundary_snapshot"],
+        "diff_rows": len(view["diff_rows"]),
+        "migrations_applied": view["migrations_applied"],
+        "invariant": view["invariant"],
+    }
 
 
 def drain_consumers(client: CDCClient, names: Iterable[str]) -> None:
@@ -749,6 +941,7 @@ def main(argv: list[str] | None = None) -> int:
             reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)
 
     log(headless_summary(recorder, state)())
+    emit_json_summary(common, json_summary(recorder, state))
     return 0 if recorder.snapshot()["errors"] == 0 and state.snapshot()["invariant"] == "ok" else 1
 
 

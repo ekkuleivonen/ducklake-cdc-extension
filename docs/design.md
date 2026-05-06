@@ -107,9 +107,7 @@ orchestrators.
 
 ## Values Stay Native in SQL
 
-The typed table DML path exposes DuckLake values as DuckDB values. The
-consumer-level multi-table DML path uses a generic payload because heterogeneous
-table schemas cannot share one typed result set. Serialization choices such as
+The typed table DML path exposes DuckLake values as DuckDB values. Serialization choices such as
 GeoJSON, base64, Avro, or sink-specific envelopes belong in clients or sinks,
 not in the extension.
 

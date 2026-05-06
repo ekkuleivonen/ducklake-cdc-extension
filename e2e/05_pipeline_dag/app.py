@@ -34,7 +34,7 @@ from rich.panel import Panel  # noqa: E402
 from rich.table import Table  # noqa: E402
 from rich.text import Text  # noqa: E402
 
-from _lib.cli import effective_duration_s, make_parser, parse_common  # noqa: E402
+from _lib.cli import effective_duration_s, emit_json_summary, make_parser, parse_common  # noqa: E402
 from _lib.config import (  # noqa: E402
     load_cdc_extension,
     load_dir,
@@ -335,11 +335,11 @@ def build_layout(recorder: MetricsRecorder, stop: threading.Event) -> Layout:
     layout.split(
         Layout(_header(snap), name="header", size=3),
         Layout(name="body"),
-        Layout(_footer(stop), name="footer", size=3),
+        Layout(_footer(snap, stop), name="footer", size=3),
     )
-    layout["body"].split_row(
-        Layout(_producers_panel(snap), name="producers", ratio=2),
-        Layout(_stages_panel(snap), name="stages", ratio=3),
+    layout["body"].split(
+        Layout(_dag_panel(snap), name="dag", ratio=5),
+        Layout(_cursor_panel(snap), name="cursors", ratio=2),
     )
     return layout
 
@@ -347,64 +347,157 @@ def build_layout(recorder: MetricsRecorder, stop: threading.Event) -> Layout:
 def _header(snap: dict[str, Any]) -> Panel:
     text = Text.from_markup(
         f"[bold]ducklake-cdc[/bold] · {EXAMPLE} · "
-        f"[cyan]raw_purchases[/cyan]/[cyan]raw_refunds[/cyan] → "
-        f"[yellow]clean_purchases[/yellow]/[yellow]clean_refunds[/yellow] → "
-        f"[green]joined_orders[/green]   "
+        f"raw tables → clean tables → joined_orders   "
         f"[dim]elapsed[/dim] {_fmt_duration(snap['elapsed_s'])}   "
         f"[dim]errors[/dim] {snap['errors']}"
     )
     return Panel(text, border_style="dim")
 
 
-def _footer(_stop: threading.Event) -> Panel:
-    return Panel(
-        Text.from_markup("[dim]Ctrl-C to stop[/dim]"),
-        border_style="dim",
-    )
-
-
-def _producers_panel(snap: dict[str, Any]) -> Panel:
-    details = snap["details"]
-    table = Table.grid(padding=(0, 2))
-    table.add_column(justify="left")
-    table.add_column(justify="right", style="dim")
-    table.add_column(justify="right")
-    table.add_row("[cyan]raw_purchases[/cyan]", "rows", _fmt_int(details.get("producer_purchases_total", 0)))
-    table.add_row("", "last batch", _fmt_int(details.get("producer_purchases_last_batch", 0)))
-    table.add_row("", "interval", f"{PRODUCER_BATCH_INTERVAL_S * 1000:.0f} ms")
-    table.add_row("", "", "")
-    table.add_row("[cyan]raw_refunds[/cyan]", "rows", _fmt_int(details.get("producer_refunds_total", 0)))
-    table.add_row("", "last batch", _fmt_int(details.get("producer_refunds_last_batch", 0)))
-    table.add_row("", "interval", f"{PRODUCER_BATCH_INTERVAL_S * 1000:.0f} ms")
-    return Panel(table, title="[bold cyan]producers[/bold cyan]", border_style="cyan")
-
-
-def _stages_panel(snap: dict[str, Any]) -> Panel:
-    details = snap["details"]
+def _footer(snap: dict[str, Any], _stop: threading.Event) -> Panel:
     lat = snap["latency_ms"]
-    elapsed = max(snap["elapsed_s"], 1e-9)
+    text = Text()
+    text.append("apply latency ", style="dim")
+    text.append(f"p50 {_fmt_ms(lat.get('p50'))}  ")
+    text.append(f"p95 {_fmt_ms(lat.get('p95'))}  ")
+    text.append(f"p99 {_fmt_ms(lat.get('p99'))}")
+    text.append("   Ctrl-C to stop", style="dim")
+    return Panel(text, border_style="dim")
 
-    table = Table.grid(padding=(0, 2))
-    table.add_column(justify="left")
-    table.add_column(justify="right", style="dim")
-    table.add_column(justify="right")
-    for stage in STAGES:
-        rows = details.get(f"stage_{stage.name}_rows", 0)
-        batches = details.get(f"stage_{stage.name}_batches", 0)
-        snap_id = details.get(f"stage_{stage.name}_last_snapshot", "—")
-        rps = (rows / elapsed) if elapsed else 0
-        table.add_row(
-            f"[green]{stage.name}[/green]",
-            f"src={stage.source}",
-            f"{_fmt_int(rows)} rows · {_fmt_int(batches)} batches · {rps:,.0f}/s · snap {snap_id}",
-        )
-    table.add_row("", "", "")
-    table.add_row(
-        "[bold]apply latency[/bold]",
-        "p50 / p95 / p99",
-        f"{_fmt_ms(lat.get('p50'))} / {_fmt_ms(lat.get('p95'))} / {_fmt_ms(lat.get('p99'))}",
+
+def _dag_panel(snap: dict[str, Any]) -> Panel:
+    details = snap["details"]
+
+    raw_purchases = int(details.get("producer_purchases_total", 0))
+    raw_refunds = int(details.get("producer_refunds_total", 0))
+    clean_purchases = int(details.get("stage_normalize_purchases_rows", 0))
+    clean_refunds = int(details.get("stage_normalize_refunds_rows", 0))
+    joined_orders = int(details.get("stage_join_orders_rows", 0))
+
+    graph = Table.grid(expand=True, padding=(0, 1))
+    for i in range(9):
+        graph.add_column(ratio=4 if i % 2 == 0 else 1)
+    graph.add_row(
+        _node_panel("raw_purchases", raw_purchases, "source table"),
+        _arrow(),
+        _node_panel(
+            "normalize_purchases",
+            clean_purchases,
+            "stage",
+            snap=details.get("stage_normalize_purchases_last_snapshot"),
+        ),
+        _arrow(),
+        _node_panel("clean_purchases", clean_purchases, "clean table"),
+        _join_connector("down"),
+        "",
+        "",
+        "",
     )
-    return Panel(table, title="[bold green]stages[/bold green]", border_style="green")
+    graph.add_row(
+        "",
+        "",
+        "",
+        "",
+        "",
+        _join_connector("into"),
+        _node_panel(
+            "join_orders",
+            joined_orders,
+            "stage",
+            snap=details.get("stage_join_orders_last_snapshot"),
+        ),
+        _arrow(),
+        _node_panel("joined_orders", joined_orders, "output table"),
+    )
+    graph.add_row(
+        _node_panel("raw_refunds", raw_refunds, "source table"),
+        _arrow(),
+        _node_panel(
+            "normalize_refunds",
+            clean_refunds,
+            "stage",
+            snap=details.get("stage_normalize_refunds_last_snapshot"),
+        ),
+        _arrow(),
+        _node_panel("clean_refunds", clean_refunds, "clean table"),
+        _join_connector("up"),
+        "",
+        "",
+        "",
+    )
+
+    return Panel(graph, title="PIPELINE DAG", border_style="dim")
+
+
+def _cursor_panel(snap: dict[str, Any]) -> Panel:
+    details = snap["details"]
+    elapsed = max(snap["elapsed_s"], 1e-9)
+    table = Table.grid(padding=(0, 2))
+    table.add_column()
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_column(justify="right")
+    table.add_row(
+        Text("stage", style="dim"),
+        Text("rows", style="dim"),
+        Text("batches", style="dim"),
+        Text("rate", style="dim"),
+        Text("snap", style="dim"),
+    )
+    for stage in STAGES:
+        table.add_row(*_stage_cells(details, stage.name, elapsed))
+    return Panel(table, title="STAGE CURSORS", border_style="dim")
+
+
+def _node_panel(name: str, rows: int, label: str, *, snap: Any = None) -> Panel:
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column()
+    grid.add_row(Text(label, style="dim"))
+    grid.add_row(Text(name, style="bold"))
+
+    count = Text()
+    count.append(_fmt_int(rows), style="bold")
+    count.append(" rows", style="dim")
+    grid.add_row(count)
+    grid.add_row(_sparkline(rows))
+    if snap is not None:
+        grid.add_row(Text(f"snap {snap}", style="dim"))
+    return Panel(grid, border_style="dim", padding=(0, 1))
+
+
+def _arrow() -> Text:
+    return Text("\n\n──▶", style="dim")
+
+
+def _join_connector(direction: str) -> Text:
+    if direction == "down":
+        return Text("\n\n──┐\n  │", style="dim")
+    if direction == "up":
+        return Text("  │\n\n──┘", style="dim")
+    return Text("\n\n──▶", style="dim")
+
+
+def _sparkline(total: int, width: int = 10) -> Text:
+    text = Text()
+    filled = min(width, total // 1_000)
+    text.append("■" * filled, style="bold")
+    text.append("□" * (width - filled), style="dim")
+    return text
+
+
+def _stage_cells(details: dict[str, Any], name: str, elapsed: float) -> tuple[Text, str, str, str, str]:
+    rows = int(details.get(f"stage_{name}_rows", 0))
+    batches = int(details.get(f"stage_{name}_batches", 0))
+    snap_id = details.get(f"stage_{name}_last_snapshot", "—")
+    rps = rows / elapsed
+    return (
+        Text(name, style="bold"),
+        _fmt_int(rows),
+        _fmt_int(batches),
+        f"{rps:,.0f}/s",
+        str(snap_id),
+    )
 
 
 def _fmt_int(n: int) -> str:
@@ -441,6 +534,25 @@ def headless_summary(recorder: MetricsRecorder) -> Callable[[], str]:
             f"throughput={rps:,.0f} rows/s p99={p99_str} errors={snap['errors']}"
         )
     return summary
+
+
+def json_summary(recorder: MetricsRecorder) -> dict[str, Any]:
+    snap = recorder.snapshot()
+    details = snap["details"]
+    elapsed = max(snap["elapsed_s"], 1e-9)
+    return {
+        "example": EXAMPLE,
+        "errors": snap["errors"],
+        "elapsed_s": snap["elapsed_s"],
+        "rows_processed": snap["rows_processed"],
+        "throughput_rows_per_s": snap["rows_processed"] / elapsed,
+        "raw_purchases": int(details.get("producer_purchases_total", 0)),
+        "raw_refunds": int(details.get("producer_refunds_total", 0)),
+        "clean_purchases": int(details.get("stage_normalize_purchases_rows", 0)),
+        "clean_refunds": int(details.get("stage_normalize_refunds_rows", 0)),
+        "joined_orders": int(details.get("stage_join_orders_rows", 0)),
+        "latency_ms": snap["latency_ms"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
 
         snap = recorder.snapshot()
         log(summary_fn())
+        emit_json_summary(common, json_summary(recorder))
 
         try:
             reset_lake(example=EXAMPLE, catalog=common.catalog, storage=common.storage)

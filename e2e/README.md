@@ -13,9 +13,9 @@ and lightweight wakeups for systems that re-read from DuckLake.
 
 | # | folder | story | status |
 |---|--------|-------|--------|
-| 01 | `01_schema_safe_consumer/` | Stop DML at schema boundaries, process DDL, migrate, then resume safely. | Spec only |
+| 01 | `01_schema_safe_consumer/` | Stop DML at schema boundaries, process DDL, migrate, then resume safely. | Runnable |
 | 02 | `02_incremental_materialized_view/` | Maintain derived DuckLake tables incrementally instead of rescanning. | Runnable |
-| 03 | `03_backfill_live_catchup/` | Start at snapshot 0, process history, then switch into live listen mode. | Spec only |
+| 03 | `03_backfill_live_catchup/` | Restart a live consumer twice while producers keep writing, then catch up. | Runnable |
 | 04 | `04_cache_refresh/` | Use metadata-only ticks to refresh caches, search indexes, or vector indexes. | Runnable |
 | 05 | `05_pipeline_dag/` | Run a multi-stage lakehouse DAG with durable CDC cursors. | Runnable |
 
@@ -35,6 +35,9 @@ uv run --project e2e python e2e/01_schema_safe_consumer/app.py --headless
 
 # Runnable today: incremental materialized view
 uv run --project e2e python e2e/02_incremental_materialized_view/app.py --headless
+
+# Runnable today: restart + catch-up (producer keeps writing during restarts)
+uv run --project e2e python e2e/03_backfill_live_catchup/app.py --headless
 ```
 
 Most examples support the shared flags:
@@ -46,6 +49,23 @@ Most examples support the shared flags:
 | `--catalog {duckdb,sqlite,postgres}` | Catalog backend. Multi-writer demos should use Postgres. |
 | `--storage {disk,s3}` | Local disk or the Garage S3 service. |
 
+## CI Gates
+
+CI runs these demos through `ci_demo_assertions.py`. Each app emits a final
+`--json-summary`; the runner checks correctness first (`errors=0`, final
+invariants, drained row counts) and then conservative performance floors for
+the tick and DAG demos.
+
+```bash
+docker compose -f e2e/docker-compose.yml up -d --wait
+uv run --project e2e --locked python e2e/ci_demo_assertions.py
+docker compose -f e2e/docker-compose.yml down -v
+```
+
+The thresholds are intentionally modest. They catch broken consumers, runaway
+latency, and obvious throughput regressions without pretending CI hardware is a
+benchmark lab.
+
 ## Catalog Reality
 
 DuckLake's catalog backend matters more than these demos should hide.
@@ -54,7 +74,7 @@ DuckLake's catalog backend matters more than these demos should hide.
 |---------|--------|--------|----------|-------|
 | 01 schema-safe consumer | yes | no | yes | Demonstrates sink-write + `cdc_commit` transaction; SQLite lock behavior distracts from the schema story. |
 | 02 incremental materialized view | yes | no | yes | Demonstrates aggregate update + `cdc_commit` transaction; SQLite lock behavior distracts from the incremental-maintenance story. |
-| 03 backfill/live catchup | yes | yes | yes | Backfill is bounded reads; listen mode follows catalog limits. |
+| 03 backfill/live catchup | yes | no | yes | Restart gap + READ catch-up + LISTEN; SQLite excluded like 01/02 for transactional sink pattern. |
 | 04 cache refresh | yes | yes | yes | Postgres gets `LISTEN`/`NOTIFY`; others poll. |
 | 05 pipeline DAG | no | no | yes | Five concurrent writers; embedded/file catalogs contend too hard. |
 
@@ -75,9 +95,8 @@ Each example should prove a real operating property:
 ## Supporting Directories
 
 - `_lib/`: shared config, load generation, metrics, stage runner, and TUI glue.
-- `benchmark/`: legacy synthetic harness kept only while useful for comparison.
-- `catalog_matrix/`, `smoke/`, `upstream/`: narrow compatibility/probe suites
-  that test extension invariants rather than end-user stories.
+- `smoke/`: narrow extension probes that need Python/C++ harnesses.
+- `upstream/`: DuckDB/DuckLake contract probes that do not load this extension.
 
 ## S3 Storage
 

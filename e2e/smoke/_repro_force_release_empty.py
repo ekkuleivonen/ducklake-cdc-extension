@@ -19,9 +19,9 @@ sensitive.
 
 Run after ``make release``::
 
-    uv run --project e2e/benchmark python e2e/smoke/_repro_force_release_empty.py
-    uv run --project e2e/benchmark python e2e/smoke/_repro_force_release_empty.py --runs 100
-    uv run --project e2e/benchmark python e2e/smoke/_repro_force_release_empty.py --probe list_empty
+    uv run --project e2e python e2e/smoke/_repro_force_release_empty.py
+    uv run --project e2e python e2e/smoke/_repro_force_release_empty.py --runs 100
+    uv run --project e2e python e2e/smoke/_repro_force_release_empty.py --probe list_empty
 """
 
 from __future__ import annotations
