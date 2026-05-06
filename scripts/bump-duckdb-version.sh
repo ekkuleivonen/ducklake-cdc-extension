@@ -93,8 +93,12 @@ update(
     [(r'"duckdb==[0-9]+\.[0-9]+\.[0-9]+"', f'"duckdb=={version}"')],
 )
 
+# All Python lives in e2e/ (single uv project); the legacy clients/python/
+# tree was dropped in favour of the published ducklake-client and
+# ducklake-cdc-client packages on PyPI. Keep this list in sync with any
+# future Python project under e2e/ that pins a specific duckdb version.
 update(
-    "clients/python/pyproject.toml",
+    "e2e/pyproject.toml",
     [(r'"duckdb==[0-9]+\.[0-9]+\.[0-9]+"', f'"duckdb=={version}"')],
 )
 
@@ -141,7 +145,7 @@ PY
 if [[ "$update_lockfiles" == true ]]; then
   if command -v uv >/dev/null 2>&1; then
     uv lock
-    uv --directory clients/python lock
+    uv --directory e2e lock
   else
     echo "warning: uv not found; skipped lockfile updates" >&2
   fi
@@ -164,4 +168,4 @@ if [[ "$update_submodules" == true ]]; then
 fi
 
 echo "Updated DuckDB tuple to $duckdb_tag."
-echo "Review with: git diff -- .github/duckdb-version pyproject.toml uv.lock clients/python/pyproject.toml clients/python/uv.lock .github/workflows .gitmodules docs/development.md duckdb extension-ci-tools"
+echo "Review with: git diff -- .github/duckdb-version pyproject.toml uv.lock e2e/pyproject.toml e2e/uv.lock .github/workflows .gitmodules docs/development.md duckdb extension-ci-tools"

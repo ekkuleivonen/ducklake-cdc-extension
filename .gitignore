@@ -29,6 +29,10 @@ dist/
 *.ducklake.wal
 e2e/benchmark/.work/
 e2e/benchmark/results/*.json
+# Per-example scratch dir from the e2e use-case examples (catalog files
+# for embedded backends, parquet for disk storage). Each example also
+# wipes this on clean exit; the gitignore is for crash/SIGKILL recovery.
+e2e/.work/
 *.sqlite
 *.sqlite3
 *.sqlite-wal
