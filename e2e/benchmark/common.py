@@ -317,10 +317,23 @@ def is_database_locked(exc: BaseException) -> bool:
 
 
 def is_thread_join_deadlock(exc: BaseException) -> bool:
+    """True for the family of pthread_join failures that surface H-022.
+
+    H-022 (see ``docs/hazard-log.md``) is a transient mutex re-entry on
+    the first cdc_* call against a fresh catalog in the same process.
+    macOS lets the same-thread re-entry slide past the std::mutex check
+    but still fails when DuckDB later joins the parallel pipeline that
+    raced through it: ``pthread_join`` then returns either ``EDEADLK``
+    (printed as ``thread::join failed: Resource deadlock avoided``) or
+    ``EINVAL`` (``thread::join failed: Invalid argument``) depending on
+    which thread state the join hit. Both errno values surface the same
+    underlying race, so both are retryable here.
+    """
+
     current: BaseException | None = exc
     while current is not None:
         message = str(current).lower()
-        if "thread::join failed" in message and "resource deadlock avoided" in message:
+        if "thread::join failed" in message:
             return True
         current = current.__cause__
     return False

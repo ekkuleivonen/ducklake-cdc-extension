@@ -28,16 +28,23 @@ wheels = [
 
 [[package]]
 name = "ducklake-cdc-client"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.2"
+source = { editable = "../../../ducklake-cdc-python-client" }
 dependencies = [
     { name = "ducklake-client" },
     { name = "pytz" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/76/530b74afa1e0de0c0f88646bcc636f6f209d9519c4e96e3a98a217fd4b66/ducklake_cdc_client-0.1.0.tar.gz", hash = "sha256:35623c7e4affd79459edad92857478feb909f5bd35c6ee9736ca340852c4a52c", size = 32022, upload-time = "2026-05-05T12:39:08.712Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/f8/a35bbd336c8aa5ddb77a876d2ec578ee84d6a54a3f56e2d6daba0085ae03/ducklake_cdc_client-0.1.0-py3-none-any.whl", hash = "sha256:9bb2514199c3bbbc61adb03712e0b5d1e616503e67cd9e744bb7e9c922868fc9", size = 27914, upload-time = "2026-05-05T12:39:07.544Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "ducklake-client", specifier = ">=0.1.2" },
+    { name = "pandas", marker = "extra == 'pandas'" },
+    { name = "polars", marker = "extra == 'polars'" },
+    { name = "pyarrow", marker = "extra == 'arrow'" },
+    { name = "pyarrow", marker = "extra == 'polars'" },
+    { name = "pytz", specifier = ">=2026.2" },
 ]
+provides-extras = ["arrow", "pandas", "polars"]
 
 [[package]]
 name = "ducklake-cdc-e2e-benchmark"
@@ -60,8 +67,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = "==1.5.2" },
-    { name = "ducklake-cdc-client", specifier = ">=0.1.0" },
-    { name = "ducklake-client", specifier = ">=0.1.2" },
+    { name = "ducklake-cdc-client", editable = "../../../ducklake-cdc-python-client" },
+    { name = "ducklake-client", editable = "../../../ducklake-python-client" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.3" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
@@ -75,14 +82,13 @@ dev = [
 [[package]]
 name = "ducklake-client"
 version = "0.1.2"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "../../../ducklake-python-client" }
 dependencies = [
     { name = "duckdb" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3d/d5/836500e3a8d1e8df51deca669881d8771550f18de7066e2723ef1f08608d/ducklake_client-0.1.2.tar.gz", hash = "sha256:bfa99d8078290ad1565ea280784603cae6ce748d387c57dc66690ff11250c3d2", size = 14625, upload-time = "2026-05-05T14:45:22.251Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/39/c13b4aac1fbd316b92063330de8b8b560261c2c58ed11434398f5591325c/ducklake_client-0.1.2-py3-none-any.whl", hash = "sha256:8cad6780ddd2f1a9ca86d0d8e0dc6e16f9ce3141c0049ef72eb342e37202ff09", size = 25792, upload-time = "2026-05-05T14:45:21.027Z" },
-]
+
+[package.metadata]
+requires-dist = [{ name = "duckdb" }]
 
 [[package]]
 name = "iniconfig"

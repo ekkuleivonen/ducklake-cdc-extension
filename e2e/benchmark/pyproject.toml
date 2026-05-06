@@ -17,6 +17,13 @@ dev = [
     "ruff",
 ]
 
+# Local sibling checkouts win over PyPI for this workspace. Lets a
+# benchmark run against in-flight changes to the python clients without
+# publishing first. Comment out (and ``uv lock``) to re-pin to PyPI.
+[tool.uv.sources]
+ducklake-cdc-client = { path = "../../../ducklake-cdc-python-client", editable = true }
+ducklake-client = { path = "../../../ducklake-python-client", editable = true }
+
 [tool.ruff]
 line-length = 160
 target-version = "py314"

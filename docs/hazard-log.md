@@ -326,6 +326,20 @@ go; this file says what can hurt users or maintainers on the way there.
     SQLite-backed metadata. Linux, macOS, and Wasm don't error-check
     `std::mutex` re-entry on the same thread, so the same code path
     slides past silently on those platforms.
+  - macOS (libc++/libpthread) has now also been observed surfacing the
+    race during DuckDB's parallel-pipeline teardown: when an exception
+    from inside the bootstrapping query fires while a worker thread is
+    in flight, `std::thread::join` returns either `EDEADLK` (printed
+    `_duckdb.Error: thread::join failed: Resource deadlock avoided`) or
+    `EINVAL` (`thread::join failed: Invalid argument`) depending on
+    which join-state the racing thread reached. Both errno values are
+    surfaces of the same first-bootstrap mutex re-entry — they do not
+    indicate a different bug. Reproduces on inline-DuckDB catalogs by
+    making `cdc_consumer_force_release(<fresh catalog>, <missing
+    consumer>)` the very first cdc_* call against the lake; ~1-in-5
+    attempts on darwin 25.3 / Python 3.14. See
+    `e2e/smoke/_repro_force_release_empty.py` if we want a regression
+    harness later.
   The most plausible shared mutex is inside the auto-loaded DuckLake
   extension's catalog (it owns the attached metadata database and
   sees both the outer read and the inner bootstrap write against it);
@@ -372,6 +386,18 @@ go; this file says what can hurt users or maintainers on the way there.
   DuckDB process for the preceding metadata peek, or open the catalog on an
   already-bootstraped path (`start_at := 'now'` alone did **not** clear the
   failure in MSVC release-matrix logs).
+- Python-client mitigation: `ducklake_cdc_client.retry.retry_on_transient`
+  is the high-level consumers' default retry policy. It treats both
+  `database is locked` (SQLite catalog under contention) and any
+  `thread::join failed: <errno>` (the macOS surfaces of this hazard) as
+  retryable, with a short fixed backoff and a small attempt cap. The second
+  attempt always finds the catalog already bootstrapped, so the racy first-
+  time mutex re-entry doesn't recur. Callers who explicitly want the raw
+  exception can opt out with `retry=ducklake_cdc_client.no_retry`.
+  ``e2e/benchmark/common.py::is_thread_join_deadlock`` matches the same
+  family for the benchmark's own ``retry_on_lock`` (which loops without an
+  attempt cap because the bench wants to wait through arbitrarily long
+  contention).
 - Next action: If we see this hit by a real user outside the
   regression-test pattern, capture an MSVC debug-build stack trace at
   the `std::system_error(resource_deadlock_would_occur)` throw site to
