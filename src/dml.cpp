@@ -514,15 +514,16 @@ std::condition_variable DML_SEGMENT_CACHE_CV;
 std::unordered_map<std::string, std::shared_ptr<DmlSegmentCacheEntry>> DML_SEGMENT_CACHE;
 uint64_t DML_SEGMENT_CACHE_CLOCK = 0;
 
-std::string TableChangesSchemaCacheKey(const std::string &catalog_name, int64_t table_id, int64_t schema_version) {
-	return catalog_name + ":" + std::to_string(table_id) + ":" + std::to_string(schema_version);
+std::string TableChangesSchemaCacheKey(const std::string &attachment_key, const std::string &catalog_name,
+                                       int64_t table_id, int64_t schema_version) {
+	return attachment_key + ":" + catalog_name + ":" + std::to_string(table_id) + ":" + std::to_string(schema_version);
 }
 
-std::string DmlSegmentCacheKey(const CdcChangesData &data, const std::string &scan_table_name, int64_t start_snapshot,
-                               int64_t end_snapshot) {
+std::string DmlSegmentCacheKey(const std::string &attachment_key, const CdcChangesData &data,
+                               const std::string &scan_table_name, int64_t start_snapshot, int64_t end_snapshot) {
 	std::ostringstream key;
-	key << data.catalog_name << ":" << data.table_id << ":" << scan_table_name << ":" << start_snapshot << ":"
-	    << end_snapshot << ":" << data.probe_schema_version;
+	key << attachment_key << ":" << data.catalog_name << ":" << data.table_id << ":" << scan_table_name << ":"
+	    << start_snapshot << ":" << end_snapshot << ":" << data.probe_schema_version;
 	for (const auto &change_type : data.change_types) {
 		key << ":" << change_type;
 	}
@@ -800,7 +801,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CdcChangesBindBase(duckdb::ClientContex
 	}
 	result->probe_schema_version = ResolveSchemaVersion(conn, result->catalog_name, probe_snapshot);
 	const auto schema_cache_key =
-	    TableChangesSchemaCacheKey(result->catalog_name, result->table_id, result->probe_schema_version);
+	    TableChangesSchemaCacheKey(MetadataAttachmentCacheKey(conn, result->catalog_name), result->catalog_name,
+	                               result->table_id, result->probe_schema_version);
 	{
 		std::lock_guard<std::mutex> guard(TABLE_CHANGES_SCHEMA_CACHE_MUTEX);
 		const auto entry = TABLE_CHANGES_SCHEMA_CACHE.find(schema_cache_key);
@@ -934,7 +936,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 
 	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
 	const auto changes_table = MetadataTable(data.catalog_name, "ducklake_snapshot_changes");
-	const auto cache_key = DmlSegmentCacheKey(data, scan_table_name, start_snapshot, end_snapshot);
+	const auto cache_key = DmlSegmentCacheKey(MetadataAttachmentCacheKey(conn, data.catalog_name), data,
+	                                          scan_table_name, start_snapshot, end_snapshot);
 	bool build_segment = false;
 	auto cache_entry = ReserveDmlSegment(cache_key, build_segment);
 	if (!build_segment) {
