@@ -1,11 +1,11 @@
 {
   "backend": "sqlite",
   "backend_extension_version": null,
-  "captured_at": "2026-04-28T11:29:46Z",
+  "captured_at": "2026-07-11T15:15:03Z",
   "data_inlining_row_limit": 10,
-  "duckdb_version": "1.5.2",
-  "ducklake_extension_version": "415a9ebd",
-  "git_sha": "43de1523f919",
+  "duckdb_version": "1.5.4",
+  "ducklake_extension_version": "d318a545",
+  "git_sha": "831839597326",
   "operations": [
     {
       "changes_made": "created_schema:\"main\"",

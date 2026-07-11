@@ -292,6 +292,10 @@ void AddDoctorRow(RowScanState &state, const std::string &severity, const std::s
 }
 
 bool MetadataSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
+	auto direct = conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_metadata") + " LIMIT 0");
+	if (direct && !direct->HasError()) {
+		return true;
+	}
 	auto result = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " +
 	                         QuoteLiteral("__ducklake_metadata_" + catalog_name));
 	return result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&

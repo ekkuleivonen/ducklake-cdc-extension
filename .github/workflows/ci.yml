@@ -50,10 +50,10 @@ jobs:
   code-quality-check:
     name: Code Quality Check
     needs: resolve-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.2
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
     with:
       duckdb_version: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: v1.5.2
+      ci_tools_version: v1.5.4
       extension_name: ducklake_cdc
       format_checks: 'format;tidy'
 

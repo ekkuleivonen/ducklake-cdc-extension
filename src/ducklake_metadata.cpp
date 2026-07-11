@@ -198,13 +198,21 @@ std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::stri
 	const auto metadata_database = "__ducklake_metadata_" + catalog_name;
 	auto result = conn.Query("SELECT database_oid, type, path FROM duckdb_databases() WHERE database_name = " +
 	                         QuoteLiteral(metadata_database) + " LIMIT 1");
+	// DuckDB v1.5.4 hides DuckLake's internal metadata attachment from
+	// duckdb_databases(). The logical DuckLake catalog remains visible and its
+	// oid/path still distinguish detach/reattach cycles and same-named catalogs
+	// used by the SQLLogicTest process.
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		result = conn.Query("SELECT database_oid, type, path FROM duckdb_databases() WHERE database_name = " +
+		                    QuoteLiteral(catalog_name) + " LIMIT 1");
+	}
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "";
 	}
 	const auto oid = result->GetValue(0, 0).ToString();
 	const auto type = result->GetValue(1, 0).IsNull() ? "" : result->GetValue(1, 0).ToString();
 	const auto path = result->GetValue(2, 0).IsNull() ? "" : result->GetValue(2, 0).ToString();
-	return metadata_database + "|" + oid + "|" + type + "|" + path;
+	return catalog_name + "|" + oid + "|" + type + "|" + path;
 }
 
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema) {
@@ -250,6 +258,17 @@ void StateSchemaCacheRemember(const std::string &cache_key) {
 }
 
 bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name) {
+	// Probe the state table directly before consulting DuckDB's catalog
+	// enumeration views. DuckDB v1.5.4 no longer consistently exposes schemas
+	// belonging to DuckLake's hidden metadata attachment through
+	// duckdb_schemas()/duckdb_tables() on a fresh internal connection, even
+	// though fully-qualified access to the table works. The direct zero-row
+	// query is both cheaper and authoritative for the fact we need here.
+	auto direct = conn.Query("SELECT 1 FROM " + StateTable(catalog_name, CONSUMERS_TABLE, true) + " LIMIT 0");
+	if (direct && !direct->HasError()) {
+		return true;
+	}
+
 	const auto md_db = QuoteLiteral("__ducklake_metadata_" + catalog_name);
 	auto schemas = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " + md_db +
 	                          " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
