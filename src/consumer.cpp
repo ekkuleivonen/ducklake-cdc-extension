@@ -69,6 +69,13 @@ bool CdcWindowData::Equals(const duckdb::FunctionData &other) const {
 
 namespace {
 
+bool IsH022TransientMessage(const std::string &message) {
+	const auto lower = duckdb::StringUtil::Lower(message);
+	return lower.find("resource deadlock avoided") != std::string::npos ||
+	       lower.find("resource deadlock would occur") != std::string::npos ||
+	       lower.find("thread::join failed") != std::string::npos;
+}
+
 //===--------------------------------------------------------------------===//
 // Forward declarations for the schema-shape pin enforcement helpers.
 // Definitions live further down in this translation unit; lifecycle paths
@@ -1039,7 +1046,7 @@ std::vector<ResolvedSubscriptionInput> ResolveCreateSubscriptions(duckdb::Connec
 	return ResolveDdlCreateSubscriptions(conn, catalog_name, data, snapshot_id);
 }
 
-std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const ConsumerCreateData &data) {
+std::vector<duckdb::Value> CreateConsumerOnce(duckdb::ClientContext &context, const ConsumerCreateData &data) {
 	// Open ONE connection up front so the version probe, the bootstrap
 	// CREATE writes, the start_at snapshot lookup, and the INSERTs all
 	// share a single SQLite file handle when the metadata catalog is
@@ -1148,6 +1155,20 @@ std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const 
 		}
 		throw;
 	}
+}
+
+std::vector<duckdb::Value> CreateConsumer(duckdb::ClientContext &context, const ConsumerCreateData &data) {
+	for (int attempt = 0; attempt < 5; ++attempt) {
+		try {
+			return CreateConsumerOnce(context, data);
+		} catch (const std::exception &ex) {
+			if (!IsH022TransientMessage(ex.what()) || attempt == 4) {
+				throw;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
+	}
+	throw duckdb::InternalException("cdc consumer create retry loop exited unexpectedly");
 }
 
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerCreateInit(duckdb::ClientContext &context,

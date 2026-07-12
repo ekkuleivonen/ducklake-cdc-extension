@@ -35,14 +35,36 @@
 #include "duckdb/main/materialized_query_result.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb_cdc {
 
 namespace {
+
+duckdb::unique_ptr<duckdb::MaterializedQueryResult> QueryWithH022Retry(duckdb::Connection &conn,
+                                                                       const std::string &sql) {
+	duckdb::unique_ptr<duckdb::MaterializedQueryResult> result;
+	for (int attempt = 0; attempt < 5; ++attempt) {
+		result = conn.Query(sql);
+		if (result && !result->HasError()) {
+			return result;
+		}
+		const auto message = duckdb::StringUtil::Lower(result ? result->GetError() : std::string());
+		const bool h022 = message.find("resource deadlock avoided") != std::string::npos ||
+		                  message.find("resource deadlock would occur") != std::string::npos ||
+		                  message.find("thread::join failed") != std::string::npos;
+		if (!h022 || attempt == 4) {
+			return result;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	}
+	return result;
+}
 
 //===--------------------------------------------------------------------===//
 // Token decoding for DDL extraction
@@ -1683,17 +1705,14 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcSchemaDiffInit(duckdb::C
 	// decides whether to skip itself (Phase 2 follow-up #1). Without
 	// dedup, a transaction that renames + alters the same table would
 	// emit two table_rename / per-column-diff blocks for one snapshot.
-	auto changes =
-	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, e.key AS map_key, e.value AS map_values "
-	                           "FROM ") +
-	               QuoteIdentifier(data.catalog_name) +
-	               ".snapshots() s, "
-	               "UNNEST(map_entries(s.changes)) AS u(e) "
-	               "WHERE s.snapshot_id BETWEEN " +
-	               std::to_string(data.from_snapshot) + " AND " + std::to_string(data.to_snapshot) +
-	               " AND e.key IN ('tables_created', 'tables_altered') "
-	               "ORDER BY s.snapshot_id ASC, "
-	               "CASE e.key WHEN 'tables_created' THEN 0 ELSE 1 END");
+	const auto changes_sql =
+	    std::string("SELECT s.snapshot_id, s.snapshot_time, e.key AS map_key, e.value AS map_values FROM ") +
+	    QuoteIdentifier(data.catalog_name) +
+	    ".snapshots() s, UNNEST(map_entries(s.changes)) AS u(e) WHERE s.snapshot_id BETWEEN " +
+	    std::to_string(data.from_snapshot) + " AND " + std::to_string(data.to_snapshot) +
+	    " AND e.key IN ('tables_created', 'tables_altered') ORDER BY s.snapshot_id ASC, "
+	    "CASE e.key WHEN 'tables_created' THEN 0 ELSE 1 END";
+	auto changes = QueryWithH022Retry(conn, changes_sql);
 	if (!changes || changes->HasError()) {
 		throw duckdb::Exception(duckdb::ExceptionType::INVALID,
 		                        changes ? changes->GetError() : "cdc_schema_diff MAP scan failed");

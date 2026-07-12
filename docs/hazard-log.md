@@ -463,6 +463,10 @@ go; this file says what can hurt users or maintainers on the way there.
   This removes the avoidable repeated-DDL lock handoff; callers must still use
   a dedicated derived connection for CDC. After this mitigation both shapes
   passed 100/100 populated-catalog attempts in the standalone stress test.
+- Handling (catchable surfaces): consumer creation and the schema-diff MAP
+  scan retry the three known H-022 spellings up to five times with a short
+  bounded backoff. This keeps transient lock/thread teardown errors from
+  escaping normal SQL callers; it cannot recover an uncaught runtime abort.
 - Remaining upstream boundary: first bootstrap from multiple processes, and
   the fundamental outer `ClientContext` to inner `Connection` catalog-lock
   ordering, cannot be made atomic solely by this extension. Escalate the
