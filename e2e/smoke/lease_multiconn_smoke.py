@@ -8,8 +8,11 @@ process, and asserts:
 
 1. connection A acquires the lease via `cdc_window`
 2. connection B gets `CDC_BUSY` for the same consumer
-3. connection B force-releases the lease
-4. connection A's later `cdc_commit` gets `CDC_BUSY`
+3. connection A owner-conditionally releases its own lease
+4. connection B acquires the lease
+5. connection A cannot release connection B's lease
+6. connection B force-releases the lease as an operator action
+7. connection A's later `cdc_commit` gets `CDC_BUSY`
 
 Usage:
 
@@ -130,6 +133,10 @@ int main(int argc, char **argv) {
 	}
 
 	RequireError(b, "SELECT * FROM cdc_window('lake', 'multi_conn')", "CDC_BUSY");
+	RequireOk(a, "SELECT * FROM cdc_consumer_release('lake', 'multi_conn')");
+	RequireOk(b, "SELECT * FROM cdc_window('lake', 'multi_conn')");
+	RequireError(a, "SELECT * FROM cdc_consumer_release('lake', 'multi_conn')", "CDC_BUSY");
+	RequireOk(b, "SELECT * FROM cdc_consumer_heartbeat('lake', 'multi_conn')");
 	RequireOk(b, "SELECT * FROM cdc_consumer_force_release('lake', 'multi_conn')");
 	RequireError(a, "SELECT * FROM cdc_commit('lake', 'multi_conn', " + std::to_string(end_snapshot) + ")", "CDC_BUSY");
 

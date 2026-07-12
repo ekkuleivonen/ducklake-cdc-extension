@@ -64,6 +64,20 @@ FROM cdc_consumer_heartbeat('lake', 'items_sink');
 true
 
 query I
+SELECT released_token IS NOT NULL
+FROM cdc_consumer_release('lake', 'items_sink');
+----
+true
+
+statement error
+SELECT * FROM cdc_consumer_heartbeat('lake', 'items_sink');
+----
+CDC_BUSY
+
+statement ok
+SELECT * FROM cdc_window('lake', 'items_sink');
+
+query I
 SELECT previous_token IS NOT NULL
 FROM cdc_consumer_force_release('lake', 'items_sink');
 ----
