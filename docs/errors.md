@@ -28,7 +28,8 @@ your DuckLake retention window.
 Another connection owns the consumer lease, or the caller lost its lease before
 commit.
 
-Use `cdc_consumer_stats` to inspect the holder. Use
+Use `cdc_consumer_stats` to inspect the holder. Use `cdc_consumer_release` for
+normal holder shutdown. Use
 `cdc_consumer_force_release` only when you know the holder is dead.
 
 ### `CDC_MAX_SNAPSHOTS_EXCEEDED`

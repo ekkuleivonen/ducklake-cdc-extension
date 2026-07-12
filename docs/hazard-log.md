@@ -448,9 +448,26 @@ go; this file says what can hurt users or maintainers on the way there.
   `DMLConsumer` lease connection both follow this pattern). Both
   workarounds are example-side; closing the hazard at source still
   needs the upstream lock-ordering fix the original notes describe.
-- Next action: If we see this hit by a real user outside the
-  regression-test pattern, capture an MSVC debug-build stack trace at
-  the `std::system_error(resource_deadlock_would_occur)` throw site to
-  identify the specific shared mutex, then either serialize the
-  outer-to-inner transition in our code or file an upstream issue on
-  the offending lock's ordering contract.
+- Atlas production-shaped reproduction (July 2026): Atlas surfaced bare
+  `_duckdb.Error: Resource deadlock avoided` from
+  `cdc_dml_consumer_create` while opening its crawl planner against a populated
+  Postgres DuckLake catalog. The standalone
+  `e2e/smoke/h022_atlas_setup_smoke.py` reproducer creates catalog history and
+  performs concurrent planner setup. Before the local mitigation, Atlas's
+  shared catalogue-connection shape failed 1/100 attempts while the client's
+  dedicated derived-connection shape passed 100/100.
+- Handling (populated catalogs): bootstrap now probes the state table and
+  returns immediately when it exists, rather than rerunning three `CREATE TABLE
+  IF NOT EXISTS` statements plus Postgres trigger DDL on every `cdc_*` setup.
+  Genuine first bootstrap is serialized and rechecked within one process.
+  This removes the avoidable repeated-DDL lock handoff; callers must still use
+  a dedicated derived connection for CDC. After this mitigation both shapes
+  passed 100/100 populated-catalog attempts in the standalone stress test.
+- Remaining upstream boundary: first bootstrap from multiple processes, and
+  the fundamental outer `ClientContext` to inner `Connection` catalog-lock
+  ordering, cannot be made atomic solely by this extension. Escalate the
+  standalone reproducer and a debug stack at the `std::system_error` throw site
+  to DuckDB/DuckLake. The reproducer's `--first-bootstrap-race` mode isolates
+  this boundary: the shared-connection shape surfaced `thread::join failed:
+  Invalid argument` in 1/16 attempts while the derived-connection control
+  passed 16/16.

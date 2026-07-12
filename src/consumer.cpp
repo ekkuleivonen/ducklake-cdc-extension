@@ -338,6 +338,12 @@ void CacheToken(duckdb::ClientContext &context, const std::string &catalog_name,
 	TOKEN_CACHE[TokenCacheKey(context, catalog_name, consumer_name)] = token;
 }
 
+void EraseCachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
+                      const std::string &consumer_name) {
+	std::lock_guard<std::mutex> guard(TOKEN_CACHE_MUTEX);
+	TOKEN_CACHE.erase(TokenCacheKey(context, catalog_name, consumer_name));
+}
+
 void CacheDmlSafeCommitRange(duckdb::ClientContext &context, const std::string &catalog_name,
                              const std::string &consumer_name, int64_t cursor, int64_t safe_until) {
 	std::lock_guard<std::mutex> guard(DML_SAFE_COMMIT_MUTEX);
@@ -1375,6 +1381,78 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerForceReleaseInit(du
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<ConsumerForceReleaseData>();
 	result->rows.push_back(ForceReleaseConsumer(context, data));
+	return std::move(result);
+}
+
+//===--------------------------------------------------------------------===//
+// cdc_consumer_release
+//===--------------------------------------------------------------------===//
+
+void ThrowBusy(duckdb::Connection &conn, const std::string &catalog_name, const std::string &consumer_name);
+
+struct ConsumerReleaseData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	std::string consumer_name;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<ConsumerReleaseData>();
+		result->catalog_name = catalog_name;
+		result->consumer_name = consumer_name;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> ConsumerReleaseBind(duckdb::ClientContext &context,
+                                                             duckdb::TableFunctionBindInput &input,
+                                                             duckdb::vector<duckdb::LogicalType> &return_types,
+                                                             duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 2) {
+		throw duckdb::BinderException("cdc_consumer_release requires catalog and consumer name");
+	}
+	auto result = duckdb::make_uniq<ConsumerReleaseData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
+
+	names = {"consumer_name", "consumer_id", "released_token"};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT, duckdb::LogicalType::UUID};
+	return std::move(result);
+}
+
+std::vector<duckdb::Value> ReleaseConsumer(duckdb::ClientContext &context, const ConsumerReleaseData &data) {
+	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
+	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
+	if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
+		ThrowBusy(conn, data.catalog_name, data.consumer_name);
+	}
+
+	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
+	ExecuteChecked(conn, "UPDATE " + consumers +
+	                         " SET owner_token = NULL, owner_acquired_at = NULL, owner_heartbeat_at = NULL, "
+	                         "updated_at = now() WHERE consumer_name = " +
+	                         QuoteLiteral(data.consumer_name) + " AND owner_token = " + TokenSqlOrNull(cached_token));
+	row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
+	if (!row.owner_token.IsNull()) {
+		ThrowBusy(conn, data.catalog_name, data.consumer_name);
+	}
+	EraseCachedToken(context, data.catalog_name, data.consumer_name);
+	const auto details = "{\"released_token\":\"" + JsonEscape(cached_token) + "\"}";
+	InsertAuditRow(conn, data.catalog_name, "consumer_release", data.consumer_name, row.consumer_id, details);
+	return {duckdb::Value(data.consumer_name), duckdb::Value::BIGINT(row.consumer_id), duckdb::Value(cached_token)};
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> ConsumerReleaseInit(duckdb::ClientContext &context,
+                                                                         duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<ConsumerReleaseData>();
+	result->rows.push_back(ReleaseConsumer(context, data));
 	return std::move(result);
 }
 
@@ -3574,6 +3652,13 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 		    RowScanExecute, ConsumerForceReleaseBind, ConsumerForceReleaseInit);
 		loader.RegisterFunction(force_release_function);
+	}
+
+	for (const auto &name : {"cdc_consumer_release"}) {
+		duckdb::TableFunction release_function(
+		    name, duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
+		    RowScanExecute, ConsumerReleaseBind, ConsumerReleaseInit);
+		loader.RegisterFunction(release_function);
 	}
 
 	for (const auto &name : {"cdc_consumer_heartbeat"}) {

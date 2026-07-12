@@ -80,6 +80,9 @@ owner-token lease stored on the consumer row.
 
 The holder can call `cdc_window` repeatedly and get the same window until it
 commits. Another connection trying to read the same consumer gets `CDC_BUSY`.
+The holder releases during normal shutdown with `cdc_consumer_release`, which
+checks its connection-scoped owner token atomically. `cdc_consumer_force_release`
+is reserved for operators recovering a lease whose holder is known dead.
 
 Parallel reads are still possible inside one window: an orchestrator can hold
 the consumer lease, fan out ordinary `table_changes` reads, then commit once.

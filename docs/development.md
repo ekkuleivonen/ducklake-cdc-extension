@@ -170,7 +170,7 @@ Release. Asset names include the extension version, DuckDB version, and DuckDB
 platform, for example:
 
 ```text
-ducklake_cdc-v0.5.3-duckdb-v1.5.4-linux_arm64.duckdb_extension
+ducklake_cdc-v0.5.4-duckdb-v1.5.4-linux_arm64.duckdb_extension
 ```
 
 `SHA256SUMS` in the same release pins their contents. These maintainer release

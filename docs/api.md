@@ -38,6 +38,7 @@ release.
   [`cdc_consumer_reset`](#cdc_consumer_reset),
   [`cdc_consumer_drop`](#cdc_consumer_drop),
   [`cdc_consumer_heartbeat`](#cdc_consumer_heartbeat),
+  [`cdc_consumer_release`](#cdc_consumer_release),
   [`cdc_consumer_force_release`](#cdc_consumer_force_release)
 - Cursor:
   [`cdc_window`](#cdc_window),
@@ -73,7 +74,7 @@ SELECT cdc_version();
 Returns the loaded extension version as a scalar `VARCHAR`.
 
 The value is the stable semantic release version, for example
-`ducklake_cdc 0.5.3`. Use `cdc_build_revision()` when an exact source/build
+`ducklake_cdc 0.5.4`. Use `cdc_build_revision()` when an exact source/build
 identity is required.
 
 Use it in support tickets, CI logs, benchmark output, and migration checks.
@@ -435,6 +436,30 @@ Returns:
 consumer_name VARCHAR
 consumer_id BIGINT
 previous_token UUID
+```
+
+### `cdc_consumer_release`
+
+```sql
+SELECT *
+FROM cdc_consumer_release(catalog, name);
+```
+
+Normal holder shutdown primitive. Clears the lease only when the calling
+DuckDB connection still owns it with the same cached owner token. If ownership
+has moved to another connection, the call raises `CDC_BUSY` and leaves the new
+owner untouched.
+
+Call this after the connection's in-flight CDC operation has returned and
+before closing the connection. Use `cdc_consumer_force_release` only as an
+operator action when the previous holder is known dead or wedged.
+
+Returns:
+
+```text
+consumer_name VARCHAR
+consumer_id BIGINT
+released_token UUID
 ```
 
 ---

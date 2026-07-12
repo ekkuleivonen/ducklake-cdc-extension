@@ -240,6 +240,7 @@ namespace {
 // at the listen call site.
 std::mutex STATE_SCHEMA_CACHE_MUTEX;
 std::unordered_set<std::string> STATE_SCHEMA_CACHE;
+std::mutex STATE_BOOTSTRAP_MUTEX;
 
 bool StateSchemaCacheLookup(const std::string &cache_key) {
 	if (cache_key.empty()) {
@@ -638,18 +639,48 @@ void BootstrapConsumerStateOrThrow(duckdb::Connection &conn, const std::string &
 	// CheckCatalogOrThrow is the caller's responsibility on this overload:
 	// every cdc_* function that follows the "open one conn, probe, bootstrap,
 	// then do work" pattern wants the version probe to share that conn too.
-	auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
-	                                QuoteIdentifier(STATE_SCHEMA));
-	const bool use_state_schema = create_schema && !create_schema->HasError();
-	ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
-	ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
-	ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
-	if (use_state_schema) {
-		// Pre-warm the StateSchemaExists cache so subsequent listen calls
-		// in this process never have to re-probe the catalog enumerator.
+	//
+	// Do not issue idempotent DDL on every CDC call. Against a populated
+	// Postgres DuckLake catalog, concurrent CREATE IF NOT EXISTS and trigger
+	// installation from several outer ClientContexts can trip DuckDB/DuckLake's
+	// outer-to-inner catalog lock handoff (H-022). The authoritative zero-row
+	// state-table probe is sufficient once bootstrap has completed.
+	if (ProbeStateSchema(conn, catalog_name)) {
 		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+		return;
 	}
-	InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
+
+	// Only one connection in this process may perform first bootstrap. Recheck
+	// after taking the lock because another caller may have completed while we
+	// waited. Cross-process first bootstrap still relies on backend DDL
+	// idempotence and is documented separately under H-022.
+	std::lock_guard<std::mutex> bootstrap_guard(STATE_BOOTSTRAP_MUTEX);
+	if (ProbeStateSchema(conn, catalog_name)) {
+		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+		return;
+	}
+	ExecuteChecked(conn, "BEGIN TRANSACTION");
+	try {
+		auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
+		                                QuoteIdentifier(STATE_SCHEMA));
+		const bool use_state_schema = create_schema && !create_schema->HasError();
+		ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
+		ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
+		ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
+		InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
+		ExecuteChecked(conn, "COMMIT");
+		if (use_state_schema) {
+			// Pre-warm the StateSchemaExists cache only after the DDL is
+			// committed and visible to other DatabaseInstance connections.
+			StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+		}
+	} catch (...) {
+		try {
+			ExecuteChecked(conn, "ROLLBACK");
+		} catch (...) {
+		}
+		throw;
+	}
 }
 
 void BootstrapConsumerStateOrThrow(duckdb::ClientContext &context, const std::string &catalog_name) {
