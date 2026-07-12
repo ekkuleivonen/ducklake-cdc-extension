@@ -11,11 +11,13 @@ Catalog Error: Scalar Function with name cdc_version does not exist!
 # Require statement will ensure this test is run with this extension loaded.
 require ducklake_cdc
 
-# Confirm the extension's smoke-test function returns a build-stamp string.
-# The version segment after the prefix is the git tag at HEAD or a short
-# SHA on untagged builds (per docs/decisions/0013-versioning-and-release-automation.md);
-# we only assert on the prefix so this test stays valid across releases.
+# Confirm the public semantic version and separate build revision are present.
 query I
-SELECT cdc_version() ILIKE 'ducklake_cdc %';
+SELECT cdc_version();
+----
+ducklake_cdc 0.5.3
+
+query I
+SELECT length(cdc_build_revision()) > 0;
 ----
 true

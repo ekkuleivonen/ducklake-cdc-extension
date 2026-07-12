@@ -36,11 +36,10 @@ namespace {
 
 // Build-stamp literal that mirrors CdcVersionScalarFun() in
 // `src/ducklake_cdc_extension.cpp` so the user-facing notice and
-// `cdc_version()` agree on what extension build is reporting. Driven
-// entirely by `EXT_VERSION_DUCKLAKE_CDC` (tag or short SHA) per
-// docs/decisions/0013-versioning-and-release-automation.md.
-#ifdef EXT_VERSION_DUCKLAKE_CDC
-constexpr const char *EXTENSION_VERSION_LITERAL = "ducklake_cdc " EXT_VERSION_DUCKLAKE_CDC;
+// Keep compatibility diagnostics on the stable semantic version. Exact source
+// identity remains available separately through cdc_build_revision().
+#ifdef DUCKLAKE_CDC_SEMVER
+constexpr const char *EXTENSION_VERSION_LITERAL = "ducklake_cdc " DUCKLAKE_CDC_SEMVER;
 #else
 constexpr const char *EXTENSION_VERSION_LITERAL = "ducklake_cdc unknown";
 #endif

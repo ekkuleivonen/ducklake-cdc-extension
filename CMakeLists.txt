@@ -6,7 +6,7 @@ set(TARGET_NAME ducklake_cdc)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-project(${TARGET_NAME})
+project(${TARGET_NAME} VERSION 0.5.3)
 
 set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,9 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+target_compile_definitions(${EXTENSION_NAME} PRIVATE DUCKLAKE_CDC_SEMVER="${PROJECT_VERSION}")
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE DUCKLAKE_CDC_SEMVER="${PROJECT_VERSION}")
 
 install(
   TARGETS ${EXTENSION_NAME}

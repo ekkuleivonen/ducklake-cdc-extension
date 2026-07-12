@@ -163,10 +163,32 @@ feature_* -> main -> manual release
 - `release/0.x` branches are created only when an already-published line needs
   patch maintenance after `main` has moved on.
 
+### Immutable release binaries
+
+Every non-dry-run release attaches the exact full-matrix binaries to its GitHub
+Release. Asset names include the extension version, DuckDB version, and DuckDB
+platform, for example:
+
+```text
+ducklake_cdc-v0.5.3-duckdb-v1.5.4-linux_arm64.duckdb_extension
+```
+
+`SHA256SUMS` in the same release pins their contents. These maintainer release
+assets are unsigned: production images that use them must verify the digest,
+enable `allow_unsigned_extensions`, load the fixed path, and prevent the Python
+client from reinstalling the moving community build. The community repository
+remains the signed latest-version distribution channel.
+
+`cdc_version()` reports the stable extension semantic version.
+`cdc_build_revision()` reports the source revision stamped by the build. Treat
+the release URL plus SHA-256 digest—not either SQL string alone—as the immutable
+artifact identity.
+
 ## Where to start
 
 - `src/ducklake_cdc_extension.cpp` is the extension entry point. It registers
-  `cdc_version()` and calls into the per-domain `Register*Functions`.
+  `cdc_version()` / `cdc_build_revision()` and calls into the per-domain
+  `Register*Functions`.
 - `src/include/ducklake_metadata.hpp` is the shared facts layer (catalog
   table-name builders, snapshot lookups, JSON / quoting helpers, state-table
   DDL, lazy bootstrap). `src/ducklake_metadata.cpp` implements it.

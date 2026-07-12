@@ -117,7 +117,10 @@ Releases are manual and pragmatic:
 
 - day-to-day CI stays relatively small;
 - release CI builds the full DuckDB extension matrix;
-- community extension publishing is the main distribution path.
+- each GitHub release retains those exact matrix binaries and SHA-256 checksums
+  as the immutable pinning path;
+- community extension publishing is the signed latest-version distribution
+  path.
 
 The project should prefer clear docs, focused tests, and honest limitations
 over process-heavy release gates.
