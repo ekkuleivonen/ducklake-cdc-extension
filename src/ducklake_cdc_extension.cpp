@@ -13,18 +13,13 @@
 
 namespace duckdb {
 
-// Build-stamp string returned by `cdc_version()`. The version comes
-// from `EXT_VERSION_DUCKLAKE_CDC`, which the build system stamps from
-// `git tag --points-at HEAD` when releasing or from the short SHA on
-// untagged builds (see `extension-ci-tools/scripts/configure_helper.py`).
-// This matches the official DuckDB extension versioning convention:
-// untagged builds report an unstable identifier (short SHA), tagged
-// builds report the tag (pre-release while `v0.y.z`, stable from
-// `v1.0.0`). Per docs/decisions/0013-versioning-and-release-automation.md
-// there is no in-source version literal to bump on release.
+// Stable semantic version returned by `cdc_version()`. This is deliberately
+// separate from EXT_VERSION_DUCKLAKE_CDC: community-extensions checks out a
+// commit SHA without the release tag, so DuckDB's generated extension version
+// is a build revision rather than the descriptor's semantic version.
 inline void CdcVersionScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
-#ifdef EXT_VERSION_DUCKLAKE_CDC
-	const char *version_string = "ducklake_cdc " EXT_VERSION_DUCKLAKE_CDC;
+#ifdef DUCKLAKE_CDC_SEMVER
+	const char *version_string = "ducklake_cdc " DUCKLAKE_CDC_SEMVER;
 #else
 	const char *version_string = "ducklake_cdc unknown";
 #endif
@@ -33,9 +28,25 @@ inline void CdcVersionScalarFun(DataChunk &args, ExpressionState &state, Vector 
 	out[0] = StringVector::AddString(result, version_string);
 }
 
+// Source/build identity for exact artifact review and diagnostics. Unlike
+// cdc_version(), this is expected to vary between tagged and community builds.
+inline void CdcBuildRevisionScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef EXT_VERSION_DUCKLAKE_CDC
+	const char *revision = EXT_VERSION_DUCKLAKE_CDC;
+#else
+	const char *revision = "unknown";
+#endif
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	auto out = ConstantVector::GetData<string_t>(result);
+	out[0] = StringVector::AddString(result, revision);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto cdc_version_function = ScalarFunction("cdc_version", {}, LogicalType::VARCHAR, CdcVersionScalarFun);
 	loader.RegisterFunction(cdc_version_function);
+	auto cdc_build_revision_function =
+	    ScalarFunction("cdc_build_revision", {}, LogicalType::VARCHAR, CdcBuildRevisionScalarFun);
+	loader.RegisterFunction(cdc_build_revision_function);
 	// Function registration is split across the four CDC domains:
 	//   - consumer: lifecycle (create/reset/drop/list/force_release/
 	//     heartbeat) + cursor primitives (window/commit).
@@ -67,8 +78,8 @@ std::string DucklakeCdcExtension::Name() {
 }
 
 std::string DucklakeCdcExtension::Version() const {
-#ifdef EXT_VERSION_DUCKLAKE_CDC
-	return EXT_VERSION_DUCKLAKE_CDC;
+#ifdef DUCKLAKE_CDC_SEMVER
+	return DUCKLAKE_CDC_SEMVER;
 #else
 	return "";
 #endif

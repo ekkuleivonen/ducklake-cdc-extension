@@ -72,7 +72,22 @@ SELECT cdc_version();
 
 Returns the loaded extension version as a scalar `VARCHAR`.
 
+The value is the stable semantic release version, for example
+`ducklake_cdc 0.5.3`. Use `cdc_build_revision()` when an exact source/build
+identity is required.
+
 Use it in support tickets, CI logs, benchmark output, and migration checks.
+
+### `cdc_build_revision`
+
+```sql
+SELECT cdc_build_revision();
+```
+
+Returns the source revision stamped by the DuckDB extension build. Community
+builds normally report a short commit SHA; tagged local builds may report the
+tag. Pin production artifacts by release URL and SHA-256 digest rather than by
+this diagnostic value alone.
 
 ### `cdc_doctor`
 

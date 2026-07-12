@@ -308,6 +308,21 @@ jobs:
             fi
           fi
 
+      - name: Validate version matches extension semantic version
+        if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cmake_version="$(sed -nE 's/^project\([^)]* VERSION ([0-9]+\.[0-9]+\.[0-9]+)\).*$/\1/p' CMakeLists.txt)"
+          if [[ -z "$cmake_version" ]]; then
+            echo "::error::Could not read the project VERSION from CMakeLists.txt."
+            exit 1
+          fi
+          if [[ "v$cmake_version" != "$VERSION" ]]; then
+            echo "::error::Release input $VERSION does not match CMake project version v$cmake_version."
+            exit 1
+          fi
+
       - name: Verify tag does not already exist
         if: ${{ inputs.community_pr_only != true && inputs.community_pr_only != 'true' }}
         env:
@@ -476,6 +491,50 @@ jobs:
             echo "Will retry the \`duckdb/community-extensions\` PR for existing tag \`$VERSION\` at \`$RELEASE_SHA\`."
             echo "No tags, branches, or GitHub Releases will be created in this repository."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release-assets:
+    name: Publish immutable release binaries
+    needs:
+      - resolve-duckdb-version
+      - release
+    if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' && inputs.community_pr_only != true && inputs.community_pr_only != 'true' && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download tested distribution artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ducklake_cdc-${{ needs.resolve-duckdb-version.outputs.duckdb_version }}-extension-*
+          path: release-artifacts
+
+      - name: Give artifacts immutable release names and checksums
+        env:
+          VERSION: ${{ inputs.version }}
+          DUCKDB_VERSION: ${{ needs.resolve-duckdb-version.outputs.duckdb_version }}
+        run: |
+          set -euo pipefail
+          mkdir release-upload
+          for artifact_dir in release-artifacts/*; do
+            artifact_name="${artifact_dir##*/}"
+            platform="${artifact_name##*-extension-}"
+            source_file="$(find "$artifact_dir" -type f -name 'ducklake_cdc.duckdb_extension*' -print -quit)"
+            if [[ -z "$source_file" ]]; then
+              echo "::error::No extension binary found in $artifact_dir."
+              exit 1
+            fi
+            suffix=".duckdb_extension"
+            if [[ "$source_file" == *.wasm ]]; then
+              suffix=".duckdb_extension.wasm"
+            fi
+            cp "$source_file" "release-upload/ducklake_cdc-${VERSION}-duckdb-${DUCKDB_VERSION}-${platform}${suffix}"
+          done
+          (cd release-upload && sha256sum ducklake_cdc-* > SHA256SUMS)
+          cat release-upload/SHA256SUMS
+
+      - name: Attach binaries and checksums to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: gh release upload "$VERSION" release-upload/* --repo "${{ github.repository }}" --clobber
 
   community-pr:
     name: Open community-extensions PR
