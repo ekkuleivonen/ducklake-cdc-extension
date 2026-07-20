@@ -15,7 +15,7 @@ require ducklake_cdc
 query I
 SELECT cdc_version();
 ----
-ducklake_cdc 0.5.4
+ducklake_cdc 0.6.0
 
 query I
 SELECT length(cdc_build_revision()) > 0;

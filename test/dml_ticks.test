@@ -109,3 +109,67 @@ snapshot_id	BIGINT
 snapshot_time	TIMESTAMP WITH TIME ZONE
 schema_version	BIGINT
 table_ids	BIGINT[]
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create(
+  'lake',
+  'catalog_ticks',
+  start_at := 'beginning'
+);
+
+query I
+SELECT count(DISTINCT table_id)
+FROM (
+  SELECT unnest(table_ids) AS table_id
+  FROM cdc_dml_ticks_read(
+    'lake',
+    'catalog_ticks',
+    max_snapshots := 1000
+  )
+);
+----
+2
+
+statement error
+SELECT * FROM cdc_dml_changes_read(
+  'lake',
+  'catalog_ticks',
+  max_snapshots := 1000
+);
+----
+no DML table subscription
+
+statement ok
+SET VARIABLE catalog_ticks_head = (
+  SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+SELECT * FROM cdc_commit(
+  'lake',
+  'catalog_ticks',
+  getvariable('catalog_ticks_head')
+);
+
+statement ok
+ALTER TABLE lake.orders ADD COLUMN note VARCHAR;
+
+statement ok
+INSERT INTO lake.orders(id, status, note)
+VALUES (3, 'shipped', 'catalog cursor survived DDL');
+
+query I
+SELECT count(*) >= 1
+FROM cdc_dml_ticks_read(
+  'lake',
+  'catalog_ticks',
+  max_snapshots := 1000
+);
+----
+true
+
+query TT
+SELECT terminal, schema_changes_pending
+FROM cdc_window('lake', 'catalog_ticks', max_snapshots := 1000);
+----
+false	false

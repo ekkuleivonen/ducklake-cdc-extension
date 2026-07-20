@@ -74,7 +74,7 @@ SELECT cdc_version();
 Returns the loaded extension version as a scalar `VARCHAR`.
 
 The value is the stable semantic release version, for example
-`ducklake_cdc 0.5.4`. Use `cdc_build_revision()` when an exact source/build
+`ducklake_cdc 0.6.0`. Use `cdc_build_revision()` when an exact source/build
 identity is required.
 
 Use it in support tickets, CI logs, benchmark output, and migration checks.
@@ -296,20 +296,19 @@ FROM cdc_dml_consumer_create(
 );
 ```
 
-Creates a durable DML consumer pinned to **exactly one** concrete table
-identity. Pass exactly one of `table_name` or `table_id`; the bind
-rejects "both set" and "neither set".
+Creates a durable DML consumer. Pass exactly one of `table_name` or
+`table_id` for row changes, or omit both for a catalogue-wide tick consumer.
+Passing both is always invalid, and `change_types` requires a table identity.
 
-Multi-table fan-out is **not** part of the DML consumer contract. It
-belongs to the orchestrator: spawn one DML consumer per table and join
-downstream of the sinks. This keeps the schema-shape termination
-contract crisp — when the pinned table's shape changes, that one
-consumer hard-stops and the orchestrator spawns a successor at the
-boundary snapshot.
+Catalogue-wide DML consumers work with `cdc_dml_ticks_read` and
+`cdc_dml_ticks_listen`. Their schema-independent tick rows contain the touched
+`table_ids`, follow future tables automatically, and continue across DDL
+boundaries. They intentionally cannot call `cdc_dml_changes_*`, whose dynamic
+row projection requires exactly one table identity.
 
-DML consumers do not dynamically subscribe to future tables through schema or
-catalog filters. That policy belongs in application code, usually driven by a
-separate DDL consumer.
+Table-scoped DML consumers retain the schema-shape termination contract: when
+the pinned table's shape changes, that consumer hard-stops and the orchestrator
+creates a successor at the boundary snapshot.
 
 Name input is resolved at `start_at` and persisted as `table_id`. For
 `start_at := 'beginning'`, `'oldest'`, or `'oldest_available'`, DML creation
@@ -677,11 +676,10 @@ change_count BIGINT
 
 ## Stateful DML
 
-DML consumers are pinned to exactly one table by contract (see
-`cdc_dml_consumer_create`). The DML payload API is therefore unified:
-there is one read/listen pair, and rows project the pinned table's
-**native columns** at the top level — no separate "table changes"
-function and no JSON `values` blob.
+Table-scoped DML consumers expose one row-level read/listen pair whose rows
+project the pinned table's **native columns** at the top level—no separate
+"table changes" function and no JSON `values` blob. Catalogue-wide DML
+consumers expose ticks only.
 
 All DML listen functions auto-advance through *non-terminal* empty windows.
 A window is non-terminal when `cdc_window` reports `has_changes = true` but

@@ -605,8 +605,8 @@ struct ConsumerCreateData : public duckdb::TableFunctionData {
 	duckdb::Value schema_ids;
 	duckdb::Value table_names;
 	duckdb::Value table_ids;
-	// DML-only scope inputs (one DML consumer = one table). Exactly one
-	// of {table_name, table_id} must be set on cdc_dml_consumer_create.
+	// DML scope inputs. A table identity pins row-level change consumers;
+	// omitting both creates a catalog-wide, tick-only consumer.
 	duckdb::Value table_name;
 	duckdb::Value table_id;
 	duckdb::Value change_types;
@@ -712,9 +712,8 @@ duckdb::unique_ptr<duckdb::FunctionData> DmlConsumerCreateBind(duckdb::ClientCon
 	result->consumer_name = GetStringArg(input.inputs[1], "consumer name");
 	result->consumer_kind = "dml";
 	result->start_at = StartAtParameter(input);
-	// One DML consumer = one table. We accept either `table_name` or
-	// `table_id` so callers can pin to identity (id) or convenience
-	// (name); both being set is a configuration error.
+	// A table identity pins row-level change consumers; omitting both
+	// creates a catalog-wide cursor for schema-independent DML ticks.
 	result->table_name = NamedParameterValue(input, "table_name");
 	result->table_id = NamedParameterValue(input, "table_id");
 	result->change_types = NamedParameterValue(input, "change_types");
@@ -723,9 +722,10 @@ duckdb::unique_ptr<duckdb::FunctionData> DmlConsumerCreateBind(duckdb::ClientCon
 		throw duckdb::InvalidInputException(
 		    "cdc_dml_consumer_create: pass exactly one of `table_name` or `table_id`, not both");
 	}
-	if (result->table_name.IsNull() && result->table_id.IsNull()) {
+	if (result->table_name.IsNull() && result->table_id.IsNull() && !result->change_types.IsNull()) {
 		throw duckdb::InvalidInputException(
-		    "cdc_dml_consumer_create: requires `table_name` or `table_id` (one DML consumer = one table)");
+		    "cdc_dml_consumer_create: `change_types` requires `table_name` or `table_id`; "
+		    "catalog-wide consumers emit DML ticks only");
 	}
 	ConsumerCreateReturnTypes(return_types, names);
 	return std::move(result);
@@ -944,16 +944,18 @@ void AddResolvedSubscription(std::vector<ResolvedSubscriptionInput> &out, const 
 	out.push_back(std::move(sub));
 }
 
-//! Resolve the single table identity that a DML consumer is being pinned
-//! to, fan out one base subscription per requested change_type. Bind has
-//! already enforced that exactly one of `data.table_name` /
-//! `data.table_id` is set; this function just turns identity inputs into
-//! `(schema_id, table_id, current qualified name)` and emits the
-//! per-change-type subscription rows.
+//! Resolve a DML consumer scope. Omitting table identity creates one
+//! catalog-wide subscription for schema-independent ticks. A table-scoped
+//! consumer fans out one subscription per requested row change type.
 std::vector<ResolvedSubscriptionInput> ResolveDmlCreateSubscriptions(duckdb::Connection &conn,
                                                                      const std::string &catalog_name,
                                                                      const ConsumerCreateData &data,
                                                                      int64_t snapshot_id) {
+	if (data.table_name.IsNull() && data.table_id.IsNull()) {
+		std::vector<ResolvedSubscriptionInput> out;
+		AddResolvedSubscription(out, "catalog", duckdb::Value(), duckdb::Value(), "dml", "*", duckdb::Value());
+		return out;
+	}
 	const auto change_types = DmlChangeTypeList(data.change_types);
 	int64_t schema_id = 0;
 	int64_t table_id = 0;
@@ -2487,6 +2489,15 @@ bool DmlSubscriptionsIncludeTable(const std::vector<ConsumerSubscriptionRow> &su
 	return false;
 }
 
+bool HasCatalogDmlSubscription(const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+	for (const auto &subscription : subscriptions) {
+		if (subscription.event_category == "dml" && subscription.scope_kind == "catalog") {
+			return true;
+		}
+	}
+	return false;
+}
+
 void DmlSubscriptionIds(const std::vector<ConsumerSubscriptionRow> &subscriptions,
                         std::unordered_set<int64_t> &table_ids, std::unordered_set<int64_t> &schema_ids) {
 	for (const auto &subscription : subscriptions) {
@@ -2515,14 +2526,15 @@ bool SnapshotChangeTouchesDmlTables(const DecodedSnapshotChange &change, const s
 int64_t FirstDmlSubscribedSnapshot(duckdb::Connection &conn, const std::string &catalog_name, int64_t start_snapshot,
                                    int64_t current_snapshot,
                                    const std::vector<ConsumerSubscriptionRow> &dml_subscriptions) {
+	const auto catalog_wide = HasCatalogDmlSubscription(dml_subscriptions);
 	std::unordered_set<int64_t> table_ids;
 	std::unordered_set<int64_t> schema_ids;
 	DmlSubscriptionIds(dml_subscriptions, table_ids, schema_ids);
-	if (table_ids.empty()) {
+	if (!catalog_wide && table_ids.empty()) {
 		return -1;
 	}
 	for (const auto &change : LoadDecodedSnapshotChanges(conn, catalog_name, start_snapshot, current_snapshot)) {
-		if (SnapshotChangeTouchesDmlTables(change, table_ids)) {
+		if ((catalog_wide && !change.dml_table_ids.empty()) || SnapshotChangeTouchesDmlTables(change, table_ids)) {
 			return change.snapshot_id;
 		}
 	}
@@ -2575,6 +2587,9 @@ bool DmlTableChangesMatchSubscriptions(duckdb::Connection &conn, const std::stri
 	const auto change_types = MatchingDmlChangeTypes(subscriptions, schema_id, table_id);
 	if (change_types.empty()) {
 		return false;
+	}
+	if (std::find(change_types.begin(), change_types.end(), "*") != change_types.end()) {
+		return true;
 	}
 	const auto dot = qualified_name.find('.');
 	if (dot == std::string::npos) {
@@ -3181,8 +3196,7 @@ std::vector<ConsumerSubscriptionRow> LoadDmlConsumerSubscriptions(duckdb::Connec
 	      << "s.event_category, s.change_type, s.original_qualified_name, c.consumer_kind FROM "
 	      << StateTable(conn, catalog_name, CONSUMERS_TABLE) << " c JOIN "
 	      << StateTable(conn, catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE) << " s ON s.consumer_id = c.consumer_id "
-	      << "WHERE c.consumer_name = " << QuoteLiteral(consumer_name)
-	      << " AND s.event_category = 'dml' AND s.scope_kind = 'table' AND s.table_id IS NOT NULL "
+	      << "WHERE c.consumer_name = " << QuoteLiteral(consumer_name) << " AND s.event_category = 'dml' "
 	      << "ORDER BY c.consumer_id ASC, s.subscription_id ASC";
 	auto result = conn.Query(query.str());
 	if (!result || result->HasError()) {
@@ -3645,8 +3659,8 @@ void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 	    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
 	    RowScanExecute, DmlConsumerCreateBind, ConsumerCreateInit);
 	dml_create_function.named_parameters["start_at"] = duckdb::LogicalType::VARCHAR;
-	// Scalar (singular) — one DML consumer = one table. Pass exactly one
-	// of `table_name` or `table_id`; bind rejects both-set / neither-set.
+	// Scalar table identity is optional. Pass exactly one of `table_name`
+	// or `table_id` for row changes, or omit both for catalog-wide ticks.
 	dml_create_function.named_parameters["table_name"] = duckdb::LogicalType::VARCHAR;
 	dml_create_function.named_parameters["table_id"] = duckdb::LogicalType::BIGINT;
 	dml_create_function.named_parameters["change_types"] = varchar_list;
