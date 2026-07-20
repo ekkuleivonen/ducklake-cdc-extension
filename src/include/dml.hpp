@@ -5,9 +5,9 @@
 //
 // Row-level change-event surface. Owns cdc_dml_ticks_read (snapshot-by-
 // snapshot commit metadata filtered by consumer subscriptions),
-// cdc_dml_changes_read / cdc_dml_changes_listen (typed DML rows from the
-// consumer's pinned table — one DML consumer = one table — projected
-// through subscription change-type rules), and the stateless
+// cdc_dml_changes_read / cdc_dml_changes_listen (typed DML rows from a
+// table-scoped consumer, projected through subscription change-type rules),
+// and the stateless
 // cdc_dml_changes_query sugar for ad-hoc single-table lookback.
 //===----------------------------------------------------------------------===//
 

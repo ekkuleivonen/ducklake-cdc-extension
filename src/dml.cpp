@@ -301,8 +301,10 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
 			if (subscriptions != nullptr) {
 				bool covered = false;
 				for (const auto &subscription : *subscriptions) {
-					if (subscription.event_category == "dml" && subscription.scope_kind == "table" &&
-					    !subscription.table_id.IsNull() && subscription.table_id.GetValue<int64_t>() == table_id) {
+					if (subscription.event_category == "dml" &&
+					    (subscription.scope_kind == "catalog" ||
+					     (subscription.scope_kind == "table" && !subscription.table_id.IsNull() &&
+					      subscription.table_id.GetValue<int64_t>() == table_id))) {
 						covered = true;
 						break;
 					}
@@ -1263,9 +1265,9 @@ void RegisterDmlFunctions(duckdb::ExtensionLoader &loader) {
 		loader.RegisterFunction(events_function);
 	}
 
-	// Single, typed DML row-level read/listen surface. The consumer's
-	// pinned table is implicit (one DML consumer = one table); there is
-	// no `table_id` / `table_name` override knob.
+	// Single, typed DML row-level read/listen surface. A table-scoped
+	// consumer's pinned table is implicit; catalogue-wide consumers are
+	// rejected because they have no stable row schema.
 	for (const auto &name : {"cdc_dml_changes_read", "cdc_dml_changes_listen"}) {
 		const auto bind =
 		    std::string(name).find("_listen") == std::string::npos ? CdcChangesReadBind : CdcChangesListenBind;

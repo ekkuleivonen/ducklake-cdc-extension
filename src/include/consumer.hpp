@@ -27,16 +27,16 @@ namespace duckdb_cdc {
 //! Single row from the `__ducklake_cdc_consumers` state table, normalised
 //! into typed fields. Cross-cutting routing intent (schema_id, change_type
 //! filters, rename/drop status) lives in
-//! `__ducklake_cdc_consumer_subscriptions`. The single subscribed
-//! `table_id` is denormalised onto this row because every DML consumer
-//! has exactly one table — it lets `cdc_list_consumers` and the
-//! per-listen hot path resolve the table without a join.
+//! `__ducklake_cdc_consumer_subscriptions`. A table-scoped DML consumer's
+//! subscribed `table_id` is denormalised onto this row so
+//! `cdc_list_consumers` and the row-level hot path can resolve it without a
+//! join. Catalogue-wide tick consumers leave it NULL.
 struct ConsumerRow {
 	std::string consumer_name;
 	std::string consumer_kind;
 	int64_t consumer_id;
-	//! Subscribed table_id. Populated for DML consumers (always exactly
-	//! one); always NULL for DDL consumers.
+	//! Subscribed table_id. Populated for table-scoped DML consumers;
+	//! NULL for catalogue-wide DML tick consumers and DDL consumers.
 	duckdb::Value table_id;
 	int64_t last_committed_snapshot;
 	int64_t last_committed_schema_version;

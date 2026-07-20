@@ -68,6 +68,28 @@ SELECT *
 FROM cdc_commit('lake', 'orders_sink', <batch_end_snapshot>);
 ```
 
+Create one catalogue-wide cursor when only schema-independent DML ticks are
+needed:
+
+```sql
+SELECT *
+FROM cdc_dml_consumer_create(
+  'lake',
+  'catalog_dml_ticks',
+  start_at := 'now'
+);
+
+SELECT *
+FROM cdc_dml_ticks_listen(
+  'lake',
+  'catalog_dml_ticks',
+  timeout_ms := 1000
+);
+```
+
+Each tick carries the touched `table_ids`. The same cursor follows future
+tables and crosses DDL boundaries; fan-out belongs downstream.
+
 Listen for schema changes:
 
 ```sql

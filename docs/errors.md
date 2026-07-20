@@ -44,9 +44,10 @@ extension knows how to read safely.
 
 ### `CDC_SCHEMA_TERMINATED`
 
-A DML consumer is pinned to the schema shape of its subscribed table at
-creation time (one DML consumer = one table by contract). The shape is
-the column set the table has at the consumer's
+A table-scoped DML consumer is pinned to the schema shape of its subscribed
+table at creation time. Catalogue-wide tick consumers do not have a row
+schema and do not terminate at DDL boundaries. For a table-scoped consumer,
+the shape is the column set the table has at the consumer's
 `last_committed_snapshot`. Once the subscribed table is altered,
 dropped, or has its containing schema dropped, the consumer terminates:
 it stops returning DML and its cursor is parked at the snapshot before
