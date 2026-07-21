@@ -96,3 +96,218 @@ FROM cdc_list_consumers('lake')
 WHERE consumer_name = 'items_sink';
 ----
 0
+
+# ---------------------------------------------------------------------------
+# DDL listen progress: inspected DML-only snapshots advance the durable cursor
+# without weakening caller-committed delivery for real DDL.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM cdc_ddl_consumer_create(
+  'lake',
+  'ddl_progress',
+  start_at := 'now'
+);
+
+statement ok
+INSERT INTO lake.items VALUES (3, 'three');
+
+statement ok
+INSERT INTO lake.items VALUES (4, 'four');
+
+statement ok
+INSERT INTO lake.items VALUES (5, 'five');
+
+query I
+SELECT count(*)
+FROM cdc_ddl_changes_listen(
+  'lake',
+  'ddl_progress',
+  timeout_ms := 0,
+  max_snapshots := 1000
+);
+----
+0
+
+query I
+SELECT last_committed_snapshot = (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'ddl_progress';
+----
+true
+
+statement ok
+ALTER TABLE lake.items ADD COLUMN tag VARCHAR;
+
+query III
+SELECT count(*),
+       count(*) FILTER (
+         WHERE event_kind = 'altered'
+           AND object_kind = 'table'
+           AND object_name = 'items'
+       ),
+       min(start_snapshot) = max(end_snapshot)
+FROM cdc_ddl_changes_listen(
+  'lake',
+  'ddl_progress',
+  timeout_ms := 0,
+  max_snapshots := 1000
+);
+----
+1	1	true
+
+# Non-empty DDL remains caller-committed.
+query I
+SELECT last_committed_snapshot < (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'ddl_progress';
+----
+true
+
+statement ok
+SET VARIABLE ddl_snapshot = (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+);
+
+statement ok
+SELECT * FROM cdc_commit(
+  'lake',
+  'ddl_progress',
+  getvariable('ddl_snapshot')
+);
+
+query I
+SELECT count(*)
+FROM cdc_ddl_changes_listen(
+  'lake',
+  'ddl_progress',
+  timeout_ms := 0,
+  max_snapshots := 1000
+);
+----
+0
+
+# A scoped DDL consumer applies the same rule to DDL on unsubscribed objects:
+# advance the irrelevant snapshot, then deliver the first matching DDL.
+statement ok
+CREATE SCHEMA lake.aux;
+
+statement ok
+SELECT * FROM cdc_ddl_consumer_create(
+  'lake',
+  'aux_ddl_progress',
+  schemas := ['aux'],
+  start_at := 'now'
+);
+
+statement ok
+CREATE TABLE lake.main_only(id INTEGER);
+
+query I
+SELECT count(*)
+FROM cdc_ddl_changes_listen(
+  'lake',
+  'aux_ddl_progress',
+  timeout_ms := 0,
+  max_snapshots := 1000
+);
+----
+0
+
+query I
+SELECT last_committed_snapshot = (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'aux_ddl_progress';
+----
+true
+
+statement ok
+CREATE TABLE lake.aux.watched(id INTEGER);
+
+query II
+SELECT count(*),
+       count(*) FILTER (
+         WHERE event_kind = 'created'
+           AND object_kind = 'table'
+           AND schema_name = 'aux'
+           AND object_name = 'watched'
+       )
+FROM cdc_ddl_changes_listen(
+  'lake',
+  'aux_ddl_progress',
+  timeout_ms := 0,
+  max_snapshots := 1000
+);
+----
+1	1
+
+# Non-blocking reads use the same durable empty-window progress rule. This is
+# the path used by Atlas's catalogue relay.
+statement ok
+SELECT * FROM cdc_ddl_consumer_create(
+  'lake',
+  'ddl_read_progress',
+  start_at := 'now'
+);
+
+statement ok
+INSERT INTO lake.items VALUES (6, 'six', NULL);
+
+query I
+SELECT count(*)
+FROM cdc_ddl_changes_read(
+  'lake',
+  'ddl_read_progress',
+  max_snapshots := 1000
+);
+----
+0
+
+query I
+SELECT last_committed_snapshot = (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'ddl_read_progress';
+----
+true
+
+statement ok
+ALTER TABLE lake.items ADD COLUMN score INTEGER;
+
+query II
+SELECT count(*),
+       count(*) FILTER (
+         WHERE event_kind = 'altered'
+           AND object_kind = 'table'
+           AND object_name = 'items'
+       )
+FROM cdc_ddl_changes_read(
+  'lake',
+  'ddl_read_progress',
+  max_snapshots := 1000
+);
+----
+1	1
+
+# A delivered DDL batch remains caller-committed for read just as for listen.
+query I
+SELECT last_committed_snapshot < (
+  SELECT max(snapshot_id)
+  FROM __ducklake_metadata_lake.ducklake_snapshot
+)
+FROM cdc_list_consumers('lake')
+WHERE consumer_name = 'ddl_read_progress';
+----
+true

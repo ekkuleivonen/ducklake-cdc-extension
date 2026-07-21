@@ -1268,9 +1268,13 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDdlInit(duckdb::ClientCo
 	auto result = duckdb::make_uniq<RowScanState>();
 	auto &data = input.bind_data->Cast<CdcDdlData>();
 	auto max_snapshots = data.max_snapshots;
-	if (data.listen && !data.explicit_window) {
+	if (!data.explicit_window) {
+		// Both stateful entry points must probe for subscription-relevant DDL.
+		// A non-blocking read uses a zero timeout; the probe still durably
+		// advances a DDL cursor across an inspected DML-only window.
+		const auto timeout_ms = data.listen ? data.timeout_ms : 0;
 		auto ready =
-		    WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, data.timeout_ms, data.poll_min_ms);
+		    WaitForConsumerSnapshot(context, data.catalog_name, data.consumer_name, timeout_ms, data.poll_min_ms);
 		if (ready.empty() || ready[0].IsNull()) {
 			return std::move(result);
 		}

@@ -47,3 +47,17 @@ uv run python e2e/smoke/enumerate_changes_map.py --backends duckdb sqlite postgr
 
 The script sets `DATA_INLINING_ROW_LIMIT = 10` explicitly (DuckLake's spec default)
 so inlined-data boundary checks stay deterministic across local runs and CI.
+
+## PostgreSQL consumer progress
+
+`ddl_postgres_listener_progress_smoke.py` guards the catalogue-relay workload:
+caught-up DDL read and listen calls must durably skip a new DML-only snapshot
+without sequentially rereading the complete Postgres snapshot metadata
+history, and must still deliver the next real DDL event. It also verifies that
+a caught-up non-blocking DML tick read uses a bounded head probe instead of a
+complete snapshot-table copy, while leaving the next real tick caller-committed.
+
+```bash
+docker compose -f e2e/docker-compose.yml up -d --wait postgres
+uv run --project e2e python e2e/smoke/ddl_postgres_listener_progress_smoke.py
+```
