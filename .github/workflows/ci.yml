@@ -141,6 +141,7 @@ jobs:
         run: |
           docker compose -f e2e/docker-compose.yml up -d --wait
           trap 'docker compose -f e2e/docker-compose.yml down -v' EXIT
+          uv run --project e2e --locked python e2e/smoke/ddl_postgres_listener_progress_smoke.py
           uv run --project e2e --locked python e2e/ci_demo_assertions.py
 
   upstream-contract-check:

@@ -94,6 +94,8 @@ std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name
 std::string SnapshotNotifyChannel(const std::string &catalog_name);
 bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &catalog_name);
 std::string PostgresMetadataDsn(duckdb::Connection &conn, const std::string &catalog_name);
+duckdb::unique_ptr<duckdb::MaterializedQueryResult>
+QueryPostgresMetadata(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql);
 
 //===--------------------------------------------------------------------===//
 // Snapshot fact lookups

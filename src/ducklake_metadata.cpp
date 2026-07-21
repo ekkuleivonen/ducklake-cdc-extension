@@ -357,6 +357,11 @@ int64_t ResolveSchemaVersion(duckdb::Connection &conn, const std::string &catalo
 }
 
 int64_t CurrentSnapshot(duckdb::Connection &conn, const std::string &catalog_name) {
+	if (MetadataBackendIsPostgres(conn, catalog_name)) {
+		auto result = QueryPostgresMetadata(
+		    conn, catalog_name, "SELECT max(snapshot_id) AS current_snapshot FROM public.ducklake_snapshot");
+		return SingleInt64(*result, "current snapshot");
+	}
 	auto result = conn.Query("SELECT max(snapshot_id) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
 	return SingleInt64(*result, "current snapshot");
 }
@@ -590,8 +595,24 @@ std::string SnapshotNotifyChannel(const std::string &catalog_name) {
 }
 
 bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &catalog_name) {
-	auto result = conn.Query("SELECT type FROM duckdb_databases() WHERE database_name = " +
-	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
+	// DuckLake keeps its metadata attachment private, so it is not present in
+	// duckdb_databases(). The public DuckLake catalog path records the metadata
+	// backend as `postgres:<dsn>` and is the authoritative discriminator.
+	auto result = conn.Query(
+	    "SELECT type, path FROM duckdb_databases() WHERE database_name = " + QuoteLiteral(catalog_name) + " LIMIT 1");
+	if (result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	    !result->GetValue(1, 0).IsNull()) {
+		const auto type = duckdb::StringUtil::Lower(result->GetValue(0, 0).ToString());
+		const auto path = duckdb::StringUtil::Lower(result->GetValue(1, 0).ToString());
+		if (type == "ducklake" && StartsWith(path, "postgres:")) {
+			return true;
+		}
+	}
+
+	// Keep supporting an explicitly visible metadata attachment for direct
+	// extension tests and non-DuckLake callers.
+	result = conn.Query("SELECT type FROM duckdb_databases() WHERE database_name = " +
+	                    QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -600,12 +621,31 @@ bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &cata
 }
 
 std::string PostgresMetadataDsn(duckdb::Connection &conn, const std::string &catalog_name) {
-	auto result = conn.Query("SELECT path FROM duckdb_databases() WHERE database_name = " +
-	                         QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
+	auto result = conn.Query(
+	    "SELECT type, path FROM duckdb_databases() WHERE database_name = " + QuoteLiteral(catalog_name) + " LIMIT 1");
+	if (result && !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	    !result->GetValue(1, 0).IsNull()) {
+		const auto type = duckdb::StringUtil::Lower(result->GetValue(0, 0).ToString());
+		const auto path = result->GetValue(1, 0).ToString();
+		if (type == "ducklake" && StartsWith(duckdb::StringUtil::Lower(path), "postgres:")) {
+			return path.substr(std::string("postgres:").size());
+		}
+	}
+
+	result = conn.Query("SELECT path FROM duckdb_databases() WHERE database_name = " +
+	                    QuoteLiteral("__ducklake_metadata_" + catalog_name) + " LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
+}
+
+duckdb::unique_ptr<duckdb::MaterializedQueryResult>
+QueryPostgresMetadata(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
+	auto result = conn.Query("SELECT * FROM postgres_query(" + QuoteLiteral("__ducklake_metadata_" + catalog_name) +
+	                         ", " + QuoteLiteral(sql) + ")");
+	ThrowIfQueryFailed(result);
+	return result;
 }
 
 void PostgresExecuteBestEffort(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {

@@ -2702,26 +2702,43 @@ bool SnapshotTouchesSubscriptions(duckdb::Connection &conn, const std::string &c
 	return false;
 }
 
-std::vector<duckdb::Value> NextMatchingSnapshot(duckdb::Connection &conn, const std::string &cache_namespace,
-                                                const std::string &catalog_name, const ConsumerRow &consumer,
-                                                const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+struct SnapshotMatchProbe {
+	duckdb::Value matching_snapshot;
+	int64_t scanned_through;
+
+	SnapshotMatchProbe(duckdb::Value matching_snapshot_p, int64_t scanned_through_p)
+	    : matching_snapshot(std::move(matching_snapshot_p)), scanned_through(scanned_through_p) {
+	}
+};
+
+SnapshotMatchProbe NextMatchingSnapshot(duckdb::Connection &conn, const std::string &cache_namespace,
+                                        const std::string &catalog_name, const ConsumerRow &consumer,
+                                        const std::vector<ConsumerSubscriptionRow> &subscriptions) {
 	if (OnlyDmlTableSubscriptions(subscriptions)) {
 		const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
 		const auto snapshot = FirstDmlSubscribedSnapshot(conn, catalog_name, consumer.last_committed_snapshot,
 		                                                 current_snapshot, subscriptions);
 		if (snapshot != -1) {
-			return {duckdb::Value::BIGINT(snapshot),
-			        duckdb::Value::BIGINT(snapshot - consumer.last_committed_snapshot)};
+			return {duckdb::Value::BIGINT(snapshot), current_snapshot};
 		}
-		return {duckdb::Value(), duckdb::Value()};
+		return {duckdb::Value(), current_snapshot};
 	}
-	auto rows =
-	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id > " + std::to_string(consumer.last_committed_snapshot) +
-	               DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC");
+	const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+	const auto range_sql = "SELECT snapshot_id, changes_made FROM " +
+	                       NativePostgresMetadataTable("ducklake_snapshot_changes") + " WHERE snapshot_id > " +
+	                       std::to_string(consumer.last_committed_snapshot) +
+	                       " AND snapshot_id <= " + std::to_string(current_snapshot) +
+	                       DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC";
+	auto rows = MetadataBackendIsPostgres(conn, catalog_name)
+	                ? QueryPostgresMetadata(conn, catalog_name, range_sql)
+	                : conn.Query("SELECT snapshot_id, changes_made FROM " +
+	                             MetadataTable(catalog_name, "ducklake_snapshot_changes") + " WHERE snapshot_id > " +
+	                             std::to_string(consumer.last_committed_snapshot) +
+	                             " AND snapshot_id <= " + std::to_string(current_snapshot) +
+	                             DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC");
 	ThrowIfQueryFailed(rows);
 	if (!rows) {
-		return {duckdb::Value(), duckdb::Value()};
+		return {duckdb::Value(), current_snapshot};
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
 		if (rows->GetValue(0, row_idx).IsNull()) {
@@ -2732,11 +2749,35 @@ std::vector<duckdb::Value> NextMatchingSnapshot(duckdb::Connection &conn, const 
 		const auto changes_made = changes_value.IsNull() ? std::string() : changes_value.ToString();
 		if (SnapshotTouchesSubscriptions(conn, cache_namespace, catalog_name, snapshot_id, changes_made,
 		                                 subscriptions)) {
-			return {duckdb::Value::BIGINT(snapshot_id),
-			        duckdb::Value::BIGINT(snapshot_id - consumer.last_committed_snapshot)};
+			return {duckdb::Value::BIGINT(snapshot_id), current_snapshot};
 		}
 	}
-	return {duckdb::Value(), duckdb::Value()};
+	return {duckdb::Value(), current_snapshot};
+}
+
+bool AdvanceDdlCursorPastInspectedSnapshots(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                            const std::string &catalog_name, const ConsumerRow &probed_consumer,
+                                            int64_t inspected_through) {
+	if (probed_consumer.consumer_kind != "ddl" || inspected_through <= probed_consumer.last_committed_snapshot) {
+		return false;
+	}
+
+	const auto cached_token = CachedToken(context, catalog_name, probed_consumer.consumer_name);
+	ConsumerRow owned_consumer;
+	if (!TryUseFreshCachedLease(conn, catalog_name, probed_consumer.consumer_name, cached_token, owned_consumer)) {
+		const auto backend = CachedStateBackend(context, conn, catalog_name);
+		owned_consumer = AcquireLease(conn, catalog_name, probed_consumer.consumer_name, cached_token, backend);
+	}
+	CacheToken(context, catalog_name, probed_consumer.consumer_name, owned_consumer.owner_token.ToString());
+
+	// The subscription scan was performed from probed_consumer's cursor.
+	// A concurrent reset/commit changes that premise, so retry from the new
+	// cursor instead of advancing a range we did not inspect.
+	if (owned_consumer.last_committed_snapshot != probed_consumer.last_committed_snapshot) {
+		return false;
+	}
+	CommitConsumerSnapshotWithConnection(context, conn, catalog_name, probed_consumer.consumer_name, inspected_through);
+	return true;
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &context,
@@ -2787,10 +2828,18 @@ WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Con
 			throw duckdb::InterruptException();
 		}
 		const auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
-		const auto next_matching =
-		    NextMatchingSnapshot(conn, ConnectionCachePrefix(context), catalog_name, row, subscriptions);
-		if (!next_matching.empty() && !next_matching[0].IsNull()) {
-			return next_matching;
+		const auto probe = NextMatchingSnapshot(conn, ConnectionCachePrefix(context), catalog_name, row, subscriptions);
+		if (!probe.matching_snapshot.IsNull()) {
+			const auto snapshot = probe.matching_snapshot.GetValue<int64_t>();
+			return {probe.matching_snapshot, duckdb::Value::BIGINT(snapshot - row.last_committed_snapshot)};
+		}
+		if (row.consumer_kind == "ddl" && probe.scanned_through > row.last_committed_snapshot) {
+			if (AdvanceDdlCursorPastInspectedSnapshots(context, conn, catalog_name, row, probe.scanned_through)) {
+				// Completing this empty window is observable progress. Return
+				// to the caller instead of holding the lease through another
+				// long wait without a heartbeat.
+				return {duckdb::Value()};
+			}
 		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline || clamped_timeout_ms == 0) {
@@ -3355,6 +3404,23 @@ std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &conte
 	const bool is_dml = consumer_kind == "dml";
 
 	if (is_dml) {
+		// DuckDB's Postgres scanner cannot push the aggregate in
+		// ResolveDmlWindowIndexed into the remote query. Avoid copying the
+		// complete snapshot metadata history when this consumer is already at
+		// the catalogue head—the steady-state path for non-blocking relays.
+		if (MetadataBackendIsPostgres(conn, data.catalog_name)) {
+			const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
+			if (last_snapshot == current_snapshot) {
+				CacheDmlSafeCommitRange(context, data.catalog_name, data.consumer_name, last_snapshot, last_snapshot);
+				return {duckdb::Value::BIGINT(last_snapshot + 1),
+				        duckdb::Value::BIGINT(last_snapshot),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value::BIGINT(row.last_committed_schema_version),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value()};
+			}
+		}
 		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 		const auto resolved =
 		    ResolveDmlWindowIndexed(conn, data.catalog_name, last_snapshot, data.max_snapshots, subscriptions);
