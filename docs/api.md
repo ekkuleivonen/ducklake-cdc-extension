@@ -109,7 +109,7 @@ SELECT cdc_version();
 Returns the loaded extension version as a scalar `VARCHAR`.
 
 The value is the stable semantic release version, for example
-`ducklake_cdc 0.6.1`. Use `cdc_build_revision()` when an exact source/build
+`ducklake_cdc 0.6.2`. Use `cdc_build_revision()` when an exact source/build
 identity is required.
 
 Use it in support tickets, CI logs, benchmark output, and migration checks.
