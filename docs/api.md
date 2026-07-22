@@ -8,7 +8,8 @@ release.
 ## Conventions
 
 - Every public function is registered as a DuckDB table function and is called
-  from a `FROM` clause, except `cdc_version()`, which is scalar.
+  from a `FROM` clause. `cdc_configure` may also be invoked with `CALL`, and
+  `cdc_version()` is scalar.
 - All functions take an explicit `catalog` argument: the attached DuckLake
   catalog name, for example `'lake'` after `ATTACH ... AS lake`.
 - Stateful functions operate on a named consumer cursor. A consumer owns a
@@ -26,6 +27,7 @@ release.
 ## Index
 
 - General:
+  [`cdc_configure`](#cdc_configure),
   [`cdc_version`](#cdc_version),
   [`cdc_doctor`](#cdc_doctor),
   [`cdc_list_consumers`](#cdc_list_consumers),
@@ -64,6 +66,39 @@ release.
 ---
 
 ## General
+
+### `cdc_configure`
+
+```sql
+CALL cdc_configure(
+  catalog,
+  state_schema := 'ducklake_cdc_<lake-id>',
+  metadata_schema := 'ducklake_<lake-id>'
+);
+```
+
+Configures the durable CDC and DuckLake metadata schemas for one attachment.
+Use it after `ATTACH` and before the first stateful `cdc_*` call when multiple
+DuckLakes share one PostgreSQL database. Repeating the same mapping is
+idempotent; conflicting mappings are rejected.
+
+The mapping is scoped to the resolved attachment identity, not merely its SQL
+alias, and is not persisted by the extension. A runner must repeat the call
+after each process restart. Schema names are PostgreSQL identifiers and may be
+at most 63 bytes.
+
+If this function is omitted, the backward-compatible defaults are
+`state_schema = '__ducklake_cdc'` and `metadata_schema = 'public'`. Changing
+the configured state schema deliberately does not migrate existing consumer
+cursors, leases, subscriptions, or audit history.
+
+Returns:
+
+```text
+catalog_name VARCHAR
+state_schema VARCHAR
+metadata_schema VARCHAR
+```
 
 ### `cdc_version`
 

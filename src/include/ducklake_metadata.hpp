@@ -87,11 +87,27 @@ void ConfigureCdcInternalConnection(duckdb::Connection &conn);
 
 std::string MetadataDatabase(const std::string &catalog_name);
 std::string MetadataTable(const std::string &catalog_name, const std::string &table_name);
+std::string MetadataTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name);
 std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::string &catalog_name);
+
+//! Resolved durable identity for one DuckLake attachment. The defaults retain
+//! the original single-lake PostgreSQL layout; cdc_configure can override both
+//! schemas before the first stateful CDC call for an attachment.
+struct CdcCatalogState {
+	std::string catalog_name;
+	std::string attachment_identity;
+	std::string metadata_schema;
+	std::string state_schema;
+};
+
+CdcCatalogState ResolveCdcCatalogState(duckdb::Connection &conn, const std::string &catalog_name);
+CdcCatalogState ConfigureCdcCatalogState(duckdb::Connection &conn, const std::string &catalog_name,
+                                         const std::string &state_schema, const std::string &metadata_schema);
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema);
+std::string StateTable(const std::string &catalog_name, const std::string &table_name, const std::string &state_schema);
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name);
 std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name);
-std::string SnapshotNotifyChannel(const std::string &catalog_name);
+std::string SnapshotNotifyChannel(duckdb::Connection &conn, const std::string &catalog_name);
 bool MetadataBackendIsPostgres(duckdb::Connection &conn, const std::string &catalog_name);
 std::string PostgresMetadataDsn(duckdb::Connection &conn, const std::string &catalog_name);
 duckdb::unique_ptr<duckdb::MaterializedQueryResult>
@@ -140,9 +156,10 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 // State-table DDL strings + lazy bootstrap
 //===--------------------------------------------------------------------===//
 
-std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema);
-std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema);
-std::string AuditDdl(const std::string &catalog_name, bool use_state_schema);
+std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema, const std::string &state_schema);
+std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema,
+                                     const std::string &state_schema);
+std::string AuditDdl(const std::string &catalog_name, bool use_state_schema, const std::string &state_schema);
 
 //! Idempotently create the catalog-resident CDC state tables in a DuckLake
 //! catalog. Throws `CDC_INCOMPATIBLE_CATALOG` before any write when the

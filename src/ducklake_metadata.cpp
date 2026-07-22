@@ -19,8 +19,11 @@
 #include "duckdb/parser/keyword_helper.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <mutex>
 #include <sstream>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb_cdc {
@@ -194,6 +197,15 @@ std::string MetadataTable(const std::string &catalog_name, const std::string &ta
 	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(table_name);
 }
 
+std::string MetadataTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name) {
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
+	if (state.metadata_schema == "public") {
+		return MetadataTable(catalog_name, table_name);
+	}
+	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(state.metadata_schema) + "." +
+	       QuoteIdentifier(table_name);
+}
+
 std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::string &catalog_name) {
 	const auto metadata_database = "__ducklake_metadata_" + catalog_name;
 	auto result = conn.Query("SELECT database_oid, type, path FROM duckdb_databases() WHERE database_name = " +
@@ -215,11 +227,95 @@ std::string MetadataAttachmentCacheKey(duckdb::Connection &conn, const std::stri
 	return catalog_name + "|" + oid + "|" + type + "|" + path;
 }
 
+namespace {
+
+std::mutex CDC_CATALOG_CONFIG_MUTEX;
+std::unordered_map<std::string, CdcCatalogState> CDC_CATALOG_CONFIGS;
+std::unordered_set<std::string> CONFIGURED_CATALOG_NAMES;
+std::unordered_set<std::string> ACTIVE_CDC_CATALOGS;
+
+void ValidateSchemaName(const std::string &value, const std::string &argument_name) {
+	if (value.empty()) {
+		throw duckdb::InvalidInputException("cdc_configure: %s cannot be empty", argument_name);
+	}
+	if (value.size() > 63) {
+		throw duckdb::InvalidInputException("cdc_configure: %s must be at most 63 bytes", argument_name);
+	}
+	if (value.find('\0') != std::string::npos) {
+		throw duckdb::InvalidInputException("cdc_configure: %s cannot contain a NUL byte", argument_name);
+	}
+}
+
+std::string CatalogConfigKey(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto key = MetadataAttachmentCacheKey(conn, catalog_name);
+	if (key.empty()) {
+		throw duckdb::InvalidInputException("cdc_configure: unable to resolve DuckLake catalog '%s'", catalog_name);
+	}
+	return key;
+}
+
+std::string StateSchemaCacheKey(duckdb::Connection &conn, const std::string &catalog_name,
+                                const std::string &state_schema) {
+	return MetadataAttachmentCacheKey(conn, catalog_name) + "|state_schema=" + state_schema;
+}
+
+} // namespace
+
+CdcCatalogState ResolveCdcCatalogState(duckdb::Connection &conn, const std::string &catalog_name) {
+	{
+		std::lock_guard<std::mutex> guard(CDC_CATALOG_CONFIG_MUTEX);
+		if (CONFIGURED_CATALOG_NAMES.count(catalog_name) == 0) {
+			return {catalog_name, "", "public", STATE_SCHEMA};
+		}
+	}
+	const auto attachment_identity = MetadataAttachmentCacheKey(conn, catalog_name);
+	if (!attachment_identity.empty()) {
+		std::lock_guard<std::mutex> guard(CDC_CATALOG_CONFIG_MUTEX);
+		auto entry = CDC_CATALOG_CONFIGS.find(attachment_identity);
+		if (entry != CDC_CATALOG_CONFIGS.end()) {
+			return entry->second;
+		}
+	}
+	return {catalog_name, attachment_identity, "public", STATE_SCHEMA};
+}
+
+CdcCatalogState ConfigureCdcCatalogState(duckdb::Connection &conn, const std::string &catalog_name,
+                                         const std::string &state_schema, const std::string &metadata_schema) {
+	ValidateSchemaName(state_schema, "state_schema");
+	ValidateSchemaName(metadata_schema, "metadata_schema");
+	const auto key = CatalogConfigKey(conn, catalog_name);
+	CdcCatalogState requested {catalog_name, key, metadata_schema, state_schema};
+	std::lock_guard<std::mutex> guard(CDC_CATALOG_CONFIG_MUTEX);
+	auto existing = CDC_CATALOG_CONFIGS.find(key);
+	if (existing != CDC_CATALOG_CONFIGS.end()) {
+		if (existing->second.state_schema == state_schema && existing->second.metadata_schema == metadata_schema) {
+			return existing->second;
+		}
+		throw duckdb::InvalidInputException(
+		    "cdc_configure: catalog '%s' is already configured with state_schema '%s' and metadata_schema '%s'",
+		    catalog_name, existing->second.state_schema, existing->second.metadata_schema);
+	}
+	if (ACTIVE_CDC_CATALOGS.count(key) > 0) {
+		throw duckdb::InvalidInputException(
+		    "cdc_configure: catalog '%s' has already initialized CDC state; configure it before the first stateful "
+		    "cdc_* call",
+		    catalog_name);
+	}
+	CDC_CATALOG_CONFIGS.emplace(key, requested);
+	CONFIGURED_CATALOG_NAMES.insert(catalog_name);
+	return requested;
+}
+
 std::string StateTable(const std::string &catalog_name, const std::string &table_name, bool use_state_schema) {
 	if (use_state_schema) {
 		return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(STATE_SCHEMA) + "." + QuoteIdentifier(table_name);
 	}
 	return MetadataDatabase(catalog_name) + ".main." + QuoteIdentifier(table_name);
+}
+
+std::string StateTable(const std::string &catalog_name, const std::string &table_name,
+                       const std::string &state_schema) {
+	return MetadataDatabase(catalog_name) + "." + QuoteIdentifier(state_schema) + "." + QuoteIdentifier(table_name);
 }
 
 namespace {
@@ -258,21 +354,21 @@ void StateSchemaCacheRemember(const std::string &cache_key) {
 	STATE_SCHEMA_CACHE.insert(cache_key);
 }
 
-bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name) {
+bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name, const std::string &state_schema) {
 	// Probe the state table directly before consulting DuckDB's catalog
 	// enumeration views. DuckDB v1.5.4 no longer consistently exposes schemas
 	// belonging to DuckLake's hidden metadata attachment through
 	// duckdb_schemas()/duckdb_tables() on a fresh internal connection, even
 	// though fully-qualified access to the table works. The direct zero-row
 	// query is both cheaper and authoritative for the fact we need here.
-	auto direct = conn.Query("SELECT 1 FROM " + StateTable(catalog_name, CONSUMERS_TABLE, true) + " LIMIT 0");
+	auto direct = conn.Query("SELECT 1 FROM " + StateTable(catalog_name, CONSUMERS_TABLE, state_schema) + " LIMIT 0");
 	if (direct && !direct->HasError()) {
 		return true;
 	}
 
 	const auto md_db = QuoteLiteral("__ducklake_metadata_" + catalog_name);
 	auto schemas = conn.Query("SELECT count(*) FROM duckdb_schemas() WHERE database_name = " + md_db +
-	                          " AND schema_name = " + QuoteLiteral(STATE_SCHEMA));
+	                          " AND schema_name = " + QuoteLiteral(state_schema));
 	if (schemas && !schemas->HasError() && schemas->RowCount() > 0 && !schemas->GetValue(0, 0).IsNull() &&
 	    schemas->GetValue(0, 0).GetValue<int64_t>() > 0) {
 		return true;
@@ -280,7 +376,7 @@ bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name)
 	// `duckdb_schemas()` did not see it. Try the table-level enumeration
 	// for the consumers table that bootstrap always creates.
 	auto tables = conn.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = " + md_db +
-	                         " AND schema_name = " + QuoteLiteral(STATE_SCHEMA) +
+	                         " AND schema_name = " + QuoteLiteral(state_schema) +
 	                         " AND table_name = " + QuoteLiteral(CONSUMERS_TABLE));
 	return tables && !tables->HasError() && tables->RowCount() > 0 && !tables->GetValue(0, 0).IsNull() &&
 	       tables->GetValue(0, 0).GetValue<int64_t>() > 0;
@@ -289,11 +385,12 @@ bool ProbeStateSchema(duckdb::Connection &conn, const std::string &catalog_name)
 } // namespace
 
 bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
-	const auto cache_key = MetadataAttachmentCacheKey(conn, catalog_name);
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
+	const auto cache_key = StateSchemaCacheKey(conn, catalog_name, state.state_schema);
 	if (StateSchemaCacheLookup(cache_key)) {
 		return true;
 	}
-	if (ProbeStateSchema(conn, catalog_name)) {
+	if (ProbeStateSchema(conn, catalog_name, state.state_schema)) {
 		StateSchemaCacheRemember(cache_key);
 		return true;
 	}
@@ -301,7 +398,10 @@ bool StateSchemaExists(duckdb::Connection &conn, const std::string &catalog_name
 }
 
 std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name, const std::string &table_name) {
-	return StateTable(catalog_name, table_name, StateSchemaExists(conn, catalog_name));
+	if (!StateSchemaExists(conn, catalog_name)) {
+		return StateTable(catalog_name, table_name, false);
+	}
+	return StateTable(catalog_name, table_name, ResolveCdcCatalogState(conn, catalog_name).state_schema);
 }
 
 //===--------------------------------------------------------------------===//
@@ -310,7 +410,7 @@ std::string StateTable(duckdb::Connection &conn, const std::string &catalog_name
 
 int64_t ResolveSnapshot(duckdb::Connection &conn, const std::string &catalog_name, const std::string &literal,
                         const std::string &argument_name, const std::string &feature_name, bool null_means_oldest) {
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
 	const auto lower_literal = duckdb::StringUtil::Lower(literal);
 	if (literal.empty() && null_means_oldest) {
 		auto result = conn.Query("SELECT min(snapshot_id) FROM " + snapshot_table);
@@ -350,7 +450,7 @@ int64_t ResolveResetSnapshot(duckdb::Connection &conn, const std::string &catalo
 }
 
 int64_t ResolveSchemaVersion(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
 	auto result = conn.Query("SELECT schema_version FROM " + snapshot_table +
 	                         " WHERE snapshot_id = " + std::to_string(snapshot_id) + " LIMIT 1");
 	return SingleInt64(*result, "schema_version");
@@ -358,16 +458,18 @@ int64_t ResolveSchemaVersion(duckdb::Connection &conn, const std::string &catalo
 
 int64_t CurrentSnapshot(duckdb::Connection &conn, const std::string &catalog_name) {
 	if (MetadataBackendIsPostgres(conn, catalog_name)) {
-		auto result = QueryPostgresMetadata(
-		    conn, catalog_name, "SELECT max(snapshot_id) AS current_snapshot FROM public.ducklake_snapshot");
+		const auto metadata_schema = ResolveCdcCatalogState(conn, catalog_name).metadata_schema;
+		auto result = QueryPostgresMetadata(conn, catalog_name,
+		                                    "SELECT max(snapshot_id) AS current_snapshot FROM " +
+		                                        QuoteIdentifier(metadata_schema) + ".ducklake_snapshot");
 		return SingleInt64(*result, "current snapshot");
 	}
-	auto result = conn.Query("SELECT max(snapshot_id) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	auto result = conn.Query("SELECT max(snapshot_id) FROM " + MetadataTable(conn, catalog_name, "ducklake_snapshot"));
 	return SingleInt64(*result, "current snapshot");
 }
 
 duckdb::Value SnapshotTime(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
-	auto result = conn.Query("SELECT snapshot_time FROM " + MetadataTable(catalog_name, "ducklake_snapshot") +
+	auto result = conn.Query("SELECT snapshot_time FROM " + MetadataTable(conn, catalog_name, "ducklake_snapshot") +
 	                         " WHERE snapshot_id = " + std::to_string(snapshot_id));
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return duckdb::Value();
@@ -377,9 +479,10 @@ duckdb::Value SnapshotTime(duckdb::Connection &conn, const std::string &catalog_
 
 int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_name, int64_t last_snapshot,
                            int64_t current_snapshot) {
-	auto result = conn.Query("SELECT snapshot_id FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	                         " WHERE snapshot_id > " + std::to_string(last_snapshot) +
-	                         " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	auto result =
+	    conn.Query("SELECT snapshot_id FROM " + MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") +
+	               " WHERE snapshot_id > " + std::to_string(last_snapshot) +
+	               " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
 	if (!result || result->HasError()) {
 		return -1;
 	}
@@ -394,7 +497,7 @@ int64_t FirstSnapshotAfter(duckdb::Connection &conn, const std::string &catalog_
 
 void EnsureSnapshotExistsOrGap(duckdb::Connection &conn, const std::string &catalog_name,
                                const std::string &consumer_name, int64_t snapshot_id) {
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
 	auto exists =
 	    conn.Query("SELECT count(*) FROM " + snapshot_table + " WHERE snapshot_id = " + std::to_string(snapshot_id));
 	if (SingleInt64(*exists, "snapshot existence") > 0) {
@@ -447,8 +550,9 @@ bool SnapshotHasSchemaChange(const std::string &changes_made) {
 //! `NextExternalSchemaChangeSnapshot` returns -1, since it searches
 //! strictly AFTER start).
 bool SnapshotIsExternalSchemaChange(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id) {
-	auto result = conn.Query("SELECT changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	                         " WHERE snapshot_id = " + std::to_string(snapshot_id));
+	auto result =
+	    conn.Query("SELECT changes_made FROM " + MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") +
+	               " WHERE snapshot_id = " + std::to_string(snapshot_id));
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return false;
 	}
@@ -475,10 +579,10 @@ int64_t NextExternalSchemaChangeSnapshot(duckdb::Connection &conn, const std::st
 	// about to read the ALTER), the window's schema_version is the
 	// post-change version (set by ResolveSchemaVersion(start) in the
 	// caller); bounding the window at `start - 1` here would be wrong.
-	auto result =
-	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id > " + std::to_string(start_snapshot) +
-	               " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
+	auto result = conn.Query("SELECT snapshot_id, changes_made FROM " +
+	                         MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") + " WHERE snapshot_id > " +
+	                         std::to_string(start_snapshot) +
+	                         " AND snapshot_id <= " + std::to_string(current_snapshot) + " ORDER BY snapshot_id ASC");
 	if (!result || result->HasError()) {
 		return -1;
 	}
@@ -518,9 +622,9 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 	// Epoch math instead of `now() - INTERVAL X SECOND`: DuckDB has no
 	// `-(TIMESTAMP_TZ, INTERVAL)` binder, but `epoch(...)` works on any
 	// timestamp variant and the comparison is straight DOUBLE arithmetic.
-	auto result =
-	    conn.Query("SELECT COALESCE(max(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot") +
-	               " WHERE epoch(snapshot_time) <= epoch(now()) - " + std::to_string(since_seconds));
+	auto result = conn.Query("SELECT COALESCE(max(snapshot_id), 0) FROM " +
+	                         MetadataTable(conn, catalog_name, "ducklake_snapshot") +
+	                         " WHERE epoch(snapshot_time) <= epoch(now()) - " + std::to_string(since_seconds));
 	return SingleInt64(*result, "since_seconds start snapshot");
 }
 
@@ -528,13 +632,15 @@ int64_t ResolveSinceStartSnapshot(duckdb::Connection &conn, const std::string &c
 // State-table DDL strings + lazy bootstrap
 //===--------------------------------------------------------------------===//
 
-std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema) {
+std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema, const std::string &state_schema) {
 	// `table_id` is the single subscribed table for DML consumers (one
 	// DML consumer = one table, by contract). It is NULL for DDL
 	// consumers — DDL consumers can subscribe to schemas, tables, or the
 	// whole catalog and route those facts through
 	// `__ducklake_cdc_consumer_subscriptions`.
-	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema) +
+	const auto table = use_state_schema ? StateTable(catalog_name, CONSUMERS_TABLE, state_schema)
+	                                    : StateTable(catalog_name, CONSUMERS_TABLE, false);
+	return "CREATE TABLE IF NOT EXISTS " + table +
 	       " ("
 	       "consumer_name VARCHAR, "
 	       "consumer_kind VARCHAR NOT NULL, "
@@ -553,8 +659,11 @@ std::string ConsumersDdl(const std::string &catalog_name, bool use_state_schema)
 	       ")";
 }
 
-std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema) {
-	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE, use_state_schema) +
+std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_state_schema,
+                                     const std::string &state_schema) {
+	const auto table = use_state_schema ? StateTable(catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE, state_schema)
+	                                    : StateTable(catalog_name, CONSUMER_SUBSCRIPTIONS_TABLE, false);
+	return "CREATE TABLE IF NOT EXISTS " + table +
 	       " ("
 	       "consumer_id BIGINT NOT NULL, "
 	       "subscription_id BIGINT NOT NULL, "
@@ -569,8 +678,10 @@ std::string ConsumerSubscriptionsDdl(const std::string &catalog_name, bool use_s
 	       ")";
 }
 
-std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
-	return "CREATE TABLE IF NOT EXISTS " + StateTable(catalog_name, AUDIT_TABLE, use_state_schema) +
+std::string AuditDdl(const std::string &catalog_name, bool use_state_schema, const std::string &state_schema) {
+	const auto table = use_state_schema ? StateTable(catalog_name, AUDIT_TABLE, state_schema)
+	                                    : StateTable(catalog_name, AUDIT_TABLE, false);
+	return "CREATE TABLE IF NOT EXISTS " + table +
 	       " ("
 	       "audit_id BIGINT, "
 	       "ts TIMESTAMP WITH TIME ZONE NOT NULL, "
@@ -582,9 +693,10 @@ std::string AuditDdl(const std::string &catalog_name, bool use_state_schema) {
 	       ")";
 }
 
-std::string SnapshotNotifyChannel(const std::string &catalog_name) {
+std::string SnapshotNotifyChannel(duckdb::Connection &conn, const std::string &catalog_name) {
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
 	std::string out = "ducklake_cdc_snapshot_";
-	for (auto c : catalog_name) {
+	for (auto c : state.state_schema) {
 		if (out.size() >= 63) {
 			break;
 		}
@@ -658,21 +770,26 @@ void InstallPostgresSnapshotNotifyBestEffort(duckdb::Connection &conn, const std
 	if (!MetadataBackendIsPostgres(conn, catalog_name)) {
 		return;
 	}
-	const auto channel = SnapshotNotifyChannel(catalog_name);
-	PostgresExecuteBestEffort(conn, catalog_name, "CREATE SCHEMA IF NOT EXISTS " + QuoteIdentifier(STATE_SCHEMA));
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
+	const auto channel = SnapshotNotifyChannel(conn, catalog_name);
+	const auto state_schema = QuoteIdentifier(state.state_schema);
+	const auto snapshot_table = QuoteIdentifier(state.metadata_schema) + "." + QuoteIdentifier("ducklake_snapshot");
+	PostgresExecuteBestEffort(conn, catalog_name, "CREATE SCHEMA IF NOT EXISTS " + state_schema);
 	PostgresExecuteBestEffort(
 	    conn, catalog_name,
-	    "CREATE OR REPLACE FUNCTION " + QuoteIdentifier(STATE_SCHEMA) +
+	    "CREATE OR REPLACE FUNCTION " + state_schema +
 	        ".ducklake_cdc_notify_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_notify(" +
 	        QuoteLiteral(channel) + ", NEW.snapshot_id::text); RETURN NEW; END; $$");
-	PostgresExecuteBestEffort(
-	    conn, catalog_name,
-	    "DO $$ BEGIN IF NOT EXISTS ("
-	    "SELECT 1 FROM pg_trigger WHERE tgname = 'ducklake_cdc_snapshot_notify' "
-	    "AND tgrelid = 'public.ducklake_snapshot'::regclass"
-	    ") THEN EXECUTE 'CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON public.ducklake_snapshot "
-	    "FOR EACH ROW EXECUTE FUNCTION " +
-	        QuoteIdentifier(STATE_SCHEMA) + ".ducklake_cdc_notify_snapshot()'; END IF; END $$");
+	const auto create_trigger = "CREATE TRIGGER ducklake_cdc_snapshot_notify AFTER INSERT ON " + snapshot_table +
+	                            " FOR EACH ROW EXECUTE FUNCTION " + state_schema + ".ducklake_cdc_notify_snapshot()";
+	PostgresExecuteBestEffort(conn, catalog_name,
+	                          "DO $$ BEGIN IF NOT EXISTS ("
+	                          "SELECT 1 FROM pg_trigger WHERE tgname = 'ducklake_cdc_snapshot_notify' "
+	                          "AND tgrelid = " +
+	                              QuoteLiteral(snapshot_table) +
+	                              "::regclass"
+	                              ") THEN EXECUTE " +
+	                              QuoteLiteral(create_trigger) + "; END IF; END $$");
 }
 
 void BootstrapConsumerStateOrThrow(duckdb::Connection &conn, const std::string &catalog_name) {
@@ -685,41 +802,62 @@ void BootstrapConsumerStateOrThrow(duckdb::Connection &conn, const std::string &
 	// installation from several outer ClientContexts can trip DuckDB/DuckLake's
 	// outer-to-inner catalog lock handoff (H-022). The authoritative zero-row
 	// state-table probe is sufficient once bootstrap has completed.
-	if (ProbeStateSchema(conn, catalog_name)) {
-		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+	auto state = ResolveCdcCatalogState(conn, catalog_name);
+	if (state.attachment_identity.empty()) {
+		state.attachment_identity = MetadataAttachmentCacheKey(conn, catalog_name);
+	}
+	{
+		std::lock_guard<std::mutex> guard(CDC_CATALOG_CONFIG_MUTEX);
+		if (!state.attachment_identity.empty()) {
+			ACTIVE_CDC_CATALOGS.insert(state.attachment_identity);
+		}
+	}
+	const auto cache_key = StateSchemaCacheKey(conn, catalog_name, state.state_schema);
+	if (ProbeStateSchema(conn, catalog_name, state.state_schema)) {
+		StateSchemaCacheRemember(cache_key);
 		return;
 	}
 
 	// Only one connection in this process may perform first bootstrap. Recheck
 	// after taking the lock because another caller may have completed while we
-	// waited. Cross-process first bootstrap still relies on backend DDL
-	// idempotence and is documented separately under H-022.
+	// waited. PostgreSQL first bootstrap also retries: CREATE SCHEMA IF NOT
+	// EXISTS can still race another uncommitted CREATE from a different process.
 	std::lock_guard<std::mutex> bootstrap_guard(STATE_BOOTSTRAP_MUTEX);
-	if (ProbeStateSchema(conn, catalog_name)) {
-		StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
-		return;
-	}
-	ExecuteChecked(conn, "BEGIN TRANSACTION");
-	try {
-		auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
-		                                QuoteIdentifier(STATE_SCHEMA));
-		const bool use_state_schema = create_schema && !create_schema->HasError();
-		ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema));
-		ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema));
-		ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema));
-		InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
-		ExecuteChecked(conn, "COMMIT");
-		if (use_state_schema) {
-			// Pre-warm the StateSchemaExists cache only after the DDL is
-			// committed and visible to other DatabaseInstance connections.
-			StateSchemaCacheRemember(MetadataAttachmentCacheKey(conn, catalog_name));
+	const bool postgres = MetadataBackendIsPostgres(conn, catalog_name);
+	for (int attempt = 0; attempt < (postgres ? 10 : 1); ++attempt) {
+		if (ProbeStateSchema(conn, catalog_name, state.state_schema)) {
+			StateSchemaCacheRemember(cache_key);
+			return;
 		}
-	} catch (...) {
+		ExecuteChecked(conn, "BEGIN TRANSACTION");
 		try {
-			ExecuteChecked(conn, "ROLLBACK");
+			auto create_schema = conn.Query("CREATE SCHEMA IF NOT EXISTS " + MetadataDatabase(catalog_name) + "." +
+			                                QuoteIdentifier(state.state_schema));
+			if (postgres) {
+				ThrowIfQueryFailed(create_schema);
+			}
+			const bool use_state_schema = create_schema && !create_schema->HasError();
+			ExecuteChecked(conn, ConsumersDdl(catalog_name, use_state_schema, state.state_schema));
+			ExecuteChecked(conn, ConsumerSubscriptionsDdl(catalog_name, use_state_schema, state.state_schema));
+			ExecuteChecked(conn, AuditDdl(catalog_name, use_state_schema, state.state_schema));
+			InstallPostgresSnapshotNotifyBestEffort(conn, catalog_name);
+			ExecuteChecked(conn, "COMMIT");
+			if (use_state_schema) {
+				// Pre-warm the StateSchemaExists cache only after the DDL is
+				// committed and visible to other DatabaseInstance connections.
+				StateSchemaCacheRemember(cache_key);
+			}
+			return;
 		} catch (...) {
+			try {
+				ExecuteChecked(conn, "ROLLBACK");
+			} catch (...) {
+			}
+			if (!postgres || attempt == 9) {
+				throw;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
-		throw;
 	}
 }
 
