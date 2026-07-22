@@ -278,8 +278,8 @@ void AppendDmlTickRows(duckdb::Connection &conn, const std::string &catalog_name
                        std::vector<std::vector<duckdb::Value>> &out, bool stateful) {
 	auto rows =
 	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, s.schema_version, c.changes_made FROM ") +
-	               MetadataTable(catalog_name, "ducklake_snapshot") + " s JOIN " +
-	               MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	               MetadataTable(conn, catalog_name, "ducklake_snapshot") + " s JOIN " +
+	               MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") +
 	               " c USING (snapshot_id) WHERE s.snapshot_id BETWEEN " + std::to_string(start_snapshot) + " AND " +
 	               std::to_string(end_snapshot) + " ORDER BY s.snapshot_id ASC");
 	if (!rows || rows->HasError()) {
@@ -936,8 +936,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcChangesInit(duckdb::Clie
 		where_clause << ")";
 	}
 
-	const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
-	const auto changes_table = MetadataTable(data.catalog_name, "ducklake_snapshot_changes");
+	const auto snapshot_table = MetadataTable(conn, data.catalog_name, "ducklake_snapshot");
+	const auto changes_table = MetadataTable(conn, data.catalog_name, "ducklake_snapshot_changes");
 	const auto cache_key = DmlSegmentCacheKey(MetadataAttachmentCacheKey(conn, data.catalog_name), data,
 	                                          scan_table_name, start_snapshot, end_snapshot);
 	bool build_segment = false;
@@ -1032,8 +1032,8 @@ void ValidateRangeBounds(duckdb::Connection &conn, const std::string &catalog_na
 	if (to_snapshot < from_snapshot) {
 		throw duckdb::InvalidInputException("%s: from_snapshot must be <= to_snapshot", feature_name);
 	}
-	auto oldest_result =
-	    conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
+	                                MetadataTable(conn, catalog_name, "ducklake_snapshot"));
 	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
 	if (from_snapshot < oldest_snapshot) {
 		throw duckdb::InvalidInputException("%s: from_snapshot %lld is older than oldest available snapshot %lld",
@@ -1210,9 +1210,9 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 		auto query = std::string("SELECT ") + column_list.str() +
 		             ", s.snapshot_time, c.author, c.commit_message, c.commit_extra_info FROM " +
 		             DuckLakeTableChangesCall(data.catalog_name, data.table_name, from_snapshot, data.to_snapshot) +
-		             " tc LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
+		             " tc LEFT JOIN " + MetadataTable(conn, data.catalog_name, "ducklake_snapshot") +
 		             " s ON s.snapshot_id = tc.snapshot_id LEFT JOIN " +
-		             MetadataTable(data.catalog_name, "ducklake_snapshot_changes") +
+		             MetadataTable(conn, data.catalog_name, "ducklake_snapshot_changes") +
 		             " c ON c.snapshot_id = tc.snapshot_id ORDER BY tc.snapshot_id ASC, tc.rowid ASC";
 		return conn.Query(query);
 	};
@@ -1223,7 +1223,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcRangeChangesInit(duckdb:
 	}
 	if (rows->RowCount() == 0 && data.allow_history_fallback) {
 		auto begin_result = conn.Query("SELECT COALESCE(min(begin_snapshot), " + std::to_string(data.from_snapshot) +
-		                               ") FROM " + MetadataTable(data.catalog_name, "ducklake_table") +
+		                               ") FROM " + MetadataTable(conn, data.catalog_name, "ducklake_table") +
 		                               " WHERE table_id = " + std::to_string(data.table_id));
 		if (begin_result && !begin_result->HasError() && begin_result->RowCount() > 0 &&
 		    !begin_result->GetValue(0, 0).IsNull()) {

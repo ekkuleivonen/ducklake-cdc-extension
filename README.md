@@ -49,6 +49,23 @@ end-to-end latency, you probably want something built for that job.
 
 ## Use It From SQL
 
+When multiple DuckLakes keep metadata in different schemas of the same
+PostgreSQL database, configure a lake-owned CDC schema immediately after
+`ATTACH` and before the first stateful `cdc_*` call:
+
+```sql
+CALL cdc_configure(
+  'lake',
+  state_schema := 'ducklake_cdc_8f6d...',
+  metadata_schema := 'ducklake_8f6d...'
+);
+```
+
+The mapping is connection-process configuration and must be repeated after a
+restart. Existing single-lake installations that omit it continue to use
+`__ducklake_cdc` and PostgreSQL's `public` metadata schema. Selecting a new
+state schema does not migrate consumers, leases, cursors, or audit rows.
+
 Create a durable DML consumer and read row changes:
 
 ```sql

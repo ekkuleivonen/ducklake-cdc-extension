@@ -90,9 +90,10 @@ struct DdlObject {
 
 DdlObject LookupSchemaByName(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                              const std::string &schema_name) {
-	auto result = conn.Query("SELECT schema_id, schema_name FROM " + MetadataTable(catalog_name, "ducklake_schema") +
-	                         " WHERE begin_snapshot = " + std::to_string(snapshot_id) +
-	                         " AND schema_name = " + QuoteLiteral(schema_name) + " LIMIT 1");
+	auto result =
+	    conn.Query("SELECT schema_id, schema_name FROM " + MetadataTable(conn, catalog_name, "ducklake_schema") +
+	               " WHERE begin_snapshot = " + std::to_string(snapshot_id) +
+	               " AND schema_name = " + QuoteLiteral(schema_name) + " LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return {duckdb::Value(), duckdb::Value(schema_name), duckdb::Value(), duckdb::Value(schema_name)};
 	}
@@ -111,7 +112,7 @@ DdlObject LookupSchemaByName(duckdb::Connection &conn, const std::string &catalo
 DdlObject LookupSchemaById(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                            int64_t schema_id) {
 	auto result = conn.Query(
-	    "SELECT schema_id, schema_name FROM " + MetadataTable(catalog_name, "ducklake_schema") +
+	    "SELECT schema_id, schema_name FROM " + MetadataTable(conn, catalog_name, "ducklake_schema") +
 	    " WHERE schema_id = " + std::to_string(schema_id) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
 	    " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
@@ -123,8 +124,8 @@ DdlObject LookupSchemaById(duckdb::Connection &conn, const std::string &catalog_
 DdlObject LookupTableByName(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                             const std::string &schema_name, const std::string &table_name) {
 	auto result = conn.Query("SELECT s.schema_id, s.schema_name, t.table_id, t.table_name FROM " +
-	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
-	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         MetadataTable(conn, catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                         " s USING (schema_id) WHERE t.begin_snapshot = " + std::to_string(snapshot_id) +
 	                         " AND s.schema_name = " + QuoteLiteral(schema_name) +
 	                         " AND t.table_name = " + QuoteLiteral(table_name) + " LIMIT 1");
@@ -146,13 +147,14 @@ DdlObject LookupTableByName(duckdb::Connection &conn, const std::string &catalog
 //! schema row reflects its name at the right moment too.
 DdlObject LookupTableById(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                           int64_t table_id) {
-	auto result = conn.Query(
-	    "SELECT s.schema_id, s.schema_name, t.table_id, t.table_name FROM " +
-	    MetadataTable(catalog_name, "ducklake_table") + " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-	    " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) + " AND t.begin_snapshot <= " +
-	    std::to_string(snapshot_id) + " AND (t.end_snapshot IS NULL OR t.end_snapshot > " +
-	    std::to_string(snapshot_id) + ")" + " AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
-	    " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT s.schema_id, s.schema_name, t.table_id, t.table_name FROM " +
+	               MetadataTable(conn, catalog_name, "ducklake_table") + " t JOIN " +
+	               MetadataTable(conn, catalog_name, "ducklake_schema") + " s USING (schema_id) WHERE t.table_id = " +
+	               std::to_string(table_id) + " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) + ")" +
+	               " AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return {duckdb::Value(), duckdb::Value(), duckdb::Value::BIGINT(table_id), duckdb::Value()};
 	}
@@ -162,8 +164,8 @@ DdlObject LookupTableById(duckdb::Connection &conn, const std::string &catalog_n
 DdlObject LookupViewByName(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                            const std::string &schema_name, const std::string &view_name) {
 	auto result = conn.Query("SELECT s.schema_id, s.schema_name, v.view_id, v.view_name FROM " +
-	                         MetadataTable(catalog_name, "ducklake_view") + " v JOIN " +
-	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         MetadataTable(conn, catalog_name, "ducklake_view") + " v JOIN " +
+	                         MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                         " s USING (schema_id) WHERE v.begin_snapshot = " + std::to_string(snapshot_id) +
 	                         " AND s.schema_name = " + QuoteLiteral(schema_name) +
 	                         " AND v.view_name = " + QuoteLiteral(view_name) + " LIMIT 1");
@@ -181,13 +183,14 @@ DdlObject LookupViewByName(duckdb::Connection &conn, const std::string &catalog_
 //! `end_snapshot = drop_snap`.
 DdlObject LookupViewById(duckdb::Connection &conn, const std::string &catalog_name, int64_t snapshot_id,
                          int64_t view_id) {
-	auto result = conn.Query(
-	    "SELECT s.schema_id, s.schema_name, v.view_id, v.view_name FROM " +
-	    MetadataTable(catalog_name, "ducklake_view") + " v JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-	    " s USING (schema_id) WHERE v.view_id = " + std::to_string(view_id) + " AND v.begin_snapshot <= " +
-	    std::to_string(snapshot_id) + " AND (v.end_snapshot IS NULL OR v.end_snapshot > " +
-	    std::to_string(snapshot_id) + ")" + " AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
-	    " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT s.schema_id, s.schema_name, v.view_id, v.view_name FROM " +
+	               MetadataTable(conn, catalog_name, "ducklake_view") + " v JOIN " +
+	               MetadataTable(conn, catalog_name, "ducklake_schema") + " s USING (schema_id) WHERE v.view_id = " +
+	               std::to_string(view_id) + " AND v.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (v.end_snapshot IS NULL OR v.end_snapshot > " + std::to_string(snapshot_id) + ")" +
+	               " AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return {duckdb::Value(), duckdb::Value(), duckdb::Value::BIGINT(view_id), duckdb::Value()};
 	}
@@ -261,7 +264,7 @@ std::vector<ColumnInfo> LookupTableColumnsAt(duckdb::Connection &conn, const std
 	auto result = conn.Query(
 	    "SELECT column_id, column_order, column_name, column_type, nulls_allowed, "
 	    "initial_default, default_value, parent_column FROM " +
-	    MetadataTable(catalog_name, "ducklake_column") + " WHERE table_id = " + std::to_string(table_id) +
+	    MetadataTable(conn, catalog_name, "ducklake_column") + " WHERE table_id = " + std::to_string(table_id) +
 	    " AND begin_snapshot <= " + std::to_string(snapshot_id) + " AND (end_snapshot IS NULL OR end_snapshot > " +
 	    std::to_string(snapshot_id) + ")" + " ORDER BY column_order ASC");
 	if (!result || result->HasError()) {
@@ -578,7 +581,7 @@ std::string DiffsToJson(std::vector<ColumnDiff> diffs) {
 //! `altered.table` with a rename payload rather than as `created.table`.
 duckdb::Value PreviousTableName(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                                 int64_t snapshot_id) {
-	auto result = conn.Query("SELECT table_name FROM " + MetadataTable(catalog_name, "ducklake_table") +
+	auto result = conn.Query("SELECT table_name FROM " + MetadataTable(conn, catalog_name, "ducklake_table") +
 	                         " WHERE table_id = " + std::to_string(table_id) + " AND begin_snapshot < " +
 	                         std::to_string(snapshot_id) + " ORDER BY begin_snapshot DESC LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
@@ -599,7 +602,7 @@ ViewInfo LookupViewMetadata(duckdb::Connection &conn, const std::string &catalog
                             int64_t snapshot_id) {
 	ViewInfo info;
 	auto result = conn.Query(
-	    "SELECT sql, dialect, column_aliases FROM " + MetadataTable(catalog_name, "ducklake_view") +
+	    "SELECT sql, dialect, column_aliases FROM " + MetadataTable(conn, catalog_name, "ducklake_view") +
 	    " WHERE view_id = " + std::to_string(view_id) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
 	    " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0) {
@@ -645,7 +648,7 @@ std::string BuildCreatedTableDetails(duckdb::Connection &conn, const std::string
 //! skip them and let downstream serialise the empty diff group.
 bool TableSchemaVersionBumpedAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                                 int64_t snapshot_id) {
-	auto result = conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_schema_versions") +
+	auto result = conn.Query("SELECT 1 FROM " + MetadataTable(conn, catalog_name, "ducklake_schema_versions") +
 	                         " WHERE table_id = " + std::to_string(table_id) +
 	                         " AND begin_snapshot = " + std::to_string(snapshot_id) + " LIMIT 1");
 	if (!result || result->HasError()) {
@@ -1211,8 +1214,8 @@ void AppendDdlTickRows(duckdb::Connection &conn, const std::string &catalog_name
                        std::vector<std::vector<duckdb::Value>> &out, bool stateful) {
 	auto snapshots =
 	    conn.Query(std::string("SELECT s.snapshot_id, s.snapshot_time, s.schema_version, c.changes_made FROM ") +
-	               MetadataTable(catalog_name, "ducklake_snapshot") + " s JOIN " +
-	               MetadataTable(catalog_name, "ducklake_snapshot_changes") +
+	               MetadataTable(conn, catalog_name, "ducklake_snapshot") + " s JOIN " +
+	               MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") +
 	               " c USING (snapshot_id) WHERE s.snapshot_id BETWEEN " + std::to_string(start_snapshot) + " AND " +
 	               std::to_string(end_snapshot) + " ORDER BY s.snapshot_id ASC");
 	if (!snapshots || snapshots->HasError()) {
@@ -1394,8 +1397,8 @@ void ValidateDdlRangeBounds(duckdb::Connection &conn, const std::string &catalog
 	if (to_snapshot < from_snapshot) {
 		throw duckdb::InvalidInputException("cdc_ddl_changes_query: from_snapshot must be <= to_snapshot");
 	}
-	auto oldest_result =
-	    conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " + MetadataTable(catalog_name, "ducklake_snapshot"));
+	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
+	                                MetadataTable(conn, catalog_name, "ducklake_snapshot"));
 	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
 	if (from_snapshot < oldest_snapshot) {
 		throw duckdb::InvalidInputException(
@@ -1440,7 +1443,7 @@ std::vector<int64_t> DdlInt64ListNamedParameter(duckdb::TableFunctionBindInput &
 
 int64_t ResolveDdlSchemaName(duckdb::Connection &conn, const std::string &catalog_name, const std::string &schema_name,
                              int64_t snapshot_id) {
-	auto rows = conn.Query("SELECT schema_id FROM " + MetadataTable(catalog_name, "ducklake_schema") +
+	auto rows = conn.Query("SELECT schema_id FROM " + MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                       " WHERE schema_name = " + QuoteLiteral(schema_name) + " AND begin_snapshot <= " +
 	                       std::to_string(snapshot_id) + " AND (end_snapshot IS NULL OR end_snapshot > " +
 	                       std::to_string(snapshot_id) + ") ORDER BY schema_id DESC LIMIT 1");
@@ -1659,8 +1662,8 @@ std::unordered_set<int64_t> ResolveTableIdsForFilter(duckdb::Connection &conn, c
 	}
 	const auto schema_name = qualified_name.substr(0, dot);
 	const auto table_name = qualified_name.substr(dot + 1);
-	auto result = conn.Query("SELECT DISTINCT t.table_id FROM " + MetadataTable(catalog_name, "ducklake_table") +
-	                         " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
+	auto result = conn.Query("SELECT DISTINCT t.table_id FROM " + MetadataTable(conn, catalog_name, "ducklake_table") +
+	                         " t JOIN " + MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                         " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) +
 	                         " AND t.table_name = " + QuoteLiteral(table_name) +
 	                         " AND t.begin_snapshot <= " + std::to_string(to_snapshot) +

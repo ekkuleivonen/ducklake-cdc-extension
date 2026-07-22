@@ -1,0 +1,84 @@
+# name: test/configuration.test
+# group: [test]
+
+# cdc_configure contract and custom state schema
+
+require ducklake_cdc
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/configuration.ducklake' AS configured_lake
+
+query TTT
+CALL cdc_configure(
+  'configured_lake',
+  state_schema := 'configured_lake_cdc',
+  metadata_schema := 'public'
+);
+----
+configured_lake	configured_lake_cdc	public
+
+# Repeating the same mapping is idempotent.
+query TTT
+CALL cdc_configure(
+  'configured_lake',
+  state_schema := 'configured_lake_cdc',
+  metadata_schema := 'public'
+);
+----
+configured_lake	configured_lake_cdc	public
+
+statement ok
+SELECT * FROM cdc_dml_consumer_create('configured_lake', 'ticks');
+
+query I
+SELECT count(*)
+FROM __ducklake_metadata_configured_lake.configured_lake_cdc.__ducklake_cdc_consumers;
+----
+1
+
+statement error
+CALL cdc_configure(
+  'configured_lake',
+  state_schema := 'different_cdc',
+  metadata_schema := 'public'
+);
+----
+configured
+
+statement error
+CALL cdc_configure(
+  'configured_lake',
+  state_schema := 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl',
+  metadata_schema := 'public'
+);
+----
+63
+
+statement ok
+DETACH configured_lake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/configuration_late.ducklake' AS late_lake
+
+query I
+SELECT count(*) FROM cdc_list_consumers('late_lake');
+----
+0
+
+statement error
+CALL cdc_configure(
+  'late_lake',
+  state_schema := 'late_lake_cdc',
+  metadata_schema := 'public'
+);
+----
+before the first stateful
+
+statement ok
+DETACH late_lake;

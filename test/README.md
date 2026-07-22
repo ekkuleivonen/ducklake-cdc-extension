@@ -37,6 +37,8 @@ Run Python smoke probes after `make debug`:
 uv run python e2e/smoke/compat_warning_smoke.py
 uv run python e2e/smoke/lease_multiconn_smoke.py
 uv run python e2e/smoke/cdc_wait_interrupt_smoke.py
+docker compose -f e2e/docker-compose.yml up -d --wait postgres
+uv run --project e2e python e2e/smoke/postgres_state_isolation_smoke.py
 ```
 
 Run the demo CI gates after `make release`:
