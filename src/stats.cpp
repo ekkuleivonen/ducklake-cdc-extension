@@ -87,7 +87,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
 	const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
-	                                MetadataTable(data.catalog_name, "ducklake_snapshot"));
+	                                MetadataTable(conn, data.catalog_name, "ducklake_snapshot"));
 	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest snapshot");
 
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
@@ -101,7 +101,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConsumerStatsInit(duckdb
 	auto query = std::string("SELECT c.consumer_name, c.consumer_kind, c.consumer_id, c.last_committed_snapshot, "
 	                         "s.snapshot_time, c.owner_token, c.owner_acquired_at, "
 	                         "c.owner_heartbeat_at, c.lease_interval_seconds FROM ") +
-	             consumers + " c LEFT JOIN " + MetadataTable(data.catalog_name, "ducklake_snapshot") +
+	             consumers + " c LEFT JOIN " + MetadataTable(conn, data.catalog_name, "ducklake_snapshot") +
 	             " s ON s.snapshot_id = c.last_committed_snapshot" + where.str() + " ORDER BY c.consumer_name ASC";
 	auto rows = conn.Query(query);
 	if (!rows || rows->HasError()) {
@@ -292,7 +292,7 @@ void AddDoctorRow(RowScanState &state, const std::string &severity, const std::s
 }
 
 bool MetadataSchemaExists(duckdb::Connection &conn, const std::string &catalog_name) {
-	auto direct = conn.Query("SELECT 1 FROM " + MetadataTable(catalog_name, "ducklake_metadata") + " LIMIT 0");
+	auto direct = conn.Query("SELECT 1 FROM " + MetadataTable(conn, catalog_name, "ducklake_metadata") + " LIMIT 0");
 	if (direct && !direct->HasError()) {
 		return true;
 	}
@@ -385,7 +385,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcDoctorInit(duckdb::Clien
 
 	const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
 	auto oldest_result = conn.Query("SELECT COALESCE(min(snapshot_id), 0) FROM " +
-	                                MetadataTable(data.catalog_name, "ducklake_snapshot"));
+	                                MetadataTable(conn, data.catalog_name, "ducklake_snapshot"));
 	const auto oldest_snapshot = SingleInt64(*oldest_result, "oldest available snapshot");
 
 	std::vector<std::string> consumer_names;

@@ -8,7 +8,8 @@ release.
 ## Conventions
 
 - Every public function is registered as a DuckDB table function and is called
-  from a `FROM` clause, except `cdc_version()`, which is scalar.
+  from a `FROM` clause. `cdc_configure` may also be invoked with `CALL`, and
+  `cdc_version()` is scalar.
 - All functions take an explicit `catalog` argument: the attached DuckLake
   catalog name, for example `'lake'` after `ATTACH ... AS lake`.
 - Stateful functions operate on a named consumer cursor. A consumer owns a
@@ -26,6 +27,7 @@ release.
 ## Index
 
 - General:
+  [`cdc_configure`](#cdc_configure),
   [`cdc_version`](#cdc_version),
   [`cdc_doctor`](#cdc_doctor),
   [`cdc_list_consumers`](#cdc_list_consumers),
@@ -65,6 +67,39 @@ release.
 
 ## General
 
+### `cdc_configure`
+
+```sql
+CALL cdc_configure(
+  catalog,
+  state_schema := 'ducklake_cdc_<lake-id>',
+  metadata_schema := 'ducklake_<lake-id>'
+);
+```
+
+Configures the durable CDC and DuckLake metadata schemas for one attachment.
+Use it after `ATTACH` and before the first stateful `cdc_*` call when multiple
+DuckLakes share one PostgreSQL database. Repeating the same mapping is
+idempotent; conflicting mappings are rejected.
+
+The mapping is scoped to the resolved attachment identity, not merely its SQL
+alias, and is not persisted by the extension. A runner must repeat the call
+after each process restart. Schema names are PostgreSQL identifiers and may be
+at most 63 bytes.
+
+If this function is omitted, the backward-compatible defaults are
+`state_schema = '__ducklake_cdc'` and `metadata_schema = 'public'`. Changing
+the configured state schema deliberately does not migrate existing consumer
+cursors, leases, subscriptions, or audit history.
+
+Returns:
+
+```text
+catalog_name VARCHAR
+state_schema VARCHAR
+metadata_schema VARCHAR
+```
+
 ### `cdc_version`
 
 ```sql
@@ -74,7 +109,7 @@ SELECT cdc_version();
 Returns the loaded extension version as a scalar `VARCHAR`.
 
 The value is the stable semantic release version, for example
-`ducklake_cdc 0.6.0`. Use `cdc_build_revision()` when an exact source/build
+`ducklake_cdc 0.6.2`. Use `cdc_build_revision()` when an exact source/build
 identity is required.
 
 Use it in support tickets, CI logs, benchmark output, and migration checks.
@@ -572,6 +607,12 @@ FROM cdc_ddl_changes_listen(
 Waits until DDL changes matching the consumer are available or the deadline is
 reached, then returns parsed DDL changes.
 
+When catalog activity contains no DDL matching this consumer, both stateful
+read and listen durably advance the cursor through the inspected snapshots and
+may return an empty result. This is internal no-op acknowledgement, not
+`auto_commit`: a non-empty DDL result remains caller-committed unless
+`auto_commit := TRUE`.
+
 `poll_min_ms` controls the initial polling interval for backends without an
 event wakeup path (or when the wakeup path is unavailable). The interval
 backs off exponentially after each empty probe. PostgreSQL catalogs use the
@@ -799,6 +840,12 @@ FROM cdc_dml_ticks_read(
 ```
 
 Reads DML-relevant snapshot ticks for the consumer without waiting.
+
+For PostgreSQL-backed catalogues, a consumer already at catalogue head is
+resolved with a native bounded head probe. The steady-state empty read does
+not copy the full DuckLake snapshot metadata history through DuckDB's
+Postgres scanner. This is an empty-read optimization only; the next non-empty
+tick remains caller-committed unless `auto_commit := TRUE`.
 
 Returns:
 

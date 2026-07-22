@@ -314,14 +314,16 @@ std::string ConnectionCachePrefix(duckdb::ClientContext &context) {
 	return out.str();
 }
 
-std::string TokenCacheKey(duckdb::ClientContext &context, const std::string &catalog_name,
+std::string TokenCacheKey(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
                           const std::string &consumer_name) {
-	return ConnectionCachePrefix(context) + ":" + catalog_name + ":" + consumer_name;
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
+	const auto identity = state.attachment_identity.empty() ? catalog_name : state.attachment_identity;
+	return ConnectionCachePrefix(context) + ":" + identity + ":" + state.state_schema + ":" + consumer_name;
 }
 
-std::string DmlSafeCommitKey(duckdb::ClientContext &context, const std::string &catalog_name,
+std::string DmlSafeCommitKey(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
                              const std::string &consumer_name) {
-	return TokenCacheKey(context, catalog_name, consumer_name);
+	return TokenCacheKey(context, conn, catalog_name, consumer_name);
 }
 
 std::string AdaptiveListenKey(const std::string &catalog_name, const std::string &consumer_name,
@@ -329,41 +331,42 @@ std::string AdaptiveListenKey(const std::string &catalog_name, const std::string
 	return catalog_name + ":" + consumer_name + ":" + stream_key;
 }
 
-std::string CachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
+std::string CachedToken(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
                         const std::string &consumer_name) {
 	std::lock_guard<std::mutex> guard(TOKEN_CACHE_MUTEX);
-	auto entry = TOKEN_CACHE.find(TokenCacheKey(context, catalog_name, consumer_name));
+	auto entry = TOKEN_CACHE.find(TokenCacheKey(context, conn, catalog_name, consumer_name));
 	if (entry == TOKEN_CACHE.end()) {
 		return "";
 	}
 	return entry->second;
 }
 
-void CacheToken(duckdb::ClientContext &context, const std::string &catalog_name, const std::string &consumer_name,
-                const std::string &token) {
+void CacheToken(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
+                const std::string &consumer_name, const std::string &token) {
 	std::lock_guard<std::mutex> guard(TOKEN_CACHE_MUTEX);
-	TOKEN_CACHE[TokenCacheKey(context, catalog_name, consumer_name)] = token;
+	TOKEN_CACHE[TokenCacheKey(context, conn, catalog_name, consumer_name)] = token;
 }
 
-void EraseCachedToken(duckdb::ClientContext &context, const std::string &catalog_name,
+void EraseCachedToken(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
                       const std::string &consumer_name) {
 	std::lock_guard<std::mutex> guard(TOKEN_CACHE_MUTEX);
-	TOKEN_CACHE.erase(TokenCacheKey(context, catalog_name, consumer_name));
+	TOKEN_CACHE.erase(TokenCacheKey(context, conn, catalog_name, consumer_name));
 }
 
-void CacheDmlSafeCommitRange(duckdb::ClientContext &context, const std::string &catalog_name,
+void CacheDmlSafeCommitRange(duckdb::ClientContext &context, duckdb::Connection &conn, const std::string &catalog_name,
                              const std::string &consumer_name, int64_t cursor, int64_t safe_until) {
 	std::lock_guard<std::mutex> guard(DML_SAFE_COMMIT_MUTEX);
 	DmlSafeCommitRange range;
 	range.cursor = cursor;
 	range.safe_until = safe_until;
-	DML_SAFE_COMMIT_RANGES[DmlSafeCommitKey(context, catalog_name, consumer_name)] = range;
+	DML_SAFE_COMMIT_RANGES[DmlSafeCommitKey(context, conn, catalog_name, consumer_name)] = range;
 }
 
-bool HasCachedDmlSafeCommitRange(duckdb::ClientContext &context, const std::string &catalog_name,
-                                 const std::string &consumer_name, int64_t cursor, int64_t requested_snapshot) {
+bool HasCachedDmlSafeCommitRange(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                 const std::string &catalog_name, const std::string &consumer_name, int64_t cursor,
+                                 int64_t requested_snapshot) {
 	std::lock_guard<std::mutex> guard(DML_SAFE_COMMIT_MUTEX);
-	const auto entry = DML_SAFE_COMMIT_RANGES.find(DmlSafeCommitKey(context, catalog_name, consumer_name));
+	const auto entry = DML_SAFE_COMMIT_RANGES.find(DmlSafeCommitKey(context, conn, catalog_name, consumer_name));
 	if (entry == DML_SAFE_COMMIT_RANGES.end()) {
 		return false;
 	}
@@ -462,13 +465,12 @@ std::string NativePostgresTable(const std::string &schema_name, const std::strin
 	return QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name);
 }
 
-std::string NativePostgresStateTable(const std::string &table_name, bool use_state_schema) {
-	const auto schema_name = use_state_schema ? STATE_SCHEMA : "public";
-	return NativePostgresTable(schema_name, table_name);
+std::string NativePostgresStateTable(const std::string &state_schema, const std::string &table_name) {
+	return NativePostgresTable(state_schema, table_name);
 }
 
-std::string NativePostgresMetadataTable(const std::string &table_name) {
-	return NativePostgresTable("public", table_name);
+std::string NativePostgresMetadataTable(const std::string &metadata_schema, const std::string &table_name) {
+	return NativePostgresTable(metadata_schema, table_name);
 }
 
 void PostgresExecuteChecked(duckdb::Connection &conn, const std::string &catalog_name, const std::string &sql) {
@@ -659,6 +661,62 @@ duckdb::Value NamedParameterValue(duckdb::TableFunctionBindInput &input, const s
 	return entry->second;
 }
 
+//===--------------------------------------------------------------------===//
+// cdc_configure
+//===--------------------------------------------------------------------===//
+
+struct CdcConfigureData : public duckdb::TableFunctionData {
+	std::string catalog_name;
+	std::string state_schema;
+	std::string metadata_schema;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CdcConfigureData>();
+		result->catalog_name = catalog_name;
+		result->state_schema = state_schema;
+		result->metadata_schema = metadata_schema;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		return this == &other;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> CdcConfigureBind(duckdb::ClientContext &context,
+                                                          duckdb::TableFunctionBindInput &input,
+                                                          duckdb::vector<duckdb::LogicalType> &return_types,
+                                                          duckdb::vector<duckdb::string> &names) {
+	if (input.inputs.size() != 1) {
+		throw duckdb::BinderException("cdc_configure requires catalog");
+	}
+	auto result = duckdb::make_uniq<CdcConfigureData>();
+	result->catalog_name = GetStringArg(input.inputs[0], "catalog");
+	const auto state_schema = NamedParameterValue(input, "state_schema");
+	const auto metadata_schema = NamedParameterValue(input, "metadata_schema");
+	if (state_schema.IsNull() || metadata_schema.IsNull()) {
+		throw duckdb::BinderException("cdc_configure requires state_schema and metadata_schema");
+	}
+	result->state_schema = state_schema.GetValue<std::string>();
+	result->metadata_schema = metadata_schema.GetValue<std::string>();
+	names = {"catalog_name", "state_schema", "metadata_schema"};
+	return_types = {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR};
+	return std::move(result);
+}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CdcConfigureInit(duckdb::ClientContext &context,
+                                                                      duckdb::TableFunctionInitInput &input) {
+	auto result = duckdb::make_uniq<RowScanState>();
+	auto &data = input.bind_data->Cast<CdcConfigureData>();
+	duckdb::Connection conn(*context.db);
+	ConfigureCdcInternalConnection(conn);
+	CheckCatalogOrThrow(conn, data.catalog_name);
+	const auto configured = ConfigureCdcCatalogState(conn, data.catalog_name, data.state_schema, data.metadata_schema);
+	result->rows.push_back({duckdb::Value(configured.catalog_name), duckdb::Value(configured.state_schema),
+	                        duckdb::Value(configured.metadata_schema)});
+	return std::move(result);
+}
+
 void ConsumerCreateReturnTypes(duckdb::vector<duckdb::LogicalType> &return_types,
                                duckdb::vector<duckdb::string> &names) {
 	names = {"consumer_name",
@@ -762,10 +820,10 @@ duckdb::Value OptionalQualifiedName(const std::string &scope_kind, const duckdb:
 
 bool ResolveSchemaByNameAt(duckdb::Connection &conn, const std::string &catalog_name, const std::string &schema_name,
                            int64_t snapshot_id, int64_t &schema_id) {
-	auto result =
-	    conn.Query("SELECT schema_id FROM " + MetadataTable(catalog_name, "ducklake_schema") + " WHERE schema_name = " +
-	               QuoteLiteral(schema_name) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
-	               " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
+	auto result = conn.Query(
+	    "SELECT schema_id FROM " + MetadataTable(conn, catalog_name, "ducklake_schema") +
+	    " WHERE schema_name = " + QuoteLiteral(schema_name) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
+	    " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -775,10 +833,10 @@ bool ResolveSchemaByNameAt(duckdb::Connection &conn, const std::string &catalog_
 
 bool ResolveSchemaByIdAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t schema_id,
                          int64_t snapshot_id, std::string &schema_name) {
-	auto result =
-	    conn.Query("SELECT schema_name FROM " + MetadataTable(catalog_name, "ducklake_schema") + " WHERE schema_id = " +
-	               std::to_string(schema_id) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
-	               " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
+	auto result = conn.Query(
+	    "SELECT schema_name FROM " + MetadataTable(conn, catalog_name, "ducklake_schema") +
+	    " WHERE schema_id = " + std::to_string(schema_id) + " AND begin_snapshot <= " + std::to_string(snapshot_id) +
+	    " AND (end_snapshot IS NULL OR end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return false;
 	}
@@ -788,13 +846,14 @@ bool ResolveSchemaByIdAt(duckdb::Connection &conn, const std::string &catalog_na
 
 bool ResolveTableByIdAt(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                         int64_t snapshot_id, int64_t &schema_id, std::string &qualified_name) {
-	auto result = conn.Query(
-	    "SELECT s.schema_id, s.schema_name || '.' || t.table_name FROM " +
-	    MetadataTable(catalog_name, "ducklake_table") + " t JOIN " + MetadataTable(catalog_name, "ducklake_schema") +
-	    " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) + " AND t.begin_snapshot <= " +
-	    std::to_string(snapshot_id) + " AND (t.end_snapshot IS NULL OR t.end_snapshot > " +
-	    std::to_string(snapshot_id) + ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
-	    " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
+	auto result =
+	    conn.Query("SELECT s.schema_id, s.schema_name || '.' || t.table_name FROM " +
+	               MetadataTable(conn, catalog_name, "ducklake_table") + " t JOIN " +
+	               MetadataTable(conn, catalog_name, "ducklake_schema") + " s USING (schema_id) WHERE t.table_id = " +
+	               std::to_string(table_id) + " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) +
+	               ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
+	               " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull() ||
 	    result->GetValue(1, 0).IsNull()) {
 		return false;
@@ -812,8 +871,8 @@ bool StartAtMeansBeginning(const std::string &start_at) {
 bool ResolveFirstLiveTableById(duckdb::Connection &conn, const std::string &catalog_name, int64_t table_id,
                                int64_t &snapshot_id, int64_t &schema_id, std::string &qualified_name) {
 	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, s.schema_name || '.' || t.table_name FROM " +
-	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
-	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         MetadataTable(conn, catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                         " s USING (schema_id) WHERE t.table_id = " + std::to_string(table_id) +
 	                         " AND s.begin_snapshot <= t.begin_snapshot "
 	                         "AND (s.end_snapshot IS NULL OR s.end_snapshot > t.begin_snapshot) "
@@ -839,8 +898,8 @@ bool ResolveFirstLiveTableByName(duckdb::Connection &conn, const std::string &ca
 	const auto schema_name = qualified_name.substr(0, dot);
 	const auto table_name = qualified_name.substr(dot + 1);
 	auto result = conn.Query("SELECT t.begin_snapshot, s.schema_id, t.table_id FROM " +
-	                         MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
-	                         MetadataTable(catalog_name, "ducklake_schema") +
+	                         MetadataTable(conn, catalog_name, "ducklake_table") + " t JOIN " +
+	                         MetadataTable(conn, catalog_name, "ducklake_schema") +
 	                         " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) +
 	                         " AND t.table_name = " + QuoteLiteral(table_name) +
 	                         " AND s.begin_snapshot <= t.begin_snapshot "
@@ -1450,7 +1509,7 @@ std::vector<duckdb::Value> ReleaseConsumer(duckdb::ClientContext &context, const
 	ConfigureCdcInternalConnection(conn);
 	CheckCatalogOrThrow(conn, data.catalog_name);
 	BootstrapConsumerStateOrThrow(conn, data.catalog_name);
-	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	const auto cached_token = CachedToken(context, conn, data.catalog_name, data.consumer_name);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
 		ThrowBusy(conn, data.catalog_name, data.consumer_name);
@@ -1465,7 +1524,7 @@ std::vector<duckdb::Value> ReleaseConsumer(duckdb::ClientContext &context, const
 	if (!row.owner_token.IsNull()) {
 		ThrowBusy(conn, data.catalog_name, data.consumer_name);
 	}
-	EraseCachedToken(context, data.catalog_name, data.consumer_name);
+	EraseCachedToken(context, conn, data.catalog_name, data.consumer_name);
 	const auto details = "{\"released_token\":\"" + JsonEscape(cached_token) + "\"}";
 	InsertAuditRow(conn, data.catalog_name, "consumer_release", data.consumer_name, row.consumer_id, details);
 	return {duckdb::Value(data.consumer_name), duckdb::Value::BIGINT(row.consumer_id), duckdb::Value(cached_token)};
@@ -1688,7 +1747,7 @@ int64_t RequiredInt64(const duckdb::Value &value, const std::string &description
 DmlWindowResolution ResolveDmlWindowIndexed(duckdb::Connection &conn, const std::string &catalog_name,
                                             int64_t last_snapshot, int64_t max_snapshots,
                                             const std::vector<ConsumerSubscriptionRow> &subscriptions) {
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
 	const auto last_snapshot_sql = std::to_string(last_snapshot);
 	auto result =
 	    conn.Query("WITH snapshot_bounds AS ("
@@ -1748,8 +1807,8 @@ DmlWindowResolution ResolveDmlWindowIndexed(duckdb::Connection &conn, const std:
 
 WindowResolution ResolveWindowFast(duckdb::Connection &conn, const std::string &catalog_name, int64_t last_snapshot,
                                    int64_t max_snapshots) {
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
-	const auto changes_table = MetadataTable(catalog_name, "ducklake_snapshot_changes");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
+	const auto changes_table = MetadataTable(conn, catalog_name, "ducklake_snapshot_changes");
 	const auto last_snapshot_sql = std::to_string(last_snapshot);
 	const auto max_snapshots_sql = std::to_string(max_snapshots);
 	const auto schema_change_filter = "(sc.changes_made LIKE 'created_%' OR sc.changes_made LIKE '%,created_%' OR "
@@ -1887,7 +1946,7 @@ void ValidateCommitSnapshot(duckdb::Connection &conn, const std::string &catalog
 		                                    static_cast<long long>(snapshot_id), consumer_name,
 		                                    static_cast<long long>(current_cursor));
 	}
-	const auto snapshot_table = MetadataTable(catalog_name, "ducklake_snapshot");
+	const auto snapshot_table = MetadataTable(conn, catalog_name, "ducklake_snapshot");
 	auto result =
 	    conn.Query("SELECT count(*) FROM " + snapshot_table + " WHERE snapshot_id = " + std::to_string(snapshot_id));
 	if (SingleInt64(*result, "commit snapshot existence") == 0) {
@@ -1973,10 +2032,13 @@ bool TryCommitPostgresNative(duckdb::Connection &conn, const std::string &catalo
 	if (cached_token.empty()) {
 		return false;
 	}
-	const auto use_state_schema = StateSchemaExists(conn, catalog_name);
-	const auto consumers = NativePostgresStateTable(CONSUMERS_TABLE, use_state_schema);
-	const auto attached_consumers = StateTable(catalog_name, CONSUMERS_TABLE, use_state_schema);
-	const auto snapshot_table = NativePostgresMetadataTable("ducklake_snapshot");
+	if (!StateSchemaExists(conn, catalog_name)) {
+		return false;
+	}
+	const auto state = ResolveCdcCatalogState(conn, catalog_name);
+	const auto consumers = NativePostgresStateTable(state.state_schema, CONSUMERS_TABLE);
+	const auto attached_consumers = StateTable(catalog_name, CONSUMERS_TABLE, state.state_schema);
+	const auto snapshot_table = NativePostgresMetadataTable(state.metadata_schema, "ducklake_snapshot");
 	const auto snapshot_sql = std::to_string(snapshot_id);
 	const auto update_sql =
 	    "UPDATE " + consumers + " SET last_committed_snapshot = " + snapshot_sql +
@@ -2000,18 +2062,18 @@ std::vector<duckdb::Value> CommitWindowWithConnection(duckdb::ClientContext &con
 	CheckCatalogOrThrow(conn, data.catalog_name);
 
 	const auto backend = CachedStateBackend(context, conn, data.catalog_name);
-	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	const auto cached_token = CachedToken(context, conn, data.catalog_name, data.consumer_name);
 	// Look up the consumer once before any UPDATE: the per-subscribed-table
 	// schema-shape boundary check must happen on every code path (fast,
 	// postgres-native, legacy) and must precede any state mutation.
 	auto initial_row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
-	if (!HasCachedDmlSafeCommitRange(context, data.catalog_name, data.consumer_name,
+	if (!HasCachedDmlSafeCommitRange(context, conn, data.catalog_name, data.consumer_name,
 	                                 initial_row.last_committed_snapshot, data.snapshot_id)) {
 		ValidateDmlConsumerShapeBoundary(conn, data.catalog_name, initial_row, data.snapshot_id);
 	}
 	if (SupportsUpdateReturning(backend)) {
 		const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
-		const auto snapshot_table = MetadataTable(data.catalog_name, "ducklake_snapshot");
+		const auto snapshot_table = MetadataTable(conn, data.catalog_name, "ducklake_snapshot");
 		auto fast_commit = conn.Query(
 		    "UPDATE " + consumers + " SET last_committed_snapshot = " + std::to_string(data.snapshot_id) +
 		    ", last_committed_schema_version = (SELECT schema_version FROM " + snapshot_table +
@@ -2109,7 +2171,7 @@ std::vector<duckdb::Value> HeartbeatConsumer(duckdb::ClientContext &context, con
 	ConfigureCdcInternalConnection(conn);
 	CheckCatalogOrThrow(conn, data.catalog_name);
 	const auto consumers = StateTable(conn, data.catalog_name, CONSUMERS_TABLE);
-	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	const auto cached_token = CachedToken(context, conn, data.catalog_name, data.consumer_name);
 	auto row = LoadConsumerOrThrow(conn, data.catalog_name, data.consumer_name);
 	if (cached_token.empty() || row.owner_token.IsNull() || row.owner_token.ToString() != cached_token) {
 		ThrowBusy(conn, data.catalog_name, data.consumer_name);
@@ -2342,10 +2404,10 @@ std::vector<DecodedSnapshotChange> LoadDecodedSnapshotChanges(duckdb::Connection
 		return cached;
 	}
 
-	auto rows =
-	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id > " + std::to_string(from_snapshot) +
-	               " AND snapshot_id <= " + std::to_string(to_snapshot) + " ORDER BY snapshot_id ASC");
+	auto rows = conn.Query("SELECT snapshot_id, changes_made FROM " +
+	                       MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") + " WHERE snapshot_id > " +
+	                       std::to_string(from_snapshot) + " AND snapshot_id <= " + std::to_string(to_snapshot) +
+	                       " ORDER BY snapshot_id ASC");
 	ThrowIfQueryFailed(rows);
 	if (!rows) {
 		return {};
@@ -2702,26 +2764,44 @@ bool SnapshotTouchesSubscriptions(duckdb::Connection &conn, const std::string &c
 	return false;
 }
 
-std::vector<duckdb::Value> NextMatchingSnapshot(duckdb::Connection &conn, const std::string &cache_namespace,
-                                                const std::string &catalog_name, const ConsumerRow &consumer,
-                                                const std::vector<ConsumerSubscriptionRow> &subscriptions) {
+struct SnapshotMatchProbe {
+	duckdb::Value matching_snapshot;
+	int64_t scanned_through;
+
+	SnapshotMatchProbe(duckdb::Value matching_snapshot_p, int64_t scanned_through_p)
+	    : matching_snapshot(std::move(matching_snapshot_p)), scanned_through(scanned_through_p) {
+	}
+};
+
+SnapshotMatchProbe NextMatchingSnapshot(duckdb::Connection &conn, const std::string &cache_namespace,
+                                        const std::string &catalog_name, const ConsumerRow &consumer,
+                                        const std::vector<ConsumerSubscriptionRow> &subscriptions) {
 	if (OnlyDmlTableSubscriptions(subscriptions)) {
 		const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
 		const auto snapshot = FirstDmlSubscribedSnapshot(conn, catalog_name, consumer.last_committed_snapshot,
 		                                                 current_snapshot, subscriptions);
 		if (snapshot != -1) {
-			return {duckdb::Value::BIGINT(snapshot),
-			        duckdb::Value::BIGINT(snapshot - consumer.last_committed_snapshot)};
+			return {duckdb::Value::BIGINT(snapshot), current_snapshot};
 		}
-		return {duckdb::Value(), duckdb::Value()};
+		return {duckdb::Value(), current_snapshot};
 	}
-	auto rows =
-	    conn.Query("SELECT snapshot_id, changes_made FROM " + MetadataTable(catalog_name, "ducklake_snapshot_changes") +
-	               " WHERE snapshot_id > " + std::to_string(consumer.last_committed_snapshot) +
-	               DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC");
+	const auto current_snapshot = CurrentSnapshot(conn, catalog_name);
+	const auto metadata_schema = ResolveCdcCatalogState(conn, catalog_name).metadata_schema;
+	const auto range_sql = "SELECT snapshot_id, changes_made FROM " +
+	                       NativePostgresMetadataTable(metadata_schema, "ducklake_snapshot_changes") +
+	                       " WHERE snapshot_id > " + std::to_string(consumer.last_committed_snapshot) +
+	                       " AND snapshot_id <= " + std::to_string(current_snapshot) +
+	                       DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC";
+	auto rows = MetadataBackendIsPostgres(conn, catalog_name)
+	                ? QueryPostgresMetadata(conn, catalog_name, range_sql)
+	                : conn.Query("SELECT snapshot_id, changes_made FROM " +
+	                             MetadataTable(conn, catalog_name, "ducklake_snapshot_changes") +
+	                             " WHERE snapshot_id > " + std::to_string(consumer.last_committed_snapshot) +
+	                             " AND snapshot_id <= " + std::to_string(current_snapshot) +
+	                             DmlTableSnapshotChangesFilter(subscriptions) + " ORDER BY snapshot_id ASC");
 	ThrowIfQueryFailed(rows);
 	if (!rows) {
-		return {duckdb::Value(), duckdb::Value()};
+		return {duckdb::Value(), current_snapshot};
 	}
 	for (duckdb::idx_t row_idx = 0; row_idx < rows->RowCount(); ++row_idx) {
 		if (rows->GetValue(0, row_idx).IsNull()) {
@@ -2732,11 +2812,35 @@ std::vector<duckdb::Value> NextMatchingSnapshot(duckdb::Connection &conn, const 
 		const auto changes_made = changes_value.IsNull() ? std::string() : changes_value.ToString();
 		if (SnapshotTouchesSubscriptions(conn, cache_namespace, catalog_name, snapshot_id, changes_made,
 		                                 subscriptions)) {
-			return {duckdb::Value::BIGINT(snapshot_id),
-			        duckdb::Value::BIGINT(snapshot_id - consumer.last_committed_snapshot)};
+			return {duckdb::Value::BIGINT(snapshot_id), current_snapshot};
 		}
 	}
-	return {duckdb::Value(), duckdb::Value()};
+	return {duckdb::Value(), current_snapshot};
+}
+
+bool AdvanceDdlCursorPastInspectedSnapshots(duckdb::ClientContext &context, duckdb::Connection &conn,
+                                            const std::string &catalog_name, const ConsumerRow &probed_consumer,
+                                            int64_t inspected_through) {
+	if (probed_consumer.consumer_kind != "ddl" || inspected_through <= probed_consumer.last_committed_snapshot) {
+		return false;
+	}
+
+	const auto cached_token = CachedToken(context, conn, catalog_name, probed_consumer.consumer_name);
+	ConsumerRow owned_consumer;
+	if (!TryUseFreshCachedLease(conn, catalog_name, probed_consumer.consumer_name, cached_token, owned_consumer)) {
+		const auto backend = CachedStateBackend(context, conn, catalog_name);
+		owned_consumer = AcquireLease(conn, catalog_name, probed_consumer.consumer_name, cached_token, backend);
+	}
+	CacheToken(context, conn, catalog_name, probed_consumer.consumer_name, owned_consumer.owner_token.ToString());
+
+	// The subscription scan was performed from probed_consumer's cursor.
+	// A concurrent reset/commit changes that premise, so retry from the new
+	// cursor instead of advancing a range we did not inspect.
+	if (owned_consumer.last_committed_snapshot != probed_consumer.last_committed_snapshot) {
+		return false;
+	}
+	CommitConsumerSnapshotWithConnection(context, conn, catalog_name, probed_consumer.consumer_name, inspected_through);
+	return true;
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> ListenWaitBind(duckdb::ClientContext &context,
@@ -2780,17 +2884,25 @@ WaitForNextSnapshotWithSubscriptions(duckdb::ClientContext &context, duckdb::Con
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(clamped_timeout_ms);
 #ifndef _WIN32
 	const auto pg_dsn = MetadataBackendIsPostgres(conn, catalog_name) ? PostgresMetadataDsn(conn, catalog_name) : "";
-	PostgresSnapshotListener pg_listener(pg_dsn, SnapshotNotifyChannel(catalog_name));
+	PostgresSnapshotListener pg_listener(pg_dsn, SnapshotNotifyChannel(conn, catalog_name));
 #endif
 	while (true) {
 		if (context.interrupted) {
 			throw duckdb::InterruptException();
 		}
 		const auto row = LoadConsumerOrThrow(conn, catalog_name, consumer_name);
-		const auto next_matching =
-		    NextMatchingSnapshot(conn, ConnectionCachePrefix(context), catalog_name, row, subscriptions);
-		if (!next_matching.empty() && !next_matching[0].IsNull()) {
-			return next_matching;
+		const auto probe = NextMatchingSnapshot(conn, ConnectionCachePrefix(context), catalog_name, row, subscriptions);
+		if (!probe.matching_snapshot.IsNull()) {
+			const auto snapshot = probe.matching_snapshot.GetValue<int64_t>();
+			return {probe.matching_snapshot, duckdb::Value::BIGINT(snapshot - row.last_committed_snapshot)};
+		}
+		if (row.consumer_kind == "ddl" && probe.scanned_through > row.last_committed_snapshot) {
+			if (AdvanceDdlCursorPastInspectedSnapshots(context, conn, catalog_name, row, probe.scanned_through)) {
+				// Completing this empty window is observable progress. Return
+				// to the caller instead of holding the lease through another
+				// long wait without a heartbeat.
+				return {duckdb::Value()};
+			}
 		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline || clamped_timeout_ms == 0) {
@@ -3099,10 +3211,10 @@ bool ResolveCurrentTableName(duckdb::Connection &conn, const std::string &catalo
 	const auto schema_name = qualified_name.substr(0, dot);
 	const auto table_name = qualified_name.substr(dot + 1);
 	auto result =
-	    conn.Query("SELECT s.schema_id, t.table_id FROM " + MetadataTable(catalog_name, "ducklake_table") + " t JOIN " +
-	               MetadataTable(catalog_name, "ducklake_schema") + " s USING (schema_id) WHERE s.schema_name = " +
-	               QuoteLiteral(schema_name) + " AND t.table_name = " + QuoteLiteral(table_name) +
-	               " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
+	    conn.Query("SELECT s.schema_id, t.table_id FROM " + MetadataTable(conn, catalog_name, "ducklake_table") +
+	               " t JOIN " + MetadataTable(conn, catalog_name, "ducklake_schema") +
+	               " s USING (schema_id) WHERE s.schema_name = " + QuoteLiteral(schema_name) + " AND t.table_name = " +
+	               QuoteLiteral(table_name) + " AND t.begin_snapshot <= " + std::to_string(snapshot_id) +
 	               " AND (t.end_snapshot IS NULL OR t.end_snapshot > " + std::to_string(snapshot_id) +
 	               ") AND s.begin_snapshot <= " + std::to_string(snapshot_id) +
 	               " AND (s.end_snapshot IS NULL OR s.end_snapshot > " + std::to_string(snapshot_id) + ") LIMIT 1");
@@ -3342,7 +3454,7 @@ std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &conte
 		throw duckdb::InvalidInputException("cdc_window max_snapshots must be >= 1");
 	}
 
-	const auto cached_token = CachedToken(context, data.catalog_name, data.consumer_name);
+	const auto cached_token = CachedToken(context, conn, data.catalog_name, data.consumer_name);
 	ConsumerRow row;
 	if (!TryUseFreshCachedLease(conn, data.catalog_name, data.consumer_name, cached_token, row)) {
 		const auto backend = CachedStateBackend(context, conn, data.catalog_name);
@@ -3351,10 +3463,28 @@ std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &conte
 	const auto last_snapshot = row.last_committed_snapshot;
 	const auto consumer_kind = row.consumer_kind;
 	const auto owner_token = row.owner_token.ToString();
-	CacheToken(context, data.catalog_name, data.consumer_name, owner_token);
+	CacheToken(context, conn, data.catalog_name, data.consumer_name, owner_token);
 	const bool is_dml = consumer_kind == "dml";
 
 	if (is_dml) {
+		// DuckDB's Postgres scanner cannot push the aggregate in
+		// ResolveDmlWindowIndexed into the remote query. Avoid copying the
+		// complete snapshot metadata history when this consumer is already at
+		// the catalogue head—the steady-state path for non-blocking relays.
+		if (MetadataBackendIsPostgres(conn, data.catalog_name)) {
+			const auto current_snapshot = CurrentSnapshot(conn, data.catalog_name);
+			if (last_snapshot == current_snapshot) {
+				CacheDmlSafeCommitRange(context, conn, data.catalog_name, data.consumer_name, last_snapshot,
+				                        last_snapshot);
+				return {duckdb::Value::BIGINT(last_snapshot + 1),
+				        duckdb::Value::BIGINT(last_snapshot),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value::BIGINT(row.last_committed_schema_version),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value::BOOLEAN(false),
+				        duckdb::Value()};
+			}
+		}
 		const auto subscriptions = LoadDmlConsumerSubscriptions(conn, data.catalog_name, data.consumer_name);
 		const auto resolved =
 		    ResolveDmlWindowIndexed(conn, data.catalog_name, last_snapshot, data.max_snapshots, subscriptions);
@@ -3384,7 +3514,7 @@ std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &conte
 				                         end_schema_version, resolved.boundary_snapshot, boundary_schema_version);
 			}
 		}
-		CacheDmlSafeCommitRange(context, data.catalog_name, data.consumer_name, last_snapshot,
+		CacheDmlSafeCommitRange(context, conn, data.catalog_name, data.consumer_name, last_snapshot,
 		                        resolved.has_changes ? resolved.end_snapshot : last_snapshot);
 		return {duckdb::Value::BIGINT(resolved.start_snapshot),
 		        duckdb::Value::BIGINT(resolved.end_snapshot),
@@ -3500,7 +3630,7 @@ std::vector<duckdb::Value> ReadWindowWithConnection(duckdb::ClientContext &conte
 		                            RequiredInt64(ddl_schema_change_version, "schema_version"));
 	}
 	if (is_dml) {
-		CacheDmlSafeCommitRange(context, data.catalog_name, data.consumer_name, last_snapshot,
+		CacheDmlSafeCommitRange(context, conn, data.catalog_name, data.consumer_name, last_snapshot,
 		                        has_changes ? end_snapshot : last_snapshot);
 	}
 	return {duckdb::Value::BIGINT(start_snapshot),
@@ -3642,6 +3772,13 @@ void RecordConsumerListenResult(const std::string &catalog_name, const std::stri
 void RegisterConsumerFunctions(duckdb::ExtensionLoader &loader) {
 	const auto varchar_list = duckdb::LogicalType::LIST(duckdb::LogicalType::VARCHAR);
 	const auto bigint_list = duckdb::LogicalType::LIST(duckdb::LogicalType::BIGINT);
+	duckdb::TableFunction configure_function("cdc_configure",
+	                                         duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR},
+	                                         RowScanExecute, CdcConfigureBind, CdcConfigureInit);
+	configure_function.named_parameters["state_schema"] = duckdb::LogicalType::VARCHAR;
+	configure_function.named_parameters["metadata_schema"] = duckdb::LogicalType::VARCHAR;
+	loader.RegisterFunction(configure_function);
+
 	duckdb::TableFunction ddl_create_function(
 	    "cdc_ddl_consumer_create",
 	    duckdb::vector<duckdb::LogicalType> {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::VARCHAR},
